@@ -123,7 +123,7 @@ class MockTTS(TTSProvider):
 class EdgeTTSProvider(TTSProvider):
     """Free, keyless TTS via the installed edge-tts package (network needed).
     Lazy import — constructed only when configured. Chunked synthesis for
-    barge-in support."""
+    barge-in support. NOT the default: local PiperTTS is the default."""
     name = "edge-tts"
 
     def __init__(self, voice: str = "en-US-AriaNeural", rate: str = "+0%") -> None:
@@ -150,6 +150,174 @@ class EdgeTTSProvider(TTSProvider):
         asyncio.run(run())
         for c in chunks:
             yield c
+
+
+class FasterWhisperSTT(STTProvider):
+    """Local offline STT (faster-whisper, tiny.en default, CPU int8).
+    Input: WAV bytes (any rate/channels; converted to 16 kHz mono).
+    Never touches the network. Lazy model load on first use."""
+    name = "local-whisper"
+
+    def __init__(self, model: str = "tiny.en", device: str = "cpu",
+                 timeout_s: float = 120.0) -> None:
+        self.model_name = model
+        self.device = device
+        self.timeout_s = timeout_s
+        self._model = None
+        self._lock = threading.Lock()
+
+    def _load(self):
+        with self._lock:
+            if self._model is None:
+                try:
+                    from faster_whisper import WhisperModel
+                except ImportError:
+                    raise RuntimeError(
+                        "faster-whisper not installed: pip install faster-whisper")
+                self._model = WhisperModel(self.model_name, device=self.device,
+                                           compute_type="int8")
+            return self._model
+
+    @staticmethod
+    def _to_mono16k(data: bytes, props: dict):
+        import io as _io
+        import wave as _wave
+        import numpy as _np
+        with _wave.open(_io.BytesIO(data), "rb") as w:
+            raw = w.readframes(w.getnframes())
+        width, ch, rate = props["width"], props["channels"], props["rate"]
+        if width != 2:
+            raise ValueError(f"unsupported sample width: {width}")
+        pcm = _np.frombuffer(raw, dtype=_np.int16).astype(_np.float32) / 32768.0
+        if ch > 1:
+            pcm = pcm.reshape(-1, ch).mean(axis=1)
+        if rate != 16000 and len(pcm) > 0:
+            idx = (_np.arange(int(len(pcm) * 16000 / rate)) * rate / 16000
+                   ).astype(int)
+            idx = _np.clip(idx, 0, len(pcm) - 1)
+            pcm = pcm[idx]
+        return pcm
+
+    def transcribe(self, audio: bytes) -> str:
+        from .audio import validate_wav
+        props = validate_wav(audio)
+        if props["frames"] == 0:
+            raise ValueError("empty audio")
+        model = self._load()
+        pcm = self._to_mono16k(audio, props)
+        segments, info = model.transcribe(pcm, beam_size=1, language="en",
+                                          condition_on_previous_text=False)
+        text = " ".join(s.text.strip() for s in segments).strip()
+        return " ".join(text.split())
+
+    def availability(self) -> dict:
+        try:
+            import faster_whisper  # noqa: F401
+            return {"backend": "faster-whisper", "model": self.model_name,
+                    "offline": True, "ready": self._model is not None}
+        except ImportError:
+            return {"backend": "faster-whisper", "model": self.model_name,
+                    "offline": True, "ready": False,
+                    "error": "faster-whisper not installed"}
+
+
+class PiperTTS(TTSProvider):
+    """Local offline TTS (Piper onnx, CPU). Text -> WAV bytes.
+    Bounded input, sentence-chunked streaming for barge-in, no network."""
+    name = "local-piper"
+    MAX_CHARS = 2000
+
+    def __init__(self, model_path: str = "", timeout_s: float = 120.0) -> None:
+        import os as _os
+        self.model_path = model_path or _os.path.expanduser(
+            "~/.cache/zara-voice/en_US-lessac-medium.onnx")
+        self.timeout_s = timeout_s
+        self._voice = None
+        self._lock = threading.Lock()
+
+    def _load(self):
+        with self._lock:
+            if self._voice is None:
+                try:
+                    from piper import PiperVoice
+                except ImportError:
+                    raise RuntimeError(
+                        "piper-tts not installed: pip install piper-tts")
+                import os as _os
+                if not _os.path.isfile(self.model_path):
+                    raise RuntimeError(
+                        f"piper voice missing: {self.model_path}")
+                self._voice = PiperVoice.load(self.model_path)
+            return self._voice
+
+    @staticmethod
+    def _sentences(text: str) -> list[str]:
+        import re as _re
+        parts = _re.split(r"(?<=[.!?])\s+", text.strip())
+        return [p for p in (s.strip() for s in parts) if p]
+
+    def _synth(self, text: str) -> bytes:
+        import io as _io
+        import wave as _wave
+        voice = self._load()
+        buf = _io.BytesIO()
+        with _wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(voice.config.sample_rate)
+            voice.synthesize_wav(text, w)
+        return buf.getvalue()
+
+    def speak(self, text: str) -> bytes:
+        if not text or not text.strip():
+            raise ValueError("empty text")
+        if len(text) > self.MAX_CHARS:
+            raise ValueError(f"text exceeds {self.MAX_CHARS} chars")
+        import io as _io
+        import wave as _wave
+        # Phase 1: synthesize everything first, so a synthesis failure
+        # surfaces as itself instead of tripping the WAV writer on close.
+        raws = [self._synth(sent) for sent in self._sentences(text)]
+        if not raws:
+            raise ValueError("empty text")
+        out = _io.BytesIO()
+        wrote = False
+        with _wave.open(out, "wb") as w:
+            for raw in raws:
+                with _wave.open(_io.BytesIO(raw), "rb") as r:
+                    if not wrote:
+                        w.setnchannels(r.getnchannels())
+                        w.setsampwidth(r.getsampwidth())
+                        w.setframerate(r.getframerate())
+                        wrote = True
+                    w.writeframes(r.readframes(r.getnframes()))
+        return out.getvalue()
+
+    def stream_speak(self, text: str,
+                     cancel: Optional[threading.Event] = None
+                     ) -> Iterator[bytes]:
+        if not text or not text.strip():
+            raise ValueError("empty text")
+        if len(text) > self.MAX_CHARS:
+            raise ValueError(f"text exceeds {self.MAX_CHARS} chars")
+        for sent in self._sentences(text):
+            if cancel is not None and cancel.is_set():
+                return
+            yield self._synth(sent)
+
+    def stop(self) -> None:
+        pass  # chunked synthesis: cancellation via cancel event
+
+    def availability(self) -> dict:
+        import os as _os
+        try:
+            import piper  # noqa: F401
+            installed = True
+        except ImportError:
+            installed = False
+        return {"backend": "piper", "model": self.model_path,
+                "offline": True, "installed": installed,
+                "model_present": _os.path.isfile(self.model_path)}
 
 
 # ---------- wake word ----------
@@ -232,6 +400,112 @@ class MockWakeEngine(WakeWordEngine):
         self.detections += 1
         self.events.append(f"detected:{self.config.phrase}")
         return {"phrase": self.config.phrase, "detections": self.detections}
+
+
+class VADSpotterBackend:
+    """Honest local wake-word backend: VAD-gated, single-shot keyword spot.
+
+    NOT an always-on DSP engine. It processes one bounded audio snippet at a
+    time (armed explicitly, e.g. push-to-talk or a polled mic check),
+    trims silence with WebRTC VAD, transcribes with the local STT, and
+    matches the exact phrase. Heavy Whisper never runs in a loop here:
+    snippets are capped, and battery gating lives in WakeWordEngine.
+    """
+
+    def __init__(self, stt: FasterWhisperSTT | None = None,
+                 max_seconds: float = 5.0) -> None:
+        self.stt = stt or FasterWhisperSTT()
+        self.max_seconds = max_seconds
+
+    @staticmethod
+    def _normalize(text: str) -> str:
+        import re as _re
+        return _re.sub(r"[^a-z ]", "", text.lower()).strip()
+
+    def has_voice(self, pcm16k: bytes) -> bool:
+        """WebRTC VAD voice-activity check on 16 kHz mono s16 bytes."""
+        try:
+            import webrtcvad
+        except ImportError:
+            raise RuntimeError("webrtcvad not installed")
+        vad = webrtcvad.Vad(2)
+        frame = 320 * 2  # 20 ms @16kHz
+        voiced = total = 0
+        for i in range(0, len(pcm16k) - frame + 1, frame):
+            total += 1
+            if vad.is_speech(pcm16k[i:i + frame], 16000):
+                voiced += 1
+        return total > 0 and voiced / total > 0.1
+
+    def check(self, wav_bytes: bytes) -> dict:
+        """Returns {detected: bool, transcript: str}. Never executes."""
+        from .audio import validate_wav
+        props = validate_wav(wav_bytes)
+        seconds = props["frames"] / max(1, props["rate"])
+        if seconds > self.max_seconds:
+            raise ValueError(f"snippet exceeds {self.max_seconds}s")
+        transcript = self.stt.transcribe(wav_bytes)
+        norm = self._normalize(transcript)
+        detected = "hey zara" in norm
+        return {"detected": detected, "transcript": transcript}
+
+    def availability(self) -> dict:
+        return {"engine": "vad-spotter",
+                "phrase": WAKE_PHRASE,
+                "always_on_dsp": False,
+                "physically_validated": False,
+                "note": "VAD-gated single-shot spotter; push-to-talk is the "
+                        "validated path; continuous listening not implemented"}
+
+
+def stt_from_env() -> STTProvider:
+    """auto (default): local whisper when importable, else mock.
+    Set STT_PROVIDER=mock to force the mock; local for explicit local."""
+    import os as _os
+    which = _os.environ.get("STT_PROVIDER", "auto").strip().lower()
+    if which == "mock":
+        return MockSTT()
+    if which in ("auto", "local"):
+        try:
+            stt = FasterWhisperSTT(
+                model=_os.environ.get("STT_MODEL", "tiny.en"))
+            if which == "local":
+                return stt
+            import faster_whisper  # noqa: F401 — probe only
+            return stt
+        except (ImportError, RuntimeError):
+            if which == "local":
+                raise
+    return MockSTT()
+
+
+def tts_from_env() -> TTSProvider:
+    """auto (default): local Piper when available, else mock.
+    TTS_PROVIDER=edge selects the pre-existing cloud TTS explicitly."""
+    import os as _os
+    which = _os.environ.get("TTS_PROVIDER", "auto").strip().lower()
+    if which == "mock":
+        return MockTTS()
+    if which == "edge":
+        return EdgeTTSProvider()
+    if which in ("auto", "local"):
+        try:
+            import os as _oo
+            default = _oo.path.expanduser(
+                "~/.cache/zara-voice/en_US-lessac-medium.onnx")
+            chosen = _os.environ.get("TTS_MODEL", "") or default
+            if which == "local" and not _oo.path.isfile(chosen):
+                raise RuntimeError(f"piper voice missing: {chosen}")
+            tts = PiperTTS(model_path=chosen)
+            if which == "local":
+                return tts
+            import piper  # noqa: F401 — probe only
+            if _oo.path.isfile(chosen):
+                return tts
+        except (ImportError, RuntimeError):
+            if which == "local":
+                raise
+    return MockTTS()
 
 
 # ---------- pipeline ----------

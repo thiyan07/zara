@@ -9,7 +9,10 @@ from dataclasses import dataclass, field
 
 SECRET_LEAK = [re.compile(p, re.I) for p in
                (r"api[_-]?key\s*[:=]\s*\S+", r"password\s*[:=]\s*\S+",
-                r"zara-dev-\S+", r"zara-pair-\S+", r"Bearer \S+")]
+                r"zara-dev-\S+", r"zara-pair-\S+", r"Bearer \S+",
+                r"nvapi-[A-Za-z0-9_\-]{8,}", r"sk-ant-[A-Za-z0-9_\-]{8,}",
+                r"sk-proj-[A-Za-z0-9_\-]{8,}", r"gsk_[A-Za-z0-9]{10,}",
+                r"\bsk-[A-Za-z0-9]{20,}", r"xox[bpas]-[A-Za-z0-9\-]+")]
 
 
 def redact(text: str) -> str:

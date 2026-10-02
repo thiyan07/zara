@@ -3,3 +3,12 @@ uvicorn==0.41.0
 pydantic>=2.0
 pytest>=8.0
 httpx>=0.24
+# Local voice (free/offline; lazy-loaded, unused when unconfigured)
+faster-whisper>=1.0
+piper-tts>=1.0
+webrtcvad-wheels>=2.0
+numpy>=1.24
+# Optional: local embeddings (ZARA_EMBEDDINGS=local)
+# fastembed>=0.3
+# Optional: browser automation
+# playwright>=1.40

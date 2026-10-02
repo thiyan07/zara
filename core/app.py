@@ -30,7 +30,8 @@ from .scheduler import Scheduler
 from .sessions import SessionStore
 from .tools import ToolDefinition, ToolRegistry
 from .tracing import Tracer
-from .voice import MockSTT, MockTTS, MockWakeEngine, VoicePipeline
+from .voice import (MockWakeEngine, VoicePipeline, stt_from_env,
+                      tts_from_env)
 from .scheduler import Scheduler
 from .tools import ToolDefinition, ToolRegistry
 
@@ -174,7 +175,7 @@ def build_stack(memory_db: str = "", audit_db: str = ":memory:",
                             router=router, devices=devices, governor=gov,
                             missions=missions, audit=audit, bus=bus,
                             sessions=sessions, tracer=tracer)
-    voice = VoicePipeline(MockSTT(""), MockTTS(), loop, sessions)
+    voice = VoicePipeline(stt_from_env(), tts_from_env(), loop, sessions)
     wake = MockWakeEngine()
     limits = {"general": RateLimiter(600, 60.0),
               "sensitive": RateLimiter(30, 60.0)}
