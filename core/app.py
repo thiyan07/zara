@@ -126,6 +126,9 @@ def build_stack(memory_db: str = ""):
         registry.register(definition, handler)
     jobs = JobQueue()
     register_device_proxies(registry, jobs)
+    from .opencode_tools import OPENCODE_TOOLS as _OT
+    for _d, _h in _OT:
+        registry.register(_d, _h)
     device_auth = DeviceAuthStore()
     events_log: list[dict] = []
     bus.subscribe("*", lambda ev: events_log.append(ev.model_dump()))
