@@ -1,4 +1,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Runtime-requested (Activity-mediated, denial is a normal state). -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- API 33+ runtime request; older versions auto-grant at install. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Normal permissions (auto-granted): backend connectivity + state. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />

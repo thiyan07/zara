@@ -55,10 +55,11 @@
   wake events only move voice state — they execute nothing.
 - Speaker audibility cannot be verified from here (no ears); playback
   path (valid WAV -> aplay -> exit 0, no zombies) is tested.
-- Android: UI/state/permission layer + native audio capability flags
-  (mic-hardware, permission, signal-unknown, speaker-hardware, engine
-  presence; Zara engines honestly false). PHYSICAL ANDROID: BLOCKED
-  (`adb devices` empty, no phone); EMULATOR VERIFIED 2026-10-03.
+- Android: full body runtime (Stage 9 — see `docs/ANDROID_STATUS.md`):
+  lifecycle/restore/revoke, allowlisted job execution, voice session with
+  Core-identical limits, notification approvals via Core, mock push + poll
+  fallback. EMULATOR VERIFIED 2026-10-03 (pairing, jobs, revoke, audio API
+  paths). PHYSICAL ANDROID: PENDING (mic signal, audibility, DSP wake).
 - Whisper quirks observed: number words normalize ("one two three" ->
   "1 2 3"), punctuation varies run to run. Tests assert accordingly.
 

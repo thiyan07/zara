@@ -12,9 +12,11 @@ class NotificationManager:
 
     def create(self, title: str, body: str = "",
                device_id: str | None = None,
-               mission_id: str | None = None) -> Notification:
+               mission_id: str | None = None,
+               execution_id: str | None = None) -> Notification:
         n = Notification(id=f"notif-{uuid.uuid4().hex[:12]}", title=title,
-                         body=body, device_id=device_id, mission_id=mission_id)
+                         body=body, device_id=device_id,
+                         mission_id=mission_id, execution_id=execution_id)
         with self._lock:
             self._items.append(n)
         if self._on_event:

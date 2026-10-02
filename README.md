@@ -14,10 +14,15 @@ Voice: `POST /v1/voice/turn`; wake: `/v1/wake/*`. Provider config:
 
 Stage 5 adds MCP interop + sandbox isolation + real-world validation.
 Stage 6 validated on the Android emulator (see `docs/STAGE6_EMULATOR_TEST_REPORT.md`). See `docs/STAGE4_STATUS.md`, `docs/TEST_REPORT.md`, `docs/DEPLOYMENT.md`.
+Stage 9 builds the Android mobile body runtime: lifecycle, secure identity,
+jobs, voice session, notifications, push abstraction — see
+`docs/ANDROID_ARCHITECTURE.md`, `docs/ANDROID_STATUS.md`,
+`docs/ANDROID_TEST_REPORT.md`. Physical-device testing is pending
+(`PHYSICAL_DEVICE_VALIDATION_PENDING` in those docs).
 
 ```bash
 pip install -r requirements.txt
-python -m pytest              # 101 tests (Stages 1-6)
+python -m pytest              # 157 tests (Stages 1-9)
 ZARA_MEMORY_DB=assistant.db ASSISTANT_TOKEN=dev-token \
   uvicorn core.app:app --port 8080
 ```

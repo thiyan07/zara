@@ -2,15 +2,43 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-/// Minimal Zara Core REST client (dart:io only, no third-party deps).
-/// Device key is kept in memory in Stage 2; secure storage lands in Stage 3.
+/// Zara Core REST client (dart:io only, no third-party deps).
+/// Device key is held in memory; long-term storage is SecureStore's job.
+/// Every call has a bounded timeout; 401/403/404 surface as typed errors
+/// so the lifecycle layer can react (revoked/reregister) instead of
+/// retry-looping. Cancellation is cooperative via [CancelScope].
+class CoreException implements Exception {
+  final int status;
+  final String body;
+  const CoreException(this.status, this.body);
+  @override
+  String toString() => 'CoreException($status): $body';
+}
+
+/// 401/403: identity rejected (revoked/rotated/expired) -> safe state.
+class AuthException extends CoreException {
+  const AuthException(super.status, super.body);
+}
+
+/// 404 on heartbeat/poll: backend restarted or never registered -> re-register.
+class NotRegisteredException extends CoreException {
+  const NotRegisteredException(super.status, super.body);
+}
+
+class CancelScope {
+  bool _cancelled = false;
+  void cancel() => _cancelled = true;
+  bool get isCancelled => _cancelled;
+}
+
 class CoreClient {
   final String baseUrl;
+  final Duration timeout;
   String? deviceId;
   String? deviceKey;
   String? devToken; // local development only
 
-  CoreClient(this.baseUrl);
+  CoreClient(this.baseUrl, {this.timeout = const Duration(seconds: 15)});
 
   Map<String, String> get _deviceHeaders {
     final h = <String, String>{'Content-Type': 'application/json'};
@@ -20,9 +48,19 @@ class CoreClient {
     return h;
   }
 
+  Never _raise(String path, int status, String text) {
+    final msg = 'POST $path -> $status: ${text.take(300)}';
+    if (status == 401 || status == 403) throw AuthException(status, msg);
+    if (status == 404) throw NotRegisteredException(status, msg);
+    throw CoreException(status, msg);
+  }
+
   Future<Map<String, dynamic>> _post(
       String path, Map<String, dynamic> body,
-      {bool deviceAuth = true}) async {
+      {bool deviceAuth = true, CancelScope? cancel}) async {
+    if (cancel?.isCancelled ?? false) {
+      throw const CoreException(-1, 'cancelled before send');
+    }
     final client = HttpClient();
     try {
       final req = await client.postUrl(Uri.parse('$baseUrl$path'));
@@ -34,11 +72,12 @@ class CoreClient {
             };
       headers.forEach(req.headers.set);
       req.write(jsonEncode(body));
-      final resp = await req.close().timeout(const Duration(seconds: 15));
+      final resp = await req.close().timeout(timeout);
       final text = await resp.transform(utf8.decoder).join();
-      if (resp.statusCode >= 400) {
-        throw HttpException('POST $path -> ${resp.statusCode}: $text');
+      if (cancel?.isCancelled ?? false) {
+        throw const CoreException(-1, 'cancelled while waiting');
       }
+      if (resp.statusCode >= 400) _raise(path, resp.statusCode, text);
       return jsonDecode(text) as Map<String, dynamic>;
     } finally {
       client.close();
@@ -63,12 +102,90 @@ class CoreClient {
   }
 
   Future<Map<String, dynamic>> heartbeat(
-      {double? batteryPct, required bool charging, required String network}) async {
+      {double? batteryPct,
+      required bool charging,
+      required String network,
+      CancelScope? cancel}) async {
     return _post('/v1/agent/heartbeat', {
       'battery_pct': batteryPct,
       'charging': charging,
       'network': network,
       'online': true,
+    }, cancel: cancel);
+  }
+
+  Future<Map<String, dynamic>> rotateKey({CancelScope? cancel}) async {
+    final out =
+        await _post('/v1/agent/rotate', {}, cancel: cancel);
+    deviceKey = out['device_key'] as String?;
+    return out;
+  }
+
+  Future<Map<String, dynamic>> updateCapabilities(
+      List<String> capabilities) async {
+    return _post('/v1/agent/capabilities', {
+      'capabilities': capabilities,
+      'removed': <String>[],
     });
   }
+
+  Future<Map<String, dynamic>?> pollJobs({CancelScope? cancel}) async {
+    final out = await _post('/v1/agent/jobs/poll', {}, cancel: cancel);
+    return out['job'] as Map<String, dynamic>?;
+  }
+
+  Future<void> reportJobResult(String jobId,
+      {required bool ok,
+      Map<String, dynamic> result = const {},
+      String error = ''}) async {
+    await _post('/v1/agent/jobs/result', {
+      'job_id': jobId,
+      'ok': ok,
+      'result': result,
+      'error': error.take(300),
+    });
+  }
+
+  Future<List<Map<String, dynamic>>> fetchNotifications() async {
+    final out = await _post('/v1/agent/notifications', {});
+    final list = out['notifications'];
+    if (list is! List) return [];
+    return list.whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList();
+  }
+
+  Future<void> ackNotification(String id) async {
+    await _post('/v1/agent/notifications/ack', {'notification_id': id});
+  }
+
+  /// Notification approve/deny buttons land here: device-scoped,
+  /// server-audited. Never local execution.
+  Future<Map<String, dynamic>> decideApproval(
+      String executionId, bool approve) async {
+    return _post('/v1/agent/approvals/$executionId', {
+      'decision': approve ? 'approve' : 'deny',
+    });
+  }
+
+  Future<void> registerPush(String token, {String provider = 'mock'}) async {
+    await _post('/v1/agent/push/register',
+        {'token': token, 'provider': provider});
+  }
+
+  Future<void> invalidatePush() async {
+    await _post('/v1/agent/push/invalidate', {});
+  }
+
+  Future<void> syncEvents(List<Map<String, dynamic>> events) async {
+    await _post('/v1/agent/events/sync', {'events': events.take(200).toList()});
+  }
+
+  Future<void> disconnect() async {
+    try {
+      await _post('/v1/agent/disconnect', {});
+    } catch (_) {/* best-effort goodbye */}
+  }
+}
+
+extension _Take on String {
+  String take(int n) => length <= n ? this : substring(0, n);
 }

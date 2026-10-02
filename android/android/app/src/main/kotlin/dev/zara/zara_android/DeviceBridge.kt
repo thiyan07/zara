@@ -1,10 +1,19 @@
 package dev.zara.zara_android
 
 import android.Manifest
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioFormat
+import android.media.AudioManager
+import android.media.AudioRecord
+import android.media.AudioTrack
+import android.media.MediaRecorder
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.BatteryManager
@@ -19,8 +28,31 @@ import io.flutter.plugin.common.MethodChannel
  * Anything not implemented here reports supported=false to Flutter;
  * Flutter never pretends an unimplemented capability works.
  */
-class DeviceBridge(private val context: Context) {
-    companion object { const val CHANNEL = "zara/device" }
+/**
+ * Zara native bridge — the ONLY place Android APIs are touched.
+ * Exposes 'zara/device' MethodChannel: getBattery / getNetwork /
+ * getPermissions / getVoiceSupport + Stage 9 audio, permission-request,
+ * notification-channel and self-test methods.
+ * Anything not implemented here reports supported=false to Flutter;
+ * Flutter never pretends an unimplemented capability works.
+ *
+ * Audio honesty: capture returns real PCM-or-error; a dataclass/wiring
+ * success is NEVER reported as human-heard or voice-detected.
+ */
+class DeviceBridge(
+    private val context: Context,
+    private val requestPermission:
+        (permission: String, result: MethodChannel.Result) -> Unit =
+        { _, result -> result.success(mapOf("granted" to false)) }
+) {
+    companion object {
+        const val CHANNEL = "zara/device"
+        const val RATE = 16000
+        const val MAX_SECONDS = 30
+    }
+
+    @Volatile private var capture: AudioRecord? = null
+    @Volatile private var player: AudioTrack? = null
 
     fun attach(engine: FlutterEngine) {
         MethodChannel(engine.dartExecutor.binaryMessenger, CHANNEL)
@@ -30,9 +62,264 @@ class DeviceBridge(private val context: Context) {
                     "getNetwork" -> result.success(network())
                     "getPermissions" -> result.success(permissions())
                     "getVoiceSupport" -> result.success(voiceSupport())
+                    "audioCapture" -> audioCapture(
+                        (call.argument<Double>("seconds") ?: 5.0), result)
+                    "audioStop" -> { stopCapture(); result.success(true) }
+                    "audioPlay" -> audioPlay(
+                        call.argument<ByteArray>("wav"), result)
+                    "audioPlayStop" -> { stopPlayer(); result.success(true) }
+                    "requestMicPermission" -> requestPermission(
+                        Manifest.permission.RECORD_AUDIO, result)
+                    "requestNotifPermission" ->
+                        if (Build.VERSION.SDK_INT >=
+                            Build.VERSION_CODES.TIRAMISU) {
+                            requestPermission(
+                                Manifest.permission.POST_NOTIFICATIONS, result)
+                        } else {
+                            result.success(mapOf("granted" to true,
+                                "already" to true))
+                        }
+                    "createNotificationChannels" -> {
+                        createChannels(); result.success(true)
+                    }
+                    "audioSelfTest" -> result.success(audioSelfTest())
                     else -> result.notImplemented()
                 }
             }
+    }
+
+    // ---------- bounded microphone capture (AudioRecord -> WAV) ----------
+
+    private fun audioCapture(seconds: Double, result: MethodChannel.Result) {
+        if (ContextCompat.checkSelfPermission(
+                context, Manifest.permission.RECORD_AUDIO) !=
+            PackageManager.PERMISSION_GRANTED) {
+            result.error("denied", "microphone permission not granted", null)
+            return
+        }
+        val secs = seconds.coerceIn(0.5, MAX_SECONDS.toDouble())
+        val n = (RATE * secs).toInt()
+        val minBuf = AudioRecord.getMinBufferSize(
+            RATE, AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT)
+        if (minBuf <= 0) {
+            result.error("unavailable", "no audio input device", null)
+            return
+        }
+        Thread {
+            var rec: AudioRecord? = null
+            try {
+                rec = AudioRecord(
+                    MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                    RATE, AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    maxOf(minBuf * 2, 32000))
+                synchronized(this) { capture = rec }
+                if (rec.state != AudioRecord.STATE_INITIALIZED) {
+                    result.error("unavailable", "input init failed", null)
+                    return@Thread
+                }
+                rec.startRecording()
+                val pcm = ByteArray(n * 2)
+                var read = 0
+                while (read < n * 2) {
+                    val r = rec.read(pcm, read, n * 2 - read)
+                    if (r <= 0) break
+                    read += r
+                }
+                result.success(wav(pcm, read))
+            } catch (e: SecurityException) {
+                result.error("denied", "microphone denied", null)
+            } catch (e: Exception) {
+                result.error("failed", (e.message ?: "capture failed"), null)
+            } finally {
+                try { rec?.stop() } catch (_: Exception) {}
+                try { rec?.release() } catch (_: Exception) {}
+                synchronized(this) {
+                    if (capture === rec) capture = null
+                }
+            }
+        }.start()
+    }
+
+    private fun stopCapture() {
+        synchronized(this) {
+            try { capture?.stop() } catch (_: Exception) {}
+            try { capture?.release() } catch (_: Exception) {}
+            capture = null
+        }
+    }
+
+    private fun wav(pcm: ByteArray, len: Int): ByteArray {
+        val total = len + 36
+        val out = ByteArray(len + 44)
+        fun w32(o: Int, v: Int) {
+            out[o] = (v and 0xFF).toByte()
+            out[o + 1] = ((v shr 8) and 0xFF).toByte()
+            out[o + 2] = ((v shr 16) and 0xFF).toByte()
+            out[o + 3] = ((v shr 24) and 0xFF).toByte()
+        }
+        fun w16(o: Int, v: Int) {
+            out[o] = (v and 0xFF).toByte()
+            out[o + 1] = ((v shr 8) and 0xFF).toByte()
+        }
+        "RIFF".forEachIndexed { i, c -> out[i] = c.code.toByte() }
+        w32(4, total)
+        "WAVEfmt ".forEachIndexed { i, c -> out[8 + i] = c.code.toByte() }
+        w32(16, 16); w16(20, 1); w16(22, 1); w32(24, RATE)
+        w32(28, RATE * 2); w16(32, 2); w16(34, 16)
+        "data".forEachIndexed { i, c -> out[36 + i] = c.code.toByte() }
+        w32(40, len)
+        pcm.copyInto(out, 44, 0, len)
+        return out
+    }
+
+    // ---------- speaker playback (AudioTrack + focus, cancellable) ----------
+
+    private fun audioPlay(wav: ByteArray?, result: MethodChannel.Result) {
+        if (wav == null || wav.size < 44) {
+            result.error("failed", "empty audio", null)
+            return
+        }
+        val am = context.getSystemService(Context.AUDIO_SERVICE)
+            as AudioManager
+        val focus: Any? = if (Build.VERSION.SDK_INT >=
+            Build.VERSION_CODES.O) {
+            val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setAudioAttributes(AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                    .setContentType(
+                        AudioAttributes.CONTENT_TYPE_SPEECH).build())
+                .build()
+            if (am.requestAudioFocus(req) !=
+                AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+                result.error("failed", "audio focus denied", null)
+                return
+            }
+            req
+        } else {
+            @Suppress("DEPRECATION")
+            if (am.requestAudioFocus(
+                    null, AudioManager.STREAM_MUSIC,
+                    AudioManager.AUDIOFOCUS_GAIN) !=
+                AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+                result.error("failed", "audio focus denied", null)
+                return
+            }
+            null
+        }
+        Thread {
+            var track: AudioTrack? = null
+            try {
+                // WAV from Core TTS is 16-bit mono; honor its own rate.
+                val rate = ((wav[24].toInt() and 0xFF) or
+                    ((wav[25].toInt() and 0xFF) shl 8) or
+                    ((wav[26].toInt() and 0xFF) shl 16) or
+                    ((wav[27].toInt() and 0xFF) shl 24))
+                    .takeIf { it in 8000..48000 } ?: 16000
+                val body = wav.copyOfRange(44, wav.size)
+                val minBuf = AudioTrack.getMinBufferSize(
+                    rate, AudioFormat.CHANNEL_OUT_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT)
+                track = AudioTrack(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                        .setContentType(
+                            AudioAttributes.CONTENT_TYPE_SPEECH).build(),
+                    AudioFormat.Builder().setEncoding(
+                        AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(rate).setChannelMask(
+                            AudioFormat.CHANNEL_OUT_MONO).build(),
+                    maxOf(minBuf, body.size),
+                    AudioTrack.MODE_STATIC,
+                    AudioManager.AUDIOFOCUS_NONE)
+                synchronized(this) { player = track }
+                if (track.state != AudioTrack.STATE_INITIALIZED) {
+                    result.error("unavailable", "output init failed", null)
+                    return@Thread
+                }
+                track.write(body, 0, body.size)
+                track.play()
+                // Bounded wait: at most clip length + 5 s, then report.
+                val ms = (body.size * 1000L / (rate * 2)).coerceAtMost(60000)
+                val deadline = System.currentTimeMillis() + ms + 5000
+                while (track.playState == AudioTrack.PLAYSTATE_PLAYING &&
+                    System.currentTimeMillis() < deadline) {
+                    Thread.sleep(50)
+                }
+                // Completion == clean exit. NOT proof a human heard it.
+                result.success(mapOf("played" to true,
+                    "bytes" to body.size, "rate" to rate,
+                    "audibility" to "manual-only"))
+            } catch (e: Exception) {
+                result.error("failed", (e.message ?: "play failed"), null)
+            } finally {
+                try { track?.stop() } catch (_: Exception) {}
+                try { track?.release() } catch (_: Exception) {}
+                synchronized(this) {
+                    if (player === track) player = null
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    (focus as? AudioFocusRequest)?.let {
+                        am.abandonAudioFocusRequest(it)
+                    }
+                } else {
+                    @Suppress("DEPRECATION")
+                    am.abandonAudioFocus(null)
+                }
+            }
+        }.start()
+    }
+
+    private fun stopPlayer() {
+        synchronized(this) {
+            try { player?.stop() } catch (_: Exception) {}
+            try { player?.release() } catch (_: Exception) {}
+            player = null
+        }
+    }
+
+    // ---------- notification channels ----------
+
+    private fun createChannels() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE)
+            as NotificationManager
+        nm.createNotificationChannel(NotificationChannel(
+            "zara_approvals", "Zara approvals",
+            NotificationManager.IMPORTANCE_HIGH))
+        nm.createNotificationChannel(NotificationChannel(
+            "zara_missions", "Zara missions",
+            NotificationManager.IMPORTANCE_DEFAULT))
+        nm.createNotificationChannel(NotificationChannel(
+            "zara_status", "Zara status",
+            NotificationManager.IMPORTANCE_LOW))
+    }
+
+    // ---------- self-test: API path only, no permission, no audio ----------
+
+    private fun audioSelfTest(): Map<String, Any?> {
+        val pm = context.packageManager
+        val minBuf = try {
+            AudioRecord.getMinBufferSize(RATE,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT)
+        } catch (e: Exception) { -1 }
+        val outBuf = try {
+            AudioTrack.getMinBufferSize(RATE,
+                AudioFormat.CHANNEL_OUT_MONO,
+                AudioFormat.ENCODING_PCM_16BIT)
+        } catch (e: Exception) { -1 }
+        return mapOf(
+            "supported" to true,
+            "microphone_hardware" to pm.hasSystemFeature(
+                PackageManager.FEATURE_MICROPHONE),
+            "speaker_hardware" to pm.hasSystemFeature(
+                PackageManager.FEATURE_AUDIO_OUTPUT),
+            "capture_api" to (minBuf > 0),
+            "playback_api" to (outBuf > 0),
+            "note" to "api path only; signal/audibility deferred",
+        )
     }
 
     private fun battery(): Map<String, Any?> {
@@ -51,8 +338,27 @@ class DeviceBridge(private val context: Context) {
                     as android.os.PowerManager
                 pm.isPowerSaveMode
             } else false
+            val plugged = filter?.getIntExtra(
+                BatteryManager.EXTRA_PLUGGED, -1) ?: -1
+            val source = when (plugged) {
+                BatteryManager.BATTERY_PLUGGED_AC -> "ac"
+                BatteryManager.BATTERY_PLUGGED_USB -> "usb"
+                BatteryManager.BATTERY_PLUGGED_WIRELESS -> "wireless"
+                else -> "battery"
+            }
+            val health = when (filter?.getIntExtra(
+                BatteryManager.EXTRA_HEALTH,
+                BatteryManager.BATTERY_HEALTH_UNKNOWN)) {
+                BatteryManager.BATTERY_HEALTH_GOOD -> "good"
+                BatteryManager.BATTERY_HEALTH_OVERHEAT -> "overheat"
+                BatteryManager.BATTERY_HEALTH_COLD -> "cold"
+                BatteryManager.BATTERY_HEALTH_OVER_VOLTAGE -> "over-voltage"
+                BatteryManager.BATTERY_HEALTH_DEAD -> "dead"
+                else -> "unknown"
+            }
             mapOf("supported" to true, "battery_pct" to pct,
-                "charging" to charging, "power_save" to powerSave)
+                "charging" to charging, "power_save" to powerSave,
+                "source" to source, "health" to health)
         } catch (e: Exception) {
             mapOf("supported" to false, "error" to (e.message ?: "unknown"))
         }
@@ -83,7 +389,8 @@ class DeviceBridge(private val context: Context) {
         val notif = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             granted(Manifest.permission.POST_NOTIFICATIONS)
         } else true
-        // Location/mic/camera intentionally unrequested in Stage 2 — report state only.
+        // Microphone/camera/location are runtime-requested (Stage 9):
+        // this reports state only; requests go through request* methods.
         return mapOf(
             "supported" to true,
             "notifications" to notif,

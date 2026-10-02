@@ -1,37 +1,56 @@
-# Android Architecture (`android/` — Flutter + Kotlin)
+# Android Architecture — Zara's mobile body
 
-## Layout
+The Android app is a **body** of the SAME Zara: one identity, one memory,
+one mission state, one permission system, one tool registry, one policy,
+one governor, one brain. The phone captures I/O, reports state, and runs
+Core-dispatched allowlisted jobs. It never reasons, never authorizes, never
+executes anything Core did not dispatch.
 
-- `lib/main.dart` — Zara shell UI: status, pairing-code claim, register,
-  battery/network cards, capability list. No voice UI yet.
-- `lib/core_client.dart` — core REST (dart:io, zero third-party deps):
-  claim/register/heartbeat. Key kept in memory (secure storage: Stage 3).
-- `lib/device_bridge.dart` — the ONLY Flutter→native path, one
-  `zara/device` MethodChannel.
-- `lib/capabilities.dart` — capability table (pure Dart, unit-tested).
-- `android/.../DeviceBridge.kt` — all Android API access:
-  `getBattery` (BatteryManager + power-save), `getNetwork`
-  (ConnectivityManager, metered detection), `getPermissions` (state reporting
-  only — nothing requested in Stage 2).
-- `MainActivity.kt` — attaches the bridge; nothing else.
+```
+Android mic ──bounded WAV──▶ Core STT ──▶ Zara Core loop (policy/governor/
+  router/approval) ──▶ NVIDIA LLM (proposal only) ──▶ verified result ──▶
+  TTS (Piper default / Magpie optional) ──▶ Android speaker
+```
 
-## Rules
+## Dart layers (`android/lib/`)
 
-- No Android code scattered in Flutter outside `device_bridge.dart`.
-- Unimplemented → `supported=false`, never faked.
-- Advertised to core = supported ones only.
-- `voice.wake_word` reserved with the exact phrase **"Hey Zara"**; the wake
-  engine itself is NOT built in this checkpoint.
-- Battery-first: 30 s heartbeat, no polling loops, no background inference,
-  heavy work routes to laptop/cloud via core router.
+| File | Owns | Authority |
+|---|---|---|
+| `device_lifecycle.dart` | pairing→enrolled→registering→online→degraded→reconnecting; revoked/logged-out/error | none; transitions only |
+| `connection.dart` | `CoreLinkState`, `RetryPolicy` (5 attempts, then offline), `PendingQueue` (bounded 50, heartbeats coalesce), `ResponseGuard` (stale drops) | none |
+| `core_client.dart` | REST calls, 15 s timeouts, typed `AuthException`/`NotRegisteredException`, `CancelScope` | none |
+| `secure_store.dart` | device key in Keystore-backed storage; in-memory fallback labeled | holds secret, never logs it |
+| `job_runner.dart` | allowlist `{system.battery, system.network}`; unknown tools REFUSED; dup IDs refused; cancel honored | executes ONLY allowlisted reads |
+| `audio_io.dart` | `MicCapture`/`SpeakerOutput` interfaces + mocks; status split hardware/permission/opened/signal | none |
+| `voice_session.dart` | `AndroidVoiceSession`: core states + `paused_battery`/`offline`; limits 5/300 s/60 s (same as Core) | none; mirrors Core |
+| `wake.dart` | `WakeController`: exact "Hey Zara" behind VAD gate + battery policy; returns state requests | none — no tool/policy path exists |
+| `battery_governor.dart` | levels from Core thresholds (critical<15, low<25, caution<30); charging overrides | advisory only |
+| `network_monitor.dart` | connected/metered/disconnected/reconnecting/unavailable; truthful strings | none |
+| `zara_notifications.dart` | channels, secret scrub, dedup, approve/deny → Core endpoint calls | none — no local execution path |
+| `push.dart` | `PushProvider` + `MockPushTransport`; token rules mirror server; poll is the reliable channel | none |
+| `app_state.dart` | `ZaraUiState`: presentation only; restore map holds device ID, never secrets | none |
+| `capabilities.dart` | advertised set (see STATUS); voice engines stay `false` | declaration only |
 
-## Limitations (Stage 2)
+## Native (`DeviceBridge.kt`, `MainActivity.kt`)
 
-No mic/capture in UI, no FCM push yet, `http://10.0.2.2:8080` dev URL for the
-emulator (TLS + production URL in later work), key in memory only.
+Single `zara/device` MethodChannel. Native owns: battery (pct/charging/
+power-save/source/health), network (transport/metered), permissions state,
+voice-support flags, bounded `AudioRecord` capture (16 kHz mono → WAV,
+≤30 s, thread-confined, no persistence), `AudioTrack` playback (focus,
+bounded wait, completion ≠ audibility), runtime permission requests
+(Activity-mediated, denial is normal state), notification channels,
+`audioSelfTest` (API-path proof without permission or audio).
 
-## Verify
+## Core endpoints used (all pre-existing protocol + Stage-9 additions)
 
-`flutter analyze` (clean), `flutter test` (3 capability-contract tests),
-`flutter build apk --debug` (validates Kotlin bridge compiles).
-No physical-device testing claimed — emulator/physical validation is later.
+enroll / claim / rotate / register / heartbeat / capabilities / jobs
+poll+result / events sync / disconnect / revoke — plus Stage 9:
+notifications pull+ack, push register+invalidate, device-scoped approvals
+(own-device executions only; cross-device stays operator-only), and
+approval holds auto-notify the target device with its execution ID.
+
+## What Android never does
+
+Bypass policy/governor/approval; run LLM-proposed commands; pick URLs;
+exec anything (`Runtime.exec`/`ProcessBuilder` absent); treat model output
+as instructions; persist audio/transcripts; log keys/tokens/secrets.

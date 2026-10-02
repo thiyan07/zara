@@ -85,6 +85,19 @@ class JobResultIn(BaseModel):
     error: str = ""
 
 
+class NotifAckIn(BaseModel):
+    notification_id: str
+
+
+class PushRegisterIn(BaseModel):
+    token: str
+    provider: str = "mock"
+
+
+class ApprovalIn(BaseModel):
+    decision: str  # approve|deny
+
+
 class TalkIn(BaseModel):
     text: str
     session_id: str = ""
@@ -165,6 +178,8 @@ def build_stack(memory_db: str = "", audit_db: str = ":memory:",
     ctx = ContextManager()
     sched = Scheduler()
     notifs = NotificationManager(on_event=lambda t, p: bus.publish(t, source="notifications", payload=p))
+    from .push import PushRegistry as _PushRegistry
+    push = _PushRegistry()
     gov = ResourceGovernor()
     model = provider_from_env()
     router = Router(devices, registry, policy, gov)
@@ -180,6 +195,25 @@ def build_stack(memory_db: str = "", audit_db: str = ":memory:",
     limits = {"general": RateLimiter(600, 60.0),
               "sensitive": RateLimiter(30, 60.0)}
     bus.subscribe("*", lambda ev: audit.record("bus", ev.type, ev.source, str(ev.payload)[:500]))
+    # Stage 9: approval holds on a device notify THAT device (with the
+    # execution ID so its Approve/Deny buttons resolve through Core).
+    def _approval_notify(payload):
+        try:
+            exec_id = (payload or {}).get("execution_id")
+            rec = engine.get(exec_id) if exec_id else None
+        except (KeyError, TypeError):
+            rec = None
+        if rec is None or not rec.device_id:
+            return
+        try:
+            devices.get(rec.device_id)
+        except KeyError:
+            return  # unknown device: nobody to notify
+        notifs.create(f"Approval required: {rec.tool}",
+                      f"Execution {rec.id} on {rec.device_id} needs a decision.",
+                      device_id=rec.device_id, mission_id=rec.mission_id,
+                      execution_id=rec.id)
+    bus.subscribe("permission_required", lambda ev: _approval_notify(ev.payload))
     return {"bus": bus, "audit": audit, "policy": policy, "registry": registry,
             "engine": engine, "missions": missions, "devices": devices,
             "memory": memory, "memory_service": memory_service,
@@ -187,7 +221,7 @@ def build_stack(memory_db: str = "", audit_db: str = ":memory:",
             "gov": gov, "model": model, "events_log": events_log,
             "jobs": jobs, "device_auth": device_auth, "router": router,
             "sessions": sessions, "tracer": tracer, "loop": loop,
-            "voice": voice, "wake": wake, "limits": limits}
+            "voice": voice, "wake": wake, "limits": limits, "push": push}
 
 def create_app(stack=None) -> FastAPI:
     s = stack or build_stack()
@@ -540,7 +574,9 @@ def create_app(stack=None) -> FastAPI:
         if s["jobs"].is_cancelled(job.id):
             return {"job": None}
         return {"job": {"job_id": job.id, "tool": job.tool,
-                        "inputs": job.inputs, "timeout_s": job.timeout_s}}
+                        "inputs": job.inputs, "timeout_s": job.timeout_s,
+                        "execution_id": job.execution_id,
+                        "mission_id": job.mission_id}}
 
     @app.post("/v1/agent/jobs/result")
     def agent_result(body: JobResultIn, device_id: str = Depends(agent_auth)):
@@ -585,6 +621,89 @@ def create_app(stack=None) -> FastAPI:
             pass
         s["audit"].record("operator", "device_revoke", device_id, "")
         return {"revoked": device_id}
+
+    # ---- Stage 9: device notifications pull/ack (poll fallback for push) ----
+
+    @app.post("/v1/agent/notifications")
+    def agent_notifications(device_id: str = Depends(agent_auth)):
+        """Pending notifications for THIS device (broadcast + addressed).
+        Bodies truncated; secrets never belong in notifications."""
+        out = []
+        for n in s["notifs"].pending(device_id):
+            out.append({"id": n.id, "title": n.title[:120],
+                        "body": (n.body or "")[:500],
+                        "mission_id": n.mission_id,
+                        "execution_id": n.execution_id,
+                        "created_at": (n.created_at.isoformat()
+                                      if hasattr(n.created_at, "isoformat")
+                                      else str(n.created_at))})
+        return {"notifications": out}
+
+    @app.post("/v1/agent/notifications/ack")
+    def agent_notifications_ack(body: NotifAckIn,
+                                device_id: str = Depends(agent_auth)):
+        """Acknowledge delivery. Only own or broadcast notifications."""
+        found = None
+        for n in s["notifs"].pending(None):
+            if n.id == body.notification_id and n.device_id in (None, device_id):
+                found = n
+                break
+        if found is None:
+            raise HTTPException(status_code=404,
+                                detail="unknown notification for this device")
+        s["notifs"].mark_delivered(found.id)
+        return {"acked": found.id}
+
+    # ---- Stage 9: push registration (mock transport; FCM deferred) ----
+
+    @app.post("/v1/agent/push/register")
+    def agent_push_register(body: PushRegisterIn,
+                            device_id: str = Depends(agent_auth)):
+        try:
+            s["push"].register(device_id, body.token, body.provider)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        s["audit"].record("device", "push_register", device_id, body.provider)
+        return {"registered": device_id, "provider": body.provider}
+
+    @app.post("/v1/agent/push/invalidate")
+    def agent_push_invalidate(device_id: str = Depends(agent_auth)):
+        s["push"].invalidate(device_id)
+        try:
+            s["devices"].mark_offline(device_id)
+        except KeyError:
+            pass
+        return {"invalidated": device_id}
+
+    # ---- Stage 9: device-scoped approval (same human, phone surface) ----
+    # A device may approve/deny ONLY executions targeted at itself.
+    # Cross-device approvals stay operator-only. Both paths audited.
+
+    @app.post("/v1/agent/approvals/{exec_id}")
+    def agent_approve(exec_id: str, body: ApprovalIn,
+                      device_id: str = Depends(agent_auth)):
+        if body.decision not in ("approve", "deny"):
+            raise HTTPException(status_code=400,
+                                detail="decision must be approve|deny")
+        try:
+            rec = s["engine"].get(exec_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="unknown execution")
+        if rec.device_id != device_id:
+            s["audit"].record(device_id, "approval_scope_denied", exec_id,
+                              f"target={rec.device_id}", ok=False)
+            raise HTTPException(status_code=403,
+                                detail="execution not targeted at this device")
+        try:
+            if body.decision == "deny":
+                rec = s["engine"].cancel(exec_id)
+            else:
+                rec = s["engine"].approve(exec_id)
+        except ValueError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        s["audit"].record(device_id, "approval_" + body.decision, exec_id,
+                          rec.state.value)
+        return {"id": rec.id, "status": rec.state.value}
 
     @app.post("/v1/dispatch")
     def dispatch(body: DispatchIn, _=Depends(auth)):

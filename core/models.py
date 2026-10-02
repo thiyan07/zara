@@ -168,6 +168,7 @@ class Notification(BaseModel):
     body: str = ""
     device_id: Optional[str] = None
     mission_id: Optional[str] = None
+    execution_id: Optional[str] = None  # Stage 9: approval actions target this
     created_at: datetime = Field(default_factory=utcnow)
     delivered: bool = False
 
