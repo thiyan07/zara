@@ -43,3 +43,10 @@ Linux, BatteryManager on Android). <15% + discharging marks the device
 degraded; router skips constrained devices (defer, not fail); heavy work
 reroutes to laptop/cloud; offline agents queue (cap 200) and back off to
 60 s. Android: 30 s heartbeat, no background loops.
+
+## Stage 3 addition
+
+Voice/wake obey the same governor: wake listening pauses <15% (resumes
+>25%), power-save pauses, no background inference or cloud audio while idle,
+STT/TTS kept short-utterance, heavy reasoning routed to laptop/cloud.
+Thresholds configurable (`WakeConfig`, `VoiceConfig`), never magic.

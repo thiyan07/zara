@@ -8,8 +8,8 @@ from collections import Counter
 from .models import MemoryItem, utcnow
 
 SECRET_MARKERS = [re.compile(p, re.I) for p in
-                  (r"secret", r"password", r"api[_-]?key", r"\btoken\b",
-                   r"private[_-]?key", r"credential")]
+                  (r"secret", r"password", r"api[ _-]?key", r"\btoken\b",
+                   r"private[ _-]?key", r"credential")]
 SECRET_CATEGORY = "secret"
 
 def _tokens(text: str) -> list[str]:
@@ -85,6 +85,8 @@ class MemoryStore:
                 continue
             if it.expires_at and it.expires_at < now:
                 continue
+            if it.metadata.get("superseded_by"):
+                continue  # corrected memories lose authority, kept as provenance
             sem = _cosine(q_emb, it.embedding or [])
             kw_toks = set(_tokens(it.text))
             kw = len(q_toks & kw_toks) / max(1, len(q_toks | kw_toks))
@@ -95,3 +97,71 @@ class MemoryStore:
 
     def all(self) -> list[MemoryItem]:
         return list(self._items.values())
+
+
+class PersistentMemoryStore(MemoryStore):
+    """SQLite-backed memory: same policy/retrieval, actually persisted.
+
+    Embeddings serialize as JSON (local path). Production path is
+    PostgreSQL + pgvector — same rows, vector column (see db.py notes).
+    """
+
+    def __init__(self, path: str = "assistant.db",
+                 embedder=None, policy=None) -> None:
+        import json as _json
+        import sqlite3 as _sqlite3
+        self._json = _json
+        super().__init__(embedder=embedder, policy=policy)
+        self._db = _sqlite3.connect(path, check_same_thread=False)
+        with self._lock, self._db:
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS memory (id TEXT PRIMARY KEY, "
+                "category TEXT NOT NULL, text TEXT NOT NULL, source TEXT, "
+                "confidence REAL, importance REAL, embedding TEXT, "
+                "metadata TEXT, created_at TEXT, updated_at TEXT, "
+                "expires_at TEXT)")
+        for row in self._db.execute("SELECT * FROM memory").fetchall():
+            try:
+                item = self._row(row)
+                if item.embedding is None:
+                    item.embedding = self.embedder.embed(item.text)
+                self._items[item.id] = item
+            except Exception:  # noqa: BLE001 — skip corrupt rows, stay up
+                continue
+
+    def _row(self, row) -> MemoryItem:
+        return MemoryItem(id=row[0], category=row[1], text=row[2],
+                          source=row[3] or "", confidence=row[4] or 0.5,
+                          importance=row[5] if row[5] is not None else 0.5,
+                          embedding=self._json.loads(row[6]) if row[6] else None,
+                          metadata=self._json.loads(row[7]) if row[7] else {},
+                          created_at=row[8], updated_at=row[9],
+                          expires_at=row[10])
+
+    def remember(self, item: MemoryItem):
+        stored = super().remember(item)
+        if stored is None:
+            return None
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT OR REPLACE INTO memory VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (stored.id, stored.category, stored.text, stored.source,
+                 stored.confidence, stored.importance,
+                 self._json.dumps(stored.embedding or []),
+                 self._json.dumps(stored.metadata),
+                 stored.created_at.isoformat()
+                 if hasattr(stored.created_at, "isoformat")
+                 else stored.created_at,
+                 stored.updated_at.isoformat()
+                 if hasattr(stored.updated_at, "isoformat")
+                 else stored.updated_at,
+                 stored.expires_at.isoformat()
+                 if stored.expires_at and hasattr(stored.expires_at, "isoformat")
+                 else stored.expires_at))
+        return stored
+
+    def forget(self, item_id: str) -> bool:
+        gone = super().forget(item_id)
+        with self._lock, self._db:
+            self._db.execute("DELETE FROM memory WHERE id=?", (item_id,))
+        return gone

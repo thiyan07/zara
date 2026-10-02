@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'capabilities.dart';
 import 'core_client.dart';
 import 'device_bridge.dart';
+import 'voice.dart' show wakePhrase;
 
 void main() => runApp(const ZaraApp());
 
@@ -88,6 +89,9 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
                 decoration: const InputDecoration(labelText: 'Pairing code from Zara Core')),
             const SizedBox(height: 8),
             FilledButton(onPressed: _connect, child: const Text('Connect “Hey Zara” device')),
+            const SizedBox(height: 12),
+            Text('Voice: wake phrase “$wakePhrase” (engine pending hardware validation)',
+                style: Theme.of(context).textTheme.bodyMedium),
             const SizedBox(height: 12),
             Text('Capabilities', style: Theme.of(context).textTheme.titleMedium),
             for (final c in androidCapabilities)

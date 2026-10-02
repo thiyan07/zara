@@ -77,3 +77,14 @@ for events and mission updates. Stateless auth hook ready for device tokens
   bridge). Boundary: Zara Core -> Device Protocol -> Device Agent -> OS APIs.
 - Details: DEVICE_ARCHITECTURE.md, DEVICE_PROTOCOL.md, ANDROID_ARCHITECTURE.md,
   LINUX_AGENT.md, DEVICE_SECURITY.md.
+
+## Stage 3 addition (same Zara)
+
+Reasoning layer attached WITHOUT touching core authority: `core/llm.py`
+(structured contract), `core/providers.py` (echo/scripted/openai-compatible,
+env-configured), `core/conversation.py` (NL tool loop with budgets),
+`core/memory_policy.py` + persistent SQLite memory, `core/sessions.py`,
+`core/tracing.py`, `core/voice.py` (STT/TTS/state/wake/pipeline), new
+endpoints `/v1/talk`, `/v1/talk/resume`, `/v1/voice/*`, `/v1/wake/*`,
+`/v1/sessions`, `/v1/memory/correct`, `/v1/trace/*`. LLM proposes, core
+disposes — see LLM_ARCHITECTURE.md, TOOL_REASONING_LOOP.md.

@@ -38,3 +38,11 @@ Per-device identity replaces the shared token for devices: one-time pairing
 codes, per-device keys (hashed server-side), expiry, revocation, 403 on
 forgery. Tool allowlists on the device back up core policy. Full detail:
 docs/DEVICE_SECURITY.md. Dev bearer token is local-dev only.
+
+## Stage 3 addition
+
+LLM treated as untrusted input: strict proposal validation, tool outputs and
+memories wrapped as untrusted data, deny-patterns hold even when the request
+arrives via NL, prompt-injection content cannot alter policy (tested),
+secrets redacted from every prompt, traces redacted. Full detail in
+LLM_CONTRACT.md, RAG_ARCHITECTURE.md, TOOL_REASONING_LOOP.md.

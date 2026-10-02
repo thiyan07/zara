@@ -83,3 +83,14 @@ steps so execution can resume after restart/offline. `approve()` unblocks
   online -> policy -> governor -> device. Deny/defer reasons recorded.
 - **Device jobs** (`core/jobs.py`): pending|claimed|done|failed|cancelled|
   expired; claim-once; server waits on Condition.
+
+## Stage 3 additions
+
+- **LLM response contract** (`core/llm.py`): response|tool_call|
+  clarification|approval_required, strictly parsed, malformed discarded.
+- **Turn contract** (`TurnResult`): reply, status, mission/execution/device/
+  tool/trace ids. Budgets: 3 tool calls, 120 s, repeat guard.
+- **Memory write contract**: AUTO_SAVE|CANDIDATE|SESSION_ONLY|NEVER_STORE;
+  corrections supersede with provenance.
+- **Voice contract**: state machine transitions, barge-in, wake phrase
+  exactly "Hey Zara", battery-gated listening.

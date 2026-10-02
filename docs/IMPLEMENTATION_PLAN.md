@@ -12,6 +12,26 @@ Backend + contracts + tests.
 - [x] SQLite works; Postgres DDL documented for Oracle
 - Gate: `pytest` green; API boots; every contract has tests.
 
+## Stage 3 — Intelligence + natural interaction (DONE)
+
+- [x] Provider layer: echo/scripted/openai-compatible, env-configured,
+      streaming, retries, error classification, cancellation
+- [x] Structured LLM contract + strict validation (malformed discarded)
+- [x] NL tool loop with budgets, repeat guard, truthful failures
+- [x] Mission-integrated turns + approval resume
+- [x] Memory write policy (AUTO/CANDIDATE/SESSION/NEVER) + secret refusal
+- [x] SQLite-persistent memory (Postgres+pgvector path documented)
+- [x] Supersede-with-provenance corrections + expiry
+- [x] Prompt-injection defenses (untrusted wrapping, policy supremacy)
+- [x] Secret isolation (store refusal + prompt/trace redaction)
+- [x] Sessions (bounded, compacted, expiring) + tracing (redacted)
+- [x] STT/TTS abstractions, voice state machine, barge-in, wake "Hey Zara"
+      with battery gating (mock engines; hardware validation pending)
+- [x] Android voice boundary (`getVoiceSupport`, real flags only)
+- [x] Router local fallback for core-scoped tools (no fake device needed)
+- [x] 30 new tests; all 32 Stage 1+2 tests still pass
+- Gate (this checkpoint): live E2E TEST 1–7 verified (see commit notes).
+
 ## Stage 2 — Device bodies (DONE)
 
 - [x] Linux daemon (`device/linux/`): enroll/claim/register, heartbeat,
@@ -30,12 +50,11 @@ Backend + contracts + tests.
 - [x] 17 new tests; all 14 Stage 1 tests still pass
 - Gate (this checkpoint): full E2E core->agent->result->audit verified.
 
-## Stage 3 — Intelligence + natural interaction
+## Stage 3 — Intelligence + natural interaction (DONE — see checklist above)
 
-LLM provider integration behind `ModelProvider` interface, RAG retrieval +
-write policy, NL→tool selection via propose/approve/execute loop, voice
-in/out streaming, screen/vision, browser automation, OpenCode jobs,
-autonomous missions with approval gates.
+Stage 4 is next: E2E + cross-device continuity, failure/permission/battery/
+offline matrices, security review, concurrency + resource limits,
+long-mission soak, Oracle Always-Free deploy, backup/recovery, full suite.
 
 ## Stage 4 — Integration + hardening
 

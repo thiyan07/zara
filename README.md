@@ -1,16 +1,22 @@
 # Personal Assistant — Zara (ONE system; stages are checkpoints, not versions)
 
-Wake phrase (reserved, engine in a later stage): **"Hey Zara"**.
+Wake phrase: **"Hey Zara"** (engine abstraction in `core/voice.py`;
+mock-backed until hardware validation — see `docs/WAKE_WORD.md`).
 
-One coherent assistant system; stages are checkpoints, not product forks.
-See `docs/` for architecture, contracts, security, battery, and plan.
+Talk to Zara: `POST /v1/talk {"text": "..."}` — full loop (context+memory
+→ LLM proposal → policy/governor/router → device → verified result → reply).
+Voice: `POST /v1/voice/turn`; wake: `/v1/wake/*`. Provider config:
+`LLM_PROVIDER` (`echo` default) | `scripted` | `openai-compatible` with
+`LLM_BASE_URL`/`LLM_API_KEY`/`LLM_MODEL`. Persistent memory:
+`ZARA_MEMORY_DB` (SQLite file; unset = in-memory dev).
 
-## Run (Stage 2: core + Linux agent)
+## Run (Stage 3: core + agent + reasoning)
 
 ```bash
 pip install -r requirements.txt
-python -m pytest              # 31 tests (14 Stage 1 + 17 Stage 2)
-ASSISTANT_TOKEN=dev-token uvicorn core.app:app --port 8080
+python -m pytest              # 62 tests (Stages 1+2+3)
+ZARA_MEMORY_DB=assistant.db ASSISTANT_TOKEN=dev-token \
+  uvicorn core.app:app --port 8080
 ```
 
 Linux agent: see `docs/LINUX_AGENT.md`. Android app: see `android/` +

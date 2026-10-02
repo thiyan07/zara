@@ -46,24 +46,28 @@ class ContextManager:
                              memories=list(memories or []), device=device)
 
     def build_prompt(self, bundle: ContextBundle, task: str) -> str:
-        """Assemble ONLY what this reasoning step needs, with a hard cap."""
-        parts = [f"Task: {task}"]
+        """Assemble ONLY what this reasoning step needs, with a hard cap.
+        Secret-looking material is redacted — secrets never enter LLM context."""
+        from .tracing import redact
+        parts = [f"Task: {redact(task)}"]
         if bundle.world:
-            parts.append("World: " + str(bundle.world)[:800])
+            parts.append("World: " + redact(str(bundle.world))[:800])
         if bundle.mission:
-            parts.append(f"Mission[{bundle.mission.state.value}]: {bundle.mission.goal}"[:400])
+            parts.append(redact(f"Mission[{bundle.mission.state.value}]: "
+                                f"{bundle.mission.goal}")[:400])
         if bundle.memories:
-            mem = "\n".join(f"- {m.text[:200]}" for m in bundle.memories[:5])
+            mem = "\n".join(f"- {redact(m.text[:200])}"
+                            for m in bundle.memories[:5])
             parts.append(f"Relevant memory:\n{mem}")
         if bundle.device:
             d = bundle.device
             parts.append(f"Device: {d.device_id} ({d.kind.value}) online={d.online} "
                          f"battery={d.battery_pct} net={d.network}")
         if bundle.conversation:
-            conv = "\n".join(f"{t.role}: {t.text[:300]}"
+            conv = "\n".join(f"{t.role}: {redact(t.text[:300])}"
                              for t in bundle.conversation[-6:])
             parts.append(f"Recent conversation:\n{conv}")
         if bundle.working:
-            parts.append("Working: " + str(bundle.working)[:800])
+            parts.append("Working: " + redact(str(bundle.working))[:800])
         prompt = "\n\n".join(parts)
         return prompt[:MAX_PROMPT_CHARS]

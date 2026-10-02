@@ -29,6 +29,7 @@ class DeviceBridge(private val context: Context) {
                     "getBattery" -> result.success(battery())
                     "getNetwork" -> result.success(network())
                     "getPermissions" -> result.success(permissions())
+                    "getVoiceSupport" -> result.success(voiceSupport())
                     else -> result.notImplemented()
                 }
             }
@@ -86,6 +87,28 @@ class DeviceBridge(private val context: Context) {
             "microphone" to granted(Manifest.permission.RECORD_AUDIO),
             "camera" to granted(Manifest.permission.CAMERA),
             "location" to granted(Manifest.permission.ACCESS_FINE_LOCATION),
+        )
+    }
+
+    /**
+     * Voice support report (Stage 3 foundation). Only the microphone
+     * *permission state* is real here; capture/STT/TTS/wake engines are
+     * reported as unsupported until provider-backed implementations land
+     * with hardware validation. Nothing is faked.
+     */
+    private fun voiceSupport(): Map<String, Any?> {
+        val mic = ContextCompat.checkSelfPermission(
+            context, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        return mapOf(
+            "supported" to true,
+            "wake_phrase" to "Hey Zara",
+            "microphone_permission" to mic,
+            "audio_capture" to false,
+            "stt" to false,
+            "tts" to false,
+            "wake_word_engine" to false,
+            "note" to "provider-backed voice pending hardware validation",
         )
     }
 }

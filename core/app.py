@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from .audit import AuditLog
 from .builtin_tools import BUILTINS
 from .context import ContextManager
+from .conversation import ConversationLoop
 from .device_auth import DeviceAuthStore
 from .device_tools import register_device_proxies
 from .devices import DeviceManager
@@ -15,14 +16,20 @@ from .events import EventBus
 from .execution import ExecutionEngine, PolicyDenied
 from .governor import ResourceGovernor, ResourceSnapshot
 from .jobs import JobQueue
-from .memory import MemoryStore
+from .memory import MemoryStore, PersistentMemoryStore
+from .memory_policy import MemoryService
 from .missions import MissionEngine, MissionState
 from .models import DeviceKind, DeviceState, MemoryItem
 from .notifications import NotificationManager
 from .policy import PolicyEngine
 from .protocol import CapabilityUpdate, ExecutionResult, HeartbeatPayload
-from .providers import EchoProvider
+from .providers import provider_from_env
 from .routing import Router
+from .scheduler import Scheduler
+from .sessions import SessionStore
+from .tools import ToolDefinition, ToolRegistry
+from .tracing import Tracer
+from .voice import MockSTT, MockTTS, MockWakeEngine, VoicePipeline
 from .scheduler import Scheduler
 from .tools import ToolDefinition, ToolRegistry
 
@@ -75,7 +82,41 @@ class JobResultIn(BaseModel):
     result: dict = {}
     error: str = ""
 
-def build_stack():
+
+class TalkIn(BaseModel):
+    text: str
+    session_id: str = ""
+    device_id: str = "cloud"
+    who: str = "user"
+
+
+class ResumeIn(BaseModel):
+    execution_id: str
+    session_id: str = ""
+
+
+class VoiceTurnIn(BaseModel):
+    audio_base64: str = ""
+    session_id: str = ""
+    device_id: str = "android-phone"
+    who: str = "user"
+
+
+class WakeEventIn(BaseModel):
+    phrase: str
+
+
+class WakeBatteryIn(BaseModel):
+    battery_pct: float | None = None
+    charging: bool = False
+    power_save: bool = False
+
+
+class MemoryCorrectIn(BaseModel):
+    old_query: str
+    new_text: str
+
+def build_stack(memory_db: str = ""):
     bus = EventBus()
     audit = AuditLog()
     policy = PolicyEngine()
@@ -91,19 +132,35 @@ def build_stack():
                              on_event=lambda t, p: bus.publish(t, source="execution", payload=p))
     missions = MissionEngine(on_event=lambda t, p: bus.publish(t, source="missions", payload=p))
     devices = DeviceManager(on_event=lambda t, p: bus.publish(t, source="devices", payload=p))
-    memory = MemoryStore()
+    if memory_db:
+        memory = PersistentMemoryStore(memory_db)
+    else:
+        memory = MemoryStore()
+    memory_service = MemoryService(memory)
     ctx = ContextManager()
     sched = Scheduler()
     notifs = NotificationManager(on_event=lambda t, p: bus.publish(t, source="notifications", payload=p))
     gov = ResourceGovernor()
-    model = EchoProvider()
+    model = provider_from_env()
     router = Router(devices, registry, policy, gov)
+    sessions = SessionStore()
+    tracer = Tracer()
+    loop = ConversationLoop(provider=model, ctx=ctx, memory=memory_service,
+                            registry=registry, policy=policy, engine=engine,
+                            router=router, devices=devices, governor=gov,
+                            missions=missions, audit=audit, bus=bus,
+                            sessions=sessions, tracer=tracer)
+    voice = VoicePipeline(MockSTT(""), MockTTS(), loop, sessions)
+    wake = MockWakeEngine()
     bus.subscribe("*", lambda ev: audit.record("bus", ev.type, ev.source, str(ev.payload)[:500]))
     return {"bus": bus, "audit": audit, "policy": policy, "registry": registry,
             "engine": engine, "missions": missions, "devices": devices,
-            "memory": memory, "ctx": ctx, "sched": sched, "notifs": notifs,
+            "memory": memory, "memory_service": memory_service,
+            "ctx": ctx, "sched": sched, "notifs": notifs,
             "gov": gov, "model": model, "events_log": events_log,
-            "jobs": jobs, "device_auth": device_auth, "router": router}
+            "jobs": jobs, "device_auth": device_auth, "router": router,
+            "sessions": sessions, "tracer": tracer, "loop": loop,
+            "voice": voice, "wake": wake}
 
 def create_app(stack=None) -> FastAPI:
     s = stack or build_stack()
@@ -217,6 +274,95 @@ def create_app(stack=None) -> FastAPI:
     @app.get("/v1/notifications")
     def notifications(_=Depends(auth)):
         return [n.model_dump() for n in s["notifs"].pending()]
+
+    # ---- Stage 3: Zara reasoning loop, memory service, voice, wake ----
+
+    @app.post("/v1/talk")
+    def talk(body: TalkIn, _=Depends(auth)):
+        """Full NL loop: context+memory -> LLM proposal -> core -> device ->
+        verified result -> NL response. LLM never executes directly."""
+        result = s["loop"].handle_text(body.text, session_id=body.session_id,
+                                       device_id=body.device_id, who=body.who)
+        return {"reply": result.reply, "status": result.status,
+                "session_id": body.session_id,
+                "mission_id": result.mission_id,
+                "execution_id": result.execution_id,
+                "device_id": result.device_id, "tool": result.tool,
+                "trace_id": result.trace_id}
+
+    @app.post("/v1/talk/resume")
+    def talk_resume(body: ResumeIn, _=Depends(auth)):
+        """Continue a turn held for approval after human approval."""
+        result = s["loop"].resume_after_approval(body.execution_id,
+                                                 body.session_id)
+        return {"reply": result.reply, "status": result.status,
+                "mission_id": result.mission_id,
+                "execution_id": result.execution_id}
+
+    @app.post("/v1/sessions")
+    def create_session(device_id: str = "cloud", _=Depends(auth)):
+        session = s["sessions"].create(device_id=device_id)
+        return session.model_dump()
+
+    @app.get("/v1/sessions/{session_id}")
+    def get_session(session_id: str, _=Depends(auth)):
+        try:
+            return s["sessions"].get(session_id).model_dump()
+        except KeyError:
+            raise HTTPException(status_code=404, detail="unknown session")
+
+    @app.post("/v1/memory/correct")
+    def memory_correct(body: MemoryCorrectIn, _=Depends(auth)):
+        return s["memory_service"].correct(body.old_query, body.new_text)
+
+    @app.get("/v1/trace/{trace_id}")
+    def get_trace(trace_id: str, _=Depends(auth)):
+        return [{"name": sp.name, "latency_s": round(sp.latency_s, 3),
+                 "attrs": sp.attrs}
+                for sp in s["tracer"].for_trace(trace_id)]
+
+    @app.post("/v1/voice/turn")
+    def voice_turn(body: VoiceTurnIn, _=Depends(auth)):
+        """Audio in -> STT -> core loop -> TTS. Mock providers by default;
+        real providers plug in via configuration (Stage 3 docs)."""
+        import base64
+        try:
+            audio = base64.b64decode(body.audio_base64) if body.audio_base64 \
+                else b"mock-audio"
+        except Exception:  # noqa: BLE001
+            raise HTTPException(status_code=422, detail="invalid audio_base64")
+        out = s["voice"].handle_audio(audio, session_id=body.session_id,
+                                      device_id=body.device_id, who=body.who)
+        return out
+
+    @app.post("/v1/voice/interrupt")
+    def voice_interrupt(_=Depends(auth)):
+        return s["voice"].interrupt()
+
+    @app.get("/v1/wake")
+    def wake_status(_=Depends(auth)):
+        w = s["wake"]
+        return {"phrase": w.config.phrase, "running": w.running,
+                "paused": w.paused, "detections": w.detections,
+                "pause_below_pct": w.config.pause_below_pct}
+
+    @app.post("/v1/wake/event")
+    def wake_event(body: WakeEventIn, _=Depends(auth)):
+        """Deterministic mock detection path. Physical audio validation
+        remains pending — see docs/WAKE_WORD.md."""
+        from .voice import WAKE_PHRASE
+        if body.phrase != WAKE_PHRASE:
+            raise HTTPException(status_code=422, detail="unknown wake phrase")
+        try:
+            return s["wake"].simulate_detection()
+        except RuntimeError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+
+    @app.post("/v1/wake/battery")
+    def wake_battery(body: WakeBatteryIn, _=Depends(auth)):
+        return {"state": s["wake"].battery_update(body.battery_pct,
+                                                  body.charging,
+                                                  body.power_save)}
 
     # ---- Stage 2: device protocol (additive) ----
 
@@ -377,4 +523,9 @@ def create_app(stack=None) -> FastAPI:
 
     return app
 
-app = create_app()
+
+def _stack_from_env():
+    return build_stack(memory_db=os.environ.get("ZARA_MEMORY_DB", ""))
+
+
+app = create_app(_stack_from_env())

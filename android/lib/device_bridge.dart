@@ -32,4 +32,16 @@ class DeviceBridge {
       return {'supported': false};
     }
   }
+
+  /// Voice boundary (Stage 3 foundation). The native side reports real
+  /// support flags; capture/STT/TTS/wake engines land with providers later.
+  /// Anything unimplemented returns supported=false — never faked.
+  Future<Map<String, dynamic>> voiceSupport() async {
+    try {
+      final m = await _ch.invokeMapMethod<String, dynamic>('getVoiceSupport');
+      return Map<String, dynamic>.from(m ?? {});
+    } on PlatformException {
+      return {'supported': false};
+    }
+  }
 }
