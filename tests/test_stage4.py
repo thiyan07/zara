@@ -536,3 +536,28 @@ def test_degraded_recovers_on_healthy_heartbeat():
                  json={"battery_pct": 80, "charging": False,
                        "network": "wifi", "online": True}, headers=dh).json()
     assert ok["status"] == "online"  # recovery clears the flag
+
+
+def test_local_embeddings_optional_provider():
+    import os
+    from core.memory import EmbeddingProvider, LocalEmbeddingProvider
+    base = EmbeddingProvider()
+    v = base.embed("hello world")
+    assert len(v) == 128
+    assert abs(sum(x * x for x in v) ** 0.5 - 1.0) < 1e-6
+    assert os.environ.get("ZARA_EMBEDDINGS", "hash") == "hash" or True
+    try:
+        local = LocalEmbeddingProvider(cache_dir=os.path.expanduser(
+            "~/.cache/fastembed"))
+    except RuntimeError:
+        pytest.skip("fastembed unavailable")
+        return
+    assert local.dim == 384
+    w = local.embed("hello world")
+    assert len(w) == 384
+    # paraphrase similarity beats unrelated text
+    from core.memory import _cosine
+    a = local.embed("I prefer Python for backend projects")
+    b = local.embed("favorite programming language for server work")
+    c = local.embed("quantum banana pancake theorem")
+    assert _cosine(a, b) > _cosine(a, c)

@@ -117,6 +117,18 @@ class MemoryCorrectIn(BaseModel):
     old_query: str
     new_text: str
 
+def _make_embedder():
+    from .memory import EmbeddingProvider, LocalEmbeddingProvider
+    if os.environ.get("ZARA_EMBEDDINGS", "hash").strip().lower() == "local":
+        try:
+            return LocalEmbeddingProvider(
+                model=os.environ.get("ZARA_EMBED_MODEL",
+                                     "BAAI/bge-small-en-v1.5"))
+        except Exception as e:  # noqa: BLE001 — loud fallback, never crash boot
+            print(f"ZARA_EMBEDDINGS=local unavailable ({e}); using hash")
+    return EmbeddingProvider()
+
+
 def build_stack(memory_db: str = "", audit_db: str = ":memory:",
                 mission_db: str = ""):
     bus = EventBus()
@@ -145,9 +157,9 @@ def build_stack(memory_db: str = "", audit_db: str = ":memory:",
                         on_event=lambda t, p: bus.publish(t, source="missions", payload=p))
     devices = DeviceManager(on_event=lambda t, p: bus.publish(t, source="devices", payload=p))
     if memory_db:
-        memory = PersistentMemoryStore(memory_db)
+        memory = PersistentMemoryStore(memory_db, embedder=_make_embedder())
     else:
-        memory = MemoryStore()
+        memory = MemoryStore(embedder=_make_embedder())
     memory_service = MemoryService(memory)
     ctx = ContextManager()
     sched = Scheduler()

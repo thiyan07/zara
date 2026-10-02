@@ -37,6 +37,30 @@ class EmbeddingProvider:
         n = math.sqrt(sum(x * x for x in v)) or 1.0
         return [x / n for x in v]
 
+
+class LocalEmbeddingProvider(EmbeddingProvider):
+    """ONNX-backed local embeddings (default bge-small-en-v1.5, 384 dim,
+    ~65 MB). Needs the `fastembed` package + one-time model download.
+    Falls back to nothing — construction fails loudly if unavailable, so
+    callers can catch it and keep the hash fallback. Set
+    ZARA_EMBEDDINGS=local to enable; ZARA_EMBED_MODEL overrides the model."""
+
+    def __init__(self, model: str = "BAAI/bge-small-en-v1.5",
+                 cache_dir: str = "") -> None:
+        import os as _os
+        try:
+            from fastembed import TextEmbedding
+        except ImportError:
+            raise RuntimeError("fastembed not installed: pip install fastembed")
+        self._model = TextEmbedding(
+            model,
+            cache_dir=cache_dir or _os.path.expanduser("~/.cache/fastembed"))
+        probe = list(self._model.embed(["probe"]))
+        self.dim = len(probe[0])
+
+    def embed(self, text: str) -> list[float]:
+        return list(self._model.embed([text]))[0].tolist()
+
 class MemoryPolicy:
     """Decides what deserves long-term storage. Not every turn is memory."""
     MIN_IMPORTANCE = 0.35

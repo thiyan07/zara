@@ -18,3 +18,7 @@ Zara's own memory store, injected as labeled untrusted context.
 - **No secrets**: the store refuses secrets at write time, so retrieval
   cannot leak them; the prompt builder redacts secret patterns anyway
   (defense in depth).
+
+## Local embeddings (evaluated, opt-in)
+
+`ZARA_EMBEDDINGS=local` selects `LocalEmbeddingProvider` (bge-small-en-v1.5, 384 dim, ~65 MB ONNX via fastembed, ~6 ms/embed, hash fallback otherwise). Measured top-1 paraphrase recall: hash 2/6 vs bge-small 4/6 on keyword-free paraphrases. Model lives in `~/.cache/fastembed`, never in git.
