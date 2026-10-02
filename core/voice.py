@@ -568,7 +568,9 @@ class VoicePipeline:
         return {"ok": True, "transcript": transcript, "reply": result.reply,
                 "audio_bytes": len(audio_out), "status": result.status,
                 "state": self.states.state.value,
-                "mission_id": result.mission_id}
+                "mission_id": result.mission_id,
+                "execution_id": result.execution_id,
+                "tool": result.tool, "device_id": result.device_id}
 
     def interrupt(self) -> dict:
         """Barge-in: stop TTS, return to listening. One session, no fork."""
@@ -581,3 +583,128 @@ class VoicePipeline:
         except IllegalVoiceTransition:
             self.states.reset()
         return {"interrupted": True, "state": self.states.state.value}
+
+
+# ---------- continuous conversation ----------
+
+import time as _time
+
+
+@dataclass
+class ConversationLimits:
+    max_turns: int = 5
+    max_duration_s: float = 300.0
+    idle_timeout_s: float = 60.0
+
+
+class VoiceConversation:
+    """Bounded multi-turn voice session over ONE VoicePipeline.
+
+    Budgets are hard: max turns, max wall-clock duration, idle timeout.
+    Approval holds pause the conversation and resume into the SAME session
+    (mission/approval state preserved). Per-turn loop budgets stay intact.
+    The LLM never touches mic, TTS provider, permissions, or devices.
+    """
+
+    def __init__(self, pipeline: VoicePipeline,
+                 limits: ConversationLimits | None = None,
+                 battery_ok=None) -> None:
+        self.pipeline = pipeline
+        self.limits = limits or ConversationLimits()
+        # battery_ok: optional callable () -> (bool, str); False pauses.
+        self.battery_ok = battery_ok or (lambda: (True, "ok"))
+        self.turns = 0
+        self.started_at = _time.time()
+        self.last_activity = self.started_at
+        self.pending_approval: str = ""
+        self.ended = False
+        self.end_reason = ""
+
+    def _check_bounds(self) -> tuple[bool, str]:
+        if self.ended:
+            return False, self.end_reason or "ended"
+        if self.turns >= self.limits.max_turns:
+            return False, "turn-limit"
+        if _time.time() - self.started_at >= self.limits.max_duration_s:
+            return False, "max-duration"
+        if _time.time() - self.last_activity >= self.limits.idle_timeout_s:
+            return False, "idle-timeout"
+        ok, reason = self.battery_ok()
+        if not ok:
+            return False, f"battery-paused: {reason}"
+        return True, "ok"
+
+    def turn(self, audio: bytes, session_id: str = "",
+             device_id: str = "local-voice", who: str = "user") -> dict:
+        """One bounded turn. Returns the pipeline result plus conversation
+        metadata. Approval holds set pending_approval instead of ending."""
+        allowed, reason = self._check_bounds()
+        if not allowed:
+            self.ended = True
+            self.end_reason = reason
+            return {"ok": False, "ended": True, "reason": reason}
+        out = self.pipeline.handle_audio(audio, session_id=session_id,
+                                         device_id=device_id, who=who)
+        self.turns += 1
+        self.last_activity = _time.time()
+        out["turn"] = self.turns
+        if out.get("status") == "approval_required" and out.get("mission_id"):
+            self.pending_approval = out.get("execution_id", "")
+        if self.turns >= self.limits.max_turns:
+            out["conversation_ended"] = "turn-limit"
+            self.ended = True
+            self.end_reason = "turn-limit"
+        return out
+
+    def resume_approval(self, session_id: str = "") -> dict:
+        """Continue after human approval, same conversation + mission."""
+        if not self.pending_approval:
+            return {"ok": False, "error": "nothing awaiting approval"}
+        res = self.pipeline.loop.resume_after_approval(
+            self.pending_approval, session_id)
+        self.pending_approval = ""
+        self.last_activity = _time.time()
+        # speak the resumed reply through the normal TTS path, walking
+        # the legal pipeline stages (no state jumps)
+        for stage in (VoiceState.LISTENING, VoiceState.TRANSCRIBING,
+                      VoiceState.THINKING, VoiceState.SPEAKING):
+            self.pipeline.states.move(stage)
+        self.pipeline._speak_cancel.clear()
+        audio_out = b"".join(self.pipeline.tts.stream_speak(
+            res.reply, cancel=self.pipeline._speak_cancel))
+        self.pipeline.states.move(VoiceState.IDLE)
+        return {"ok": True, "reply": res.reply,
+                "audio_bytes": len(audio_out),
+                "mission_id": res.mission_id}
+
+    def cancel(self) -> dict:
+        out = self.pipeline.interrupt()
+        self.ended = True
+        self.end_reason = "cancelled"
+        return out
+
+
+# ---------- barge-in monitor ----------
+
+def monitor_barge_in(capture, vad_check, timeout_s: float = 10.0,
+                     chunk_s: float = 0.5,
+                     cancel: threading.Event | None = None) -> bool:
+    """Poll bounded mic chunks for voice activity. Returns True on first
+    voiced chunk (caller then interrupts). capture() returns one WAV chunk;
+    vad_check(wav) returns bool. Never loops forever: hard timeout + cancel.
+    With a silent mic this simply returns False after the timeout."""
+    import time as _t
+    deadline = _t.time() + timeout_s
+    while _t.time() < deadline:
+        if cancel is not None and cancel.is_set():
+            return False
+        try:
+            chunk = capture(chunk_s)
+        except Exception:  # noqa: BLE001 — capture failure is not voice
+            return False
+        try:
+            if chunk and vad_check(chunk):
+                return True
+        except Exception:  # noqa: BLE001
+            return False
+    return False

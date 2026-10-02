@@ -74,6 +74,77 @@ def _spawn(cmd: list[str]) -> subprocess.Popen:
         raise AudioError(f"audio utility missing: {cmd[0]}")
 
 
+def _peak_dbfs(wav_bytes: bytes) -> float:
+    """Peak level in dBFS. -inf means digital silence."""
+    import io as _io
+    import math as _math
+    import wave as _wave
+    try:
+        with _wave.open(_io.BytesIO(wav_bytes), "rb") as w:
+            raw = w.readframes(w.getnframes())
+            width = w.getsampwidth()
+    except (wave.Error, EOFError):
+        return float("-inf")
+    if not raw or width != 2:
+        return float("-inf")
+    peak = 0
+    for i in range(0, len(raw), 2):
+        v = int.from_bytes(raw[i:i + 2], "little", signed=True)
+        if abs(v) > peak:
+            peak = abs(v)
+    if peak == 0:
+        return float("-inf")
+    return 20 * _math.log10(peak / 32768.0)
+
+
+def probe_capabilities(sample_seconds: float = 1.0) -> dict:
+    """Deterministic audio capability report. Distinguishes exists /
+    permitted / opens / carries signal / plays / completes. Never claims
+    audibility from exit codes. Signal threshold: peak above -50 dBFS."""
+    caps: dict = {
+        "microphone_available": False,
+        "microphone_permission": "unknown",  # granted|denied|unknown
+        "microphone_opens": False,
+        "microphone_signal_detected": False,
+        "microphone_peak_dbfs": None,
+        "speaker_available": False,
+        "playback_available": False,
+        "audio_input_format": "S16_LE mono",
+        "audio_output_format": "S16_LE mono",
+    }
+    try:
+        backend = record_backend()
+        caps["microphone_available"] = True
+        caps["record_backend"] = backend
+    except AudioError as e:
+        caps["record_error"] = str(e)[:120]
+        backend = None
+    if backend:
+        try:
+            data = record_audio(duration_s=min(sample_seconds, 3.0))
+            props = validate_wav(data)
+            caps["microphone_opens"] = True
+            caps["microphone_permission"] = "granted"
+            peak = _peak_dbfs(data)
+            caps["microphone_peak_dbfs"] = None if peak == float("-inf") \
+                else round(peak, 1)
+            caps["microphone_signal_detected"] = peak > -50.0
+            caps["audio_input_format"] = (
+                f"S16_LE {props['channels']}ch {props['rate']}Hz")
+        except AudioError as e:
+            msg = str(e).lower()
+            if "permission" in msg or "denied" in msg or "busy" in msg:
+                caps["microphone_permission"] = "denied"
+            caps["record_error"] = str(e)[:120]
+    try:
+        caps["playback_available"] = True
+        caps["play_backend"] = play_backend()
+        caps["speaker_available"] = True
+    except AudioError as e:
+        caps["play_error"] = str(e)[:120]
+    return caps
+
+
 def record_audio(duration_s: float = 5.0, rate: int = RATE,
                  device: str = "",
                  cancel: threading.Event | None = None) -> bytes:

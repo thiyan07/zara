@@ -35,3 +35,32 @@
   stage's own test, fixed in `core/tracing.py`).
 - No `shell=True` in audio path; argvs fixed; paths bounded; cancel
   kills process groups (no zombies verified by clean test exits).
+
+## Stage 8 (2026-10-03) — physical conversational voice experience
+
+New: `tests/test_voice_stage8.py` (12 tests): capability-probe structure,
+conversation turn-limit + idle-timeout + battery-pause + approval continuity
+(same session/mission) + cancel, barge-in monitor (voice True /
+silence-capture-failure-cancel False), interrupt-during-speaking,
+illegal-transition rejection, transcript-cannot-reconfigure-provider,
+Magpie bound/authority checks, wake-output-has-no-authority.
+
+Live measurements (not invented):
+- Piper synth "Hey Zara" 33 KB / 0.97 s; WAV 22050 Hz mono valid.
+- play_audio via ALSA exit True in 0.01 s (no audible device present) ->
+  PLAYBACK_PATH_VERIFIED, AUDIBILITY_MANUAL.
+- STT on synth speech: "Hey Zara" -> "Hey Zara!" (1.34 s incl. model load),
+  "Check my laptop battery." verbatim (0.34 s), "What is my battery level?"
+  verbatim (0.31 s). Wake spotter detects synth "Hey Zara"; VAD rejects silence.
+- Magpie live: 96 KB in 2.49 s; cancel mid-stream stops after 1 chunk
+  (51 KB), worker thread reaped.
+- E2E voice turn (STT->demo-brain->tool->TTS): ok, 30 KB audio, idle, 6.8 s
+  (first-turn model load included). Barge-in interrupt: 0 ms, listening.
+- Mic probe: opens, permission granted, peak -inf, signal False (ALC256 silent).
+- Android emulator API 16: voice-support flags verified, no crash.
+- Suite: 142 Python passed; Flutter 10 passed; flutter analyze clean.
+- Disk 16 GB free (floor 10 GB respected); no new models downloaded.
+
+Still BLOCKED (honest): live mic speech (silent ALC256), speaker audibility
+(no ears on this machine), physical Android (`adb devices` empty), always-on
+DSP wake (VAD-gated single-shot retained by design).

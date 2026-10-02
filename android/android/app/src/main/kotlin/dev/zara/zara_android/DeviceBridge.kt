@@ -94,19 +94,44 @@ class DeviceBridge(private val context: Context) {
     }
 
     /**
-     * Voice support report (Stage 3 foundation). Only the microphone
-     * *permission state* is real here; capture/STT/TTS/wake engines are
-     * reported as unsupported until provider-backed implementations land
-     * with hardware validation. Nothing is faked.
+     * Voice/audio capability report. Only natively checkable facts are real:
+     * FEATURE_MICROPHONE (hardware), RECORD_AUDIO permission state, audio
+     * output feature. Capture/STT/TTS/wake engines stay false until a
+     * provider-backed implementation lands with hardware validation.
+     * Nothing is faked: unimplemented == false, never assumed true.
      */
     private fun voiceSupport(): Map<String, Any?> {
+        val pm = context.packageManager
+        val hasMicHw = pm.hasSystemFeature(PackageManager.FEATURE_MICROPHONE)
+        val hasAudioOut = pm.hasSystemFeature(PackageManager.FEATURE_AUDIO_OUTPUT)
         val mic = ContextCompat.checkSelfPermission(
             context, Manifest.permission.RECORD_AUDIO) ==
             PackageManager.PERMISSION_GRANTED
+        // SpeechRecognizer availability is an engine check, not a guarantee
+        // of microphone signal; report engine presence only.
+        val speechEngine = try {
+            android.speech.SpeechRecognizer.isRecognitionAvailable(context)
+        } catch (e: Exception) {
+            false
+        }
+        // Android TTS engine presence (platform synthesis, not Zara's voice).
+        val ttsEngine = try {
+            val tts = android.speech.tts.TextToSpeech(context, null)
+            val ok = tts.engines.isNotEmpty()
+            tts.shutdown()
+            ok
+        } catch (e: Exception) {
+            false
+        }
         return mapOf(
             "supported" to true,
             "wake_phrase" to "Hey Zara",
+            "microphone_hardware" to hasMicHw,
             "microphone_permission" to mic,
+            "microphone_signal" to "unknown",
+            "speaker_hardware" to hasAudioOut,
+            "platform_stt_engine" to speechEngine,
+            "platform_tts_engine" to ttsEngine,
             "audio_capture" to false,
             "stt" to false,
             "tts" to false,

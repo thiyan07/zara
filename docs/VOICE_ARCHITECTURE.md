@@ -31,14 +31,41 @@ Voice work is gated like everything else: STT/TTS are not free — short
 utterances, no background loops, heavy reasoning stays on laptop/cloud via
 the router. Wake listening pauses on low battery (see WAKE_WORD.md).
 
-## Honest limits (Stage 3)
+## Honest limits (Stage 3; Stage-8 deltas noted inline)
 
 No physical microphone/speaker validation performed (no hardware harness);
 pipeline verified with REAL local engines end-to-end (synth speech -> STT ->
 core -> tool -> device -> TTS) plus deterministic mocks (STT->core->tool->
 device->TTS). Android reports real support flags (`getVoiceSupport`);
 capture/STT/TTS/wake engines report `false` until provider-backed builds land
-with hardware validation.
+with hardware validation. Stage 8: emulator flags verified live (mic-hw
+true, speaker-hw true, engines present, Zara engines honestly false);
+Linux probe verified device-opens-but-silent; speaker path exits 0 with
+audibility manual.
+
+## Capability probe (`probe_capabilities`, Stage 8)
+
+Deterministic report separating exists / permitted / opens / carries-signal
+/ plays / completes. Signal threshold: peak above -50 dBFS; silence is
+reported as `microphone_signal_detected: false` with `peak_dbfs: null`,
+never hidden. Exit-0 playback is reported as path-verified, never as
+human-heard.
+
+## Continuous conversation (`VoiceConversation`, Stage 8)
+
+Bounded multi-turn sessions over ONE `VoicePipeline`: max turns (default 5),
+max wall-clock duration (300 s), idle timeout (60 s), battery hook, cancel.
+Approval holds pause and resume in the SAME session (mission/approval state
+preserved; resumed reply re-enters the legal state path). Per-turn loop
+budgets intact; no autonomous loop. The LLM never touches mic, TTS provider,
+permissions, or devices.
+
+## Barge-in monitor (`monitor_barge_in`, Stage 8)
+
+Bounded VAD polling over mic chunks: first voiced chunk -> True (caller runs
+`VoicePipeline.interrupt()`), with hard timeout + cancel event so a silent
+mic returns False instead of hanging. Provider cancel respected (Magpie
+in-flight RPC cancel preserved; Piper chunked stop).
 
 ## Local audio layer (`core/audio.py`)
 

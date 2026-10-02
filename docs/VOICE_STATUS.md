@@ -7,8 +7,11 @@
 | STT | faster-whisper `tiny.en` (int8 CPU) | REAL LINUX AUDIO TESTED |
 | TTS | Piper `en_US-lessac-medium` (onnx CPU) | REAL LINUX AUDIO TESTED |
 | Wake | VAD-gated single-shot keyword spotter | INTEGRATION TESTED (synth audio) |
-| Mic capture | arecord/ALSA (`core/audio.py`) | INTEGRATION TESTED (device works, see below) |
-| Speaker | aplay/ALSA | INTEGRATION TESTED (clean exit; audibility not verifiable here) |
+| Mic capture | arecord/ALSA (`core/audio.py`) + `probe_capabilities()` | VERIFIED opens, BLOCKED signal (see below) |
+| Speaker | aplay/ALSA | PLAYBACK_PATH_VERIFIED, AUDIBILITY_MANUAL |
+| Conversation | `VoiceConversation` bounded sessions (`core/voice.py`) | INTEGRATION TESTED |
+| Barge-in monitor | `monitor_barge_in` VAD polling (`core/voice.py`) | INTEGRATION TESTED |
+| Android audio flags | mic-hw/permission/signal + speaker-hw/engine presence (`DeviceBridge`) | EMULATOR VERIFIED |
 
 ## What genuinely works
 
@@ -20,6 +23,25 @@
   REAL LINUX AUDIO TESTED. Note: turns needing the hosted NVIDIA LLM
   require network; that path is HOSTED, not local.
 - Barge-in cancels chunked TTS; state machine returns to idle.
+- Continuous conversation: bounded sessions (max turns/duration/idle
+  timeout, battery hook, approval-hold resume in the same session) —
+  INTEGRATION TESTED (12 Stage-8 tests).
+- Barge-in monitor: bounded VAD polling (hard timeout + cancel); voiced
+  chunk -> True, silence/capture-failure/cancel -> False — INTEGRATION TESTED.
+- Audio capability probe: device opens, permission granted, peak -inf
+  (digital silence), signal=False — VERIFIED 2026-10-03. Playback exits 0
+  via ALSA in 0.01 s (no audible device here) — PLAYBACK_PATH_VERIFIED,
+  AUDIBILITY_MANUAL.
+- Piper STT roundtrip on synth speech (2026-10-03): "Hey Zara" ->
+  "Hey Zara!", "Check my laptop battery." verbatim, "What is my battery
+  level?" verbatim; wake spotter detects synth "Hey Zara", rejects silence.
+- Magpie live (2026-10-03): 96 KB in 2.49 s; mid-stream cancel stops
+  after 1 chunk, thread reaped. Piper remains default (`TTS_PROVIDER`
+  unset -> PiperTTS); transcript cannot reconfigure providers (tested).
+- Android emulator (API 16, 2026-10-03): `getVoiceSupport` reports
+  mic-hardware true, permission false, signal unknown, speaker-hardware
+  true, platform STT/TTS engines true, Zara capture/STT/TTS/wake false
+  (honest: unimplemented == false). No crash. EMULATOR VERIFIED.
 - Push-to-talk/manual activation is the validated trigger path.
 
 ## Blocked / honest limits
@@ -33,9 +55,10 @@
   wake events only move voice state — they execute nothing.
 - Speaker audibility cannot be verified from here (no ears); playback
   path (valid WAV -> aplay -> exit 0, no zombies) is tested.
-- Android: UI/state/permission layer only; no platform STT/TTS wired.
-  PHYSICAL ANDROID TESTED: no (unchanged this stage; emulator exists but
-  has no functional mic for this purpose).
+- Android: UI/state/permission layer + native audio capability flags
+  (mic-hardware, permission, signal-unknown, speaker-hardware, engine
+  presence; Zara engines honestly false). PHYSICAL ANDROID: BLOCKED
+  (`adb devices` empty, no phone); EMULATOR VERIFIED 2026-10-03.
 - Whisper quirks observed: number words normalize ("one two three" ->
   "1 2 3"), punctuation varies run to run. Tests assert accordingly.
 

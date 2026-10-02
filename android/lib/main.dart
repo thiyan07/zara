@@ -24,6 +24,7 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
   String status = 'disconnected';
   Map<String, dynamic> battery = {};
   Map<String, dynamic> network = {};
+  Map<String, dynamic> voiceFlags = {};
   Timer? _hb;
 
   @override
@@ -58,7 +59,17 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
   Future<void> _refresh() async {
     final b = await bridge.battery();
     final n = await bridge.network();
-    if (mounted) setState(() { battery = b; network = n; });
+    // Pull the native audio/voice capability flags so the UI and any
+    // reporter always reflects the real bridge, never a stale table.
+    Map<String, dynamic> v = {};
+    try {
+      v = await bridge.voiceSupport();
+    } catch (_) {/* bridge unavailable: keep static table */}
+    if (mounted) {
+      setState(() { battery = b; network = n; voiceFlags = v; });
+      // ignore: avoid_print
+      print('zara:voice-support=$v');
+    }
   }
 
   Future<void> _connect() async {
