@@ -25,9 +25,9 @@ Phase 4 — Wake word honesty:
 - [ ] Tests for states; docs mark NOT VALIDATED on hardware
 
 Phase 5 — Auth hardening:
-- [ ] Job-result idempotency; pairing single-use verified; rotation API
-- [ ] Rate limiting middleware (pairing/auth stricter)
-- [ ] Tests: replay, revoke, rotation, rate-limit, invalid token
+- [x] Job-result idempotency; pairing single-use verified; rotation API
+- [x] Rate limiting middleware (pairing/auth stricter)
+- [x] Tests: replay, revoke, rotation, rate-limit, invalid token
 
 Phase 6 — Governor/queues:
 - [ ] JobQueue per-device cap + overflow behavior; tests
