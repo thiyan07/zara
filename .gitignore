@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 assistant.db
 backups/
+.env
+!.env.example

@@ -57,6 +57,11 @@ def parse_llm_action(raw: str | dict) -> LLMAction:
         data = json.loads(raw) if isinstance(raw, str) else raw
         if not isinstance(data, dict):
             raise ValueError("top-level JSON must be an object")
+        if "type" not in data and isinstance(data.get("text"), str):
+            # Lenient render path only: bare {"text": ...} becomes a reply.
+            # Execution is never inferred — tool_call still requires an
+            # explicit type, known tool, and valid arguments.
+            data = {"type": "response", "text": data["text"]}
         action = LLMAction(**data)
     except (json.JSONDecodeError, ValidationError, ValueError) as e:
         raise LLMError(LLMErrorKind.MALFORMED, f"malformed LLM output: {e}")

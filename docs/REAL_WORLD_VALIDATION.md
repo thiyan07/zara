@@ -23,9 +23,13 @@ exists to prevent category collapse.)
 
 ## BLOCKED (exact next manual step)
 
-- REAL_HOSTED_LLM_VALIDATION: no credential. Next: set `LLM_PROVIDER=
-  openai-compatible`, `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`, then
-  `POST /v1/talk` with a harmless task.
+- REAL_HOSTED_LLM_VALIDATION: VALIDATED 2026-10-02 (openai/gpt-oss-20b on a
+  free endpoint via `LLM_*` env: structured reply 16 s, full tool-use turn
+  text -> system.battery -> real agent (80%) -> verified NL reply; key-leak
+  audit of audit-DB/memory-DB/logs clean). Notes: the first configured
+  model was end-of-life (truthful 410, correctly classified); bare
+  `{"text": ...}` outputs are accepted as replies only, never as actions;
+  `.env` stays gitignored and unread by git.
 - PHYSICAL_ANDROID_VALIDATION: `adb devices` empty. Next: connect a phone
   with USB debugging, `adb devices` shows it, install
   `android/build/.../app-debug.apk`, pair via `/v1/agent/enroll`.

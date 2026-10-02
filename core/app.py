@@ -691,10 +691,23 @@ def create_app(stack=None) -> FastAPI:
     return app
 
 
+def _db_path(name: str, default: str = "") -> str:
+    """Env DB path only if its directory exists (docker .env works locally
+    by falling back instead of crashing the import)."""
+    path = os.environ.get(name, default)
+    if not path or path == ":memory:":
+        return path
+    parent = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(parent):
+        print(f"{name}={path} unreachable; using {default or 'in-memory'}")
+        return default
+    return path
+
+
 def _stack_from_env():
-    return build_stack(memory_db=os.environ.get("ZARA_MEMORY_DB", ""),
-                       audit_db=os.environ.get("ZARA_AUDIT_DB", ":memory:"),
-                       mission_db=os.environ.get("ZARA_MISSION_DB", ""))
+    return build_stack(memory_db=_db_path("ZARA_MEMORY_DB"),
+                       audit_db=_db_path("ZARA_AUDIT_DB", ":memory:"),
+                       mission_db=_db_path("ZARA_MISSION_DB"))
 
 
 app = create_app(_stack_from_env())
