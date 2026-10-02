@@ -439,3 +439,78 @@ def test_ready_and_admin_backup(tmp_path, monkeypatch):
     assert r["checks"]["registry"] and r["checks"]["event_bus"]
     b = c.post("/v1/admin/backup", headers=H).json()
     assert b["backups"] and b["backups"][0]["store"] == "memory"
+
+
+# ---------- scoped opencode tools ----------
+
+def _scratch(tmp_path, monkeypatch):
+    from core import opencode_tools as OT
+    monkeypatch.setattr(OT, "HOME", str(tmp_path))
+    ws = tmp_path / "ws"
+    (ws / "pkg").mkdir(parents=True)
+    (ws / "pkg" / "a.py").write_text("X = 1\n")
+    (ws / "test_a.py").write_text(
+        "from pkg.a import X\ndef test_x(): assert X == 1\n")
+    return str(ws)
+
+
+def test_code_inspect_search_diff(tmp_path, monkeypatch):
+    from core import opencode_tools as OT
+    ws = _scratch(tmp_path, monkeypatch)
+    out = OT.code_inspect({"workspace": ws, "path": "pkg/a.py"}, {})
+    assert "X = 1" in out["text"]
+    hits = OT.code_search({"workspace": ws, "pattern": "X =="}, {})
+    assert any("test_a.py" in h for h in hits["hits"])
+    with pytest.raises(PermissionError):
+        OT.code_inspect({"workspace": ws, "path": "../../etc/passwd"}, {})
+    with pytest.raises(PermissionError):
+        OT.code_inspect({"workspace": "/etc", "path": "passwd"}, {})
+
+
+def test_code_test_allowlist(tmp_path, monkeypatch):
+    from core import opencode_tools as OT
+    ws = _scratch(tmp_path, monkeypatch)
+    out = OT.code_test({"workspace": ws, "command": "pytest -q",
+                        "target": "test_a.py"}, {})
+    assert out["passed"] and out["returncode"] == 0
+    with pytest.raises(PermissionError):
+        OT.code_test({"workspace": ws, "command": "rm -rf ."}, {})
+    with pytest.raises(PermissionError):
+        OT.code_test({"workspace": ws, "command": "pytest --collect-only"},
+                     {})
+
+
+def test_code_patch_gated(tmp_path, monkeypatch):
+    import subprocess
+    from core import opencode_tools as OT
+    ws = _scratch(tmp_path, monkeypatch)
+    subprocess.run(["git", "init", "-q", ws], check=True)
+    subprocess.run(["git", "-C", ws, "config", "user.email", "t@t"],
+                   check=True)
+    subprocess.run(["git", "-C", ws, "config", "user.name", "t"], check=True)
+    subprocess.run(["git", "-C", ws, "add", "-A"], check=True)
+    subprocess.run(["git", "-C", ws, "commit", "-qm", "init"], check=True)
+    patch = ("--- a/pkg/a.py\n+++ b/pkg/a.py\n@@ -1 +1 @@\n-X = 1\n+X = 2\n")
+    out = OT.code_apply_patch({"workspace": ws, "patch": patch}, {})
+    assert out["applied"] and "pkg/a.py" in out["files"]
+    evil = ("--- a/../../evil.py\n+++ b/../../evil.py\n@@ -0,0 +1 @@\n+x\n")
+    with pytest.raises(PermissionError):
+        OT.code_apply_patch({"workspace": ws, "patch": evil}, {})
+
+
+def test_code_session_stubbed(tmp_path, monkeypatch):
+    from core import opencode_tools as OT
+    import subprocess
+    ws = _scratch(tmp_path, monkeypatch)
+    calls = []
+
+    def fake_runner(cmd, cwd, timeout):
+        calls.append(cmd)
+        assert "--cwd" in cmd
+        return subprocess.CompletedProcess(cmd, 0, "stub diff ok", "")
+
+    monkeypatch.setattr(OT, "RUNNER", fake_runner)
+    out = OT.code_session({"workspace": ws,
+                           "task": "summarize the test layout briefly"}, {})
+    assert out["returncode"] == 0 and "untrusted" in out["note"]
+    assert calls and calls[0][0] == "opencode"

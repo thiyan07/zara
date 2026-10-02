@@ -13,6 +13,7 @@ command outside the allowlist.
 from __future__ import annotations
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Callable, Optional
@@ -121,6 +122,11 @@ def code_test(inputs: dict, ctx: dict) -> dict:
         if tok.startswith("-"):
             raise PermissionError(f"flag refused: {tok}")
         _workspace(tok, inputs["workspace"])  # target must stay inside
+    binary = shutil.which(first, path=os.pathsep.join(
+        ("/usr/bin", "/bin", os.path.expanduser("~/.local/bin"))))
+    if binary is None:
+        raise RuntimeError(f"test runner not installed: {first}")
+    parts[0] = binary
     target = inputs.get("target", "")
     if target:
         t = _workspace(target, inputs["workspace"])

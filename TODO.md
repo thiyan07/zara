@@ -11,9 +11,9 @@ Phase 1 — Real LLM path:
 - [x] Retry/auth-fail-fast/stream-malformed covered
 
 Phase 2 — Android secure storage:
-- [ ] `lib/secure_store.dart` (secure plugin + fallback abstraction)
-- [ ] Claim flow stores key securely; never logs it
-- [ ] Dart tests; hardware marked NOT VALIDATED
+- [x] `lib/secure_store.dart` (secure plugin + fallback abstraction)
+- [x] Claim flow stores key securely; never logs it
+- [x] Dart tests; hardware marked NOT VALIDATED
 
 Phase 3 — WebSocket realtime:
 - [x] Authenticated `/v1/stream` (dev token or device creds, events read-only)
@@ -21,8 +21,8 @@ Phase 3 — WebSocket realtime:
 - [x] Tests: auth, live event, replay, disconnect, no-exec-over-WS
 
 Phase 4 — Wake word honesty:
-- [ ] Availability reporting endpoint/contract; no fake detection
-- [ ] Tests for states; docs mark NOT VALIDATED on hardware
+- [x] Availability reporting endpoint/contract; no fake detection
+- [x] Tests for states; docs mark NOT VALIDATED on hardware
 
 Phase 5 — Auth hardening:
 - [x] Job-result idempotency; pairing single-use verified; rotation API
@@ -41,9 +41,9 @@ Phase 8 — Browser tools (Playwright, Chrome present):
 - [x] Untrusted-output wrapping; confirm+ for side effects; TEST K live local page
 
 Phase 9 — DB/recovery + deploy + observability:
-- [ ] WAL, file-backed audit (env), backup/restore, restart-restore tests
-- [ ] Dockerfile/compose, .env.example, /v1/ready, DEPLOYMENT.md (local-validated only)
+- [x] WAL, file-backed audit (env), backup/restore, restart-restore tests
+- [x] Dockerfile/compose, .env.example, /v1/ready, DEPLOYMENT.md (local-validated only)
 
 Phase 10 — Failure matrix + E2E A–L + reports:
-- [ ] Missing failure tests (WS, replay, overflow, concurrency, restart)
-- [ ] E2E runs, TEST_REPORT.md, STAGE4_STATUS.md, docs, commits, final report
+- [x] Missing failure tests (WS, replay, overflow, concurrency, restart)
+- [x] E2E runs, TEST_REPORT.md, STAGE4_STATUS.md, docs, commits, final report

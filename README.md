@@ -10,11 +10,13 @@ Voice: `POST /v1/voice/turn`; wake: `/v1/wake/*`. Provider config:
 `LLM_BASE_URL`/`LLM_API_KEY`/`LLM_MODEL`. Persistent memory:
 `ZARA_MEMORY_DB` (SQLite file; unset = in-memory dev).
 
-## Run (Stage 3: core + agent + reasoning)
+## Run (Zara: core + agent + reasoning)
+
+Stage 4 hardened, integrated. See `docs/STAGE4_STATUS.md`, `docs/TEST_REPORT.md`, `docs/DEPLOYMENT.md`.
 
 ```bash
 pip install -r requirements.txt
-python -m pytest              # 62 tests (Stages 1+2+3)
+python -m pytest              # 90 tests (Stages 1-4)
 ZARA_MEMORY_DB=assistant.db ASSISTANT_TOKEN=dev-token \
   uvicorn core.app:app --port 8080
 ```
