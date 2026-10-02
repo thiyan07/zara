@@ -8,7 +8,7 @@ from .models import PolicyDecision, RiskLevel, utcnow
 
 # Even if a tool is mislabelled safe, these request shapes are denied/held.
 DENY_PATTERNS = [
-    re.compile(r"\brm\s+-rf\s+/(?:\s|$)"),
+    re.compile(r"\brm\s+-rf\s+/(?![\w/])"),
     re.compile(r"\b(shutdown|reboot|halt|poweroff)\b"),
     re.compile(r"\bmkfs\b"),
     re.compile(r":\(\)\s*\{\s*:\|\:"),
@@ -52,8 +52,9 @@ class PolicyEngine:
         text = f"{capability} {resource} {context.get('command', '')}"
         if any(p.search(text) for p in DENY_PATTERNS):
             return PolicyDecision(allow=False, requires_approval=True,
+                                  hard_deny=True,
                                   scope=f"{capability}@{device_id}:{resource}",
-                                  reason="deny-pattern: destructive request held for approval")
+                                  reason="deny-pattern: destructive request refused")
         if isinstance(risk, str):
             risk = RiskLevel(risk)
         if risk == RiskLevel.HIGH_RISK or any(p.search(text) for p in HIGH_RISK_HINTS):

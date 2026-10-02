@@ -66,3 +66,14 @@ BATTERY_MODEL.md.
 devices, events, memory, notifications, audit) + WebSocket `/v1/stream`
 for events and mission updates. Stateless auth hook ready for device tokens
 (Stage 2 fills real auth; until then a local dev token gate).
+
+## Stage 2 addition (same Zara, no redesign)
+
+- Device bodies attached via Device Protocol: `core/device_auth.py`
+  (per-device keys), `core/protocol.py` (v2.0 messages), `core/jobs.py`
+  (dispatch queue), `core/routing.py` (core-decided routing), `core/device_tools.py`
+  (device-backed contracts; implementations live on devices).
+- Linux agent: `device/linux/`. Android shell: `android/` (Flutter + Kotlin
+  bridge). Boundary: Zara Core -> Device Protocol -> Device Agent -> OS APIs.
+- Details: DEVICE_ARCHITECTURE.md, DEVICE_PROTOCOL.md, ANDROID_ARCHITECTURE.md,
+  LINUX_AGENT.md, DEVICE_SECURITY.md.

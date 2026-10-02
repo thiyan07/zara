@@ -31,3 +31,10 @@
   require scoped grants.
 - Verification: `confirm`-level and above tools must define verifiable
   success criteria; engine marks `verified` only after check passes.
+
+## Stage 2 addition
+
+Per-device identity replaces the shared token for devices: one-time pairing
+codes, per-device keys (hashed server-side), expiry, revocation, 403 on
+forgery. Tool allowlists on the device back up core policy. Full detail:
+docs/DEVICE_SECURITY.md. Dev bearer token is local-dev only.

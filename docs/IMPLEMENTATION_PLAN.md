@@ -1,22 +1,34 @@
 # Implementation Plan (four stages — checkpoints, not products)
 
-## Stage 1 — Core assistant (NOW, this folder)
+## Stage 1 — Core assistant (DONE)
 
-Backend + contracts + tests. No Android UI yet.
+Backend + contracts + tests.
 
 - [x] Docs: architecture, contracts, security, battery, this plan
-- [ ] `core/`: models, db, tools, policy, execution, events, missions,
+- [x] `core/`: models, db, tools, policy, execution, events, missions,
       devices, memory, context, providers, scheduler, notifications,
       audit, governor, app
-- [ ] `tests/`: unit + failure + permission + timeout + recovery tests
-- [ ] SQLite works; Postgres DDL documented for Oracle
+- [x] `tests/`: unit + failure + permission + timeout + recovery tests
+- [x] SQLite works; Postgres DDL documented for Oracle
 - Gate: `pytest` green; API boots; every contract has tests.
 
-## Stage 2 — Device bodies
+## Stage 2 — Device bodies (DONE)
 
-Laptop daemon (terminal/files/process/Git/OpenCode tools), Flutter Android
-shell + Kotlin bridges, device registration/auth, capability discovery,
-battery/network reporting, notification channel. Mock-first tests.
+- [x] Linux daemon (`device/linux/`): enroll/claim/register, heartbeat,
+      job execution (safe allowlisted tools), offline queue, reconnect
+      backoff, graceful shutdown
+- [x] Device auth (`core/device_auth.py`): per-device keys, pairing codes,
+      expiry, revocation
+- [x] Capability discovery: agents advertise only implemented capabilities;
+      core routes from registered capabilities
+- [x] Presence: registered|online|offline|degraded|reconnecting + staleness
+- [x] Protocol v2.0 (`core/protocol.py`) + REST endpoints + `/v1/dispatch`
+- [x] Router: capability -> online -> policy -> governor -> device
+- [x] Battery-aware routing + offline behavior (tested)
+- [x] Flutter Android shell + Kotlin `zara/device` bridge; capability table
+      with `voice.wake_word` ("Hey Zara") reserved, debug APK builds
+- [x] 17 new tests; all 14 Stage 1 tests still pass
+- Gate (this checkpoint): full E2E core->agent->result->audit verified.
 
 ## Stage 3 — Intelligence + natural interaction
 

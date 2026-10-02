@@ -68,6 +68,7 @@ class ToolDefinition(BaseModel):
 class PolicyDecision(BaseModel):
     allow: bool
     requires_approval: bool = False
+    hard_deny: bool = False  # Stage 2: deny-pattern hits are never approvable
     grant_id: Optional[str] = None
     scope: str = ""
     expires_at: Optional[datetime] = None
@@ -101,10 +102,13 @@ class Event(BaseModel):
     created_at: datetime = Field(default_factory=utcnow)
 
 class DeviceState(BaseModel):
-    device_id: str
+    device_id: str = Field(min_length=1, max_length=128)
     kind: DeviceKind = DeviceKind.CLOUD
     capabilities: list[str] = Field(default_factory=list)
     online: bool = True
+    # Stage 2 presence: registered|online|offline|degraded|reconnecting
+    status: str = "online"
+    software_version: str = ""
     battery_pct: Optional[float] = None
     charging: bool = False
     network: str = "unknown"

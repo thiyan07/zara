@@ -35,3 +35,11 @@ Offline is a state, not an error: keep minimal local state, accept/queue
 commands, run only lightweight permitted local actions, preserve mission
 checkpoints, queue sync, resume on `device_online` / `network_changed`
 events. Heavy work waits for network, laptop, cloud, or charging.
+
+## Stage 2 addition
+
+Real battery/network signals flow via heartbeat (`system.battery` sysfs on
+Linux, BatteryManager on Android). <15% + discharging marks the device
+degraded; router skips constrained devices (defer, not fail); heavy work
+reroutes to laptop/cloud; offline agents queue (cap 200) and back off to
+60 s. Android: 30 s heartbeat, no background loops.

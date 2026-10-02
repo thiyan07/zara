@@ -44,6 +44,43 @@ class DeviceManager:
                 del self._devices[device_id]
         self._emit("device_offline", device_id, {"revoked": True})
 
+    # ---- Stage 2 presence ----
+
+    VALID_STATUSES = {"registered", "online", "offline", "degraded",
+                      "reconnecting"}
+
+    def set_status(self, device_id: str, status: str) -> DeviceState:
+        if status not in self.VALID_STATUSES:
+            raise ValueError(f"invalid presence status: {status}")
+        with self._lock:
+            d = self._devices[device_id]
+            d.status = status
+            d.online = status in ("online", "degraded", "reconnecting")
+            d.last_seen = utcnow()
+        self._emit("device_online" if d.online else "device_offline",
+                   device_id, {"status": status})
+        return d
+
+    def mark_offline(self, device_id: str) -> DeviceState:
+        return self.set_status(device_id, "offline")
+
+    def update_capabilities(self, device_id: str,
+                            capabilities: list[str]) -> DeviceState:
+        with self._lock:
+            d = self._devices[device_id]
+            d.capabilities = list(capabilities)
+            d.last_seen = utcnow()
+        self._emit("device_online", device_id,
+                   {"capability_update": capabilities})
+        return d
+
+    def stale_ids(self, threshold_s: float = 120.0) -> list[str]:
+        """Devices not seen within threshold — reconnect/backoff candidates."""
+        now = utcnow()
+        with self._lock:
+            return [d.device_id for d in self._devices.values()
+                    if (now - d.last_seen).total_seconds() > threshold_s]
+
     def get(self, device_id: str) -> DeviceState:
         return self._devices[device_id]
 

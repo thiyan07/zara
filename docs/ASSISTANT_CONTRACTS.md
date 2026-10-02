@@ -71,3 +71,15 @@ tool/inputs/result/status), `checkpoints`, `approvals`, `retries`,
 `max_retries`, `error`, `created_at/updated_at`. `checkpoint()` snapshots
 steps so execution can resume after restart/offline. `approve()` unblocks
 `waiting_for_permission`. Terminal states are immutable.
+
+## Stage 2 additions
+
+- **Device protocol contract** (`core/protocol.py`): `{v, type, device_id,
+  payload}` v2.0, strict parsing; 12 message types from register to disconnect.
+- **Presence** (`devices.py` + `models.DeviceState.status`): registered |
+  online | offline | degraded | reconnecting; `stale_ids()` for reconnect
+  candidates. Additive — Stage 1 fields unchanged.
+- **Dispatch** (`core/routing.py` + `POST /v1/dispatch`): capability ->
+  online -> policy -> governor -> device. Deny/defer reasons recorded.
+- **Device jobs** (`core/jobs.py`): pending|claimed|done|failed|cancelled|
+  expired; claim-once; server waits on Condition.

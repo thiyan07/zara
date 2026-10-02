@@ -39,14 +39,17 @@ class ExecutionEngine:
         with self._lock:
             self._records[rec.id] = rec
         if not decision.allow:
-            rec.state = ExecutionState.DENIED if not decision.requires_approval \
-                else ExecutionState.WAITING_FOR_PERMISSION
+            if decision.requires_approval and not decision.hard_deny:
+                rec.state = ExecutionState.WAITING_FOR_PERMISSION
+                rec.error = decision.reason
+                self._emit("permission_required", execution_id=rec.id, tool=tool,
+                           reason=decision.reason)
+                return rec
+            rec.state = ExecutionState.DENIED
             rec.error = decision.reason
             self._emit("permission_required", execution_id=rec.id, tool=tool,
                        reason=decision.reason)
-            if not decision.requires_approval:
-                raise PolicyDenied(decision.reason)
-            return rec
+            raise PolicyDenied(decision.reason)
         self._run(rec)
         return rec
 

@@ -1,0 +1,105 @@
+import 'dart:async';
+import 'package:flutter/material.dart';
+import 'capabilities.dart';
+import 'core_client.dart';
+import 'device_bridge.dart';
+
+void main() => runApp(const ZaraApp());
+
+/// Zara Android shell (Stage 2 foundation): connect, claim pairing code,
+/// register capabilities, report battery/network, heartbeat. No voice yet.
+class ZaraApp extends StatefulWidget {
+  const ZaraApp({super.key});
+  @override
+  State<ZaraApp> createState() => _ZaraAppState();
+}
+
+class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
+  final bridge = DeviceBridge();
+  final client = CoreClient('http://10.0.2.2:8080');
+  final codeCtrl = TextEditingController();
+  String status = 'disconnected';
+  Map<String, dynamic> battery = {};
+  Map<String, dynamic> network = {};
+  Timer? _hb;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _refresh();
+  }
+
+  Future<void> _refresh() async {
+    final b = await bridge.battery();
+    final n = await bridge.network();
+    if (mounted) setState(() { battery = b; network = n; });
+  }
+
+  Future<void> _connect() async {
+    setState(() => status = 'claiming…');
+    try {
+      await client.claim(codeCtrl.text.trim(), 'android-phone');
+      await client.register(advertisedCapabilities(), 'zara-android 2.0.0');
+      await _beat();
+      setState(() => status = 'online as ${client.deviceId}');
+      _hb?.cancel();
+      _hb = Timer.periodic(const Duration(seconds: 30), (_) => _beat());
+    } catch (e) {
+      setState(() => status = 'error: $e');
+    }
+  }
+
+  Future<void> _beat() async {
+    try {
+      await client.heartbeat(
+        batteryPct: (battery['battery_pct'] as num?)?.toDouble(),
+        charging: battery['charging'] == true,
+        network: network['network'] as String? ?? 'unknown',
+      );
+    } catch (_) {/* offline: keep local state, retry next tick */}
+  }
+
+  @override
+  void dispose() {
+    _hb?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+    codeCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Zara',
+      theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.deepPurple),
+      home: Scaffold(
+        appBar: AppBar(title: const Text('Zara')),
+        body: ListView(
+          padding: const EdgeInsets.all(16),
+          children: [
+            Text('Status: $status', style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 8),
+            Text('Battery: ${battery['battery_pct'] ?? '?'}% '
+                '(charging: ${battery['charging'] ?? '?'})'),
+            Text('Network: ${network['network'] ?? '?'}'),
+            const SizedBox(height: 12),
+            TextField(controller: codeCtrl,
+                decoration: const InputDecoration(labelText: 'Pairing code from Zara Core')),
+            const SizedBox(height: 8),
+            FilledButton(onPressed: _connect, child: const Text('Connect “Hey Zara” device')),
+            const SizedBox(height: 12),
+            Text('Capabilities', style: Theme.of(context).textTheme.titleMedium),
+            for (final c in androidCapabilities)
+              ListTile(
+                dense: true,
+                leading: Icon(c.supported ? Icons.check_circle : Icons.circle_outlined),
+                title: Text(c.name),
+                subtitle: Text(c.note),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
