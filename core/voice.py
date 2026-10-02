@@ -208,6 +208,16 @@ class WakeWordEngine:
         return "running" if self.running and not self.paused else "paused"
 
 
+    def availability(self) -> dict:
+        """Honest capability report. Mock engines are never production."""
+        return {"engine": "mock",
+                "phrase": self.config.phrase,
+                "running": self.running,
+                "paused": self.paused,
+                "physically_validated": False,
+                "note": "deterministic stand-in; on-device model pending"}
+
+
 class MockWakeEngine(WakeWordEngine):
     """Deterministic stand-in: tests trigger detection explicitly.
     Physical audio validation remains pending (no hardware claimed)."""

@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'capabilities.dart';
 import 'core_client.dart';
 import 'device_bridge.dart';
+import 'secure_store.dart';
 import 'voice.dart' show wakePhrase;
 
 void main() => runApp(const ZaraApp());
@@ -18,6 +19,7 @@ class ZaraApp extends StatefulWidget {
 class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
   final bridge = DeviceBridge();
   final client = CoreClient('http://10.0.2.2:8080');
+  final secureStore = SecureStore();
   final codeCtrl = TextEditingController();
   String status = 'disconnected';
   Map<String, dynamic> battery = {};
@@ -41,6 +43,11 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
     setState(() => status = 'claiming…');
     try {
       await client.claim(codeCtrl.text.trim(), 'android-phone');
+      // Device key goes to Keystore-backed storage; never logs, never prefs.
+      await secureStore.saveDeviceCredentials(
+        deviceId: client.deviceId ?? 'android-phone',
+        deviceKey: client.deviceKey ?? '',
+      );
       await client.register(advertisedCapabilities(), 'zara-android 2.0.0');
       await _beat();
       setState(() => status = 'online as ${client.deviceId}');

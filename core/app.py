@@ -117,9 +117,10 @@ class MemoryCorrectIn(BaseModel):
     old_query: str
     new_text: str
 
-def build_stack(memory_db: str = ""):
+def build_stack(memory_db: str = "", audit_db: str = ":memory:",
+                mission_db: str = ""):
     bus = EventBus()
-    audit = AuditLog()
+    audit = AuditLog(audit_db)
     policy = PolicyEngine()
     registry = ToolRegistry()
     for definition, handler in BUILTINS:
@@ -138,6 +139,10 @@ def build_stack(memory_db: str = ""):
     engine = ExecutionEngine(registry, policy,
                              on_event=lambda t, p: bus.publish(t, source="execution", payload=p))
     missions = MissionEngine(on_event=lambda t, p: bus.publish(t, source="missions", payload=p))
+    if mission_db:
+        from .missions import PersistentMissionEngine as _PME
+        missions = _PME(mission_db,
+                        on_event=lambda t, p: bus.publish(t, source="missions", payload=p))
     devices = DeviceManager(on_event=lambda t, p: bus.publish(t, source="devices", payload=p))
     if memory_db:
         memory = PersistentMemoryStore(memory_db)
@@ -634,7 +639,9 @@ def create_app(stack=None) -> FastAPI:
 
 
 def _stack_from_env():
-    return build_stack(memory_db=os.environ.get("ZARA_MEMORY_DB", ""))
+    return build_stack(memory_db=os.environ.get("ZARA_MEMORY_DB", ""),
+                       audit_db=os.environ.get("ZARA_AUDIT_DB", ":memory:"),
+                       mission_db=os.environ.get("ZARA_MISSION_DB", ""))
 
 
 app = create_app(_stack_from_env())

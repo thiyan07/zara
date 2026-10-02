@@ -117,6 +117,8 @@ class PersistentMemoryStore(MemoryStore):
         super().__init__(embedder=embedder, policy=policy)
         self._db = _sqlite3.connect(path, check_same_thread=False)
         with self._lock, self._db:
+            self._db.execute("PRAGMA journal_mode=WAL")
+        with self._lock, self._db:
             self._db.execute(
                 "CREATE TABLE IF NOT EXISTS memory (id TEXT PRIMARY KEY, "
                 "category TEXT NOT NULL, text TEXT NOT NULL, source TEXT, "

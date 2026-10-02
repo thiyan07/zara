@@ -30,16 +30,24 @@ class DeviceJob(BaseModel):
 
 class JobQueue:
     CLAIM_TIMEOUT_S = 300.0
+    MAX_PENDING_PER_DEVICE = 100
 
-    def __init__(self) -> None:
+    def __init__(self, max_pending_per_device: int = 100) -> None:
         self._jobs: dict[str, DeviceJob] = {}
         self._cond = threading.Condition()
         self._cancelled: set[str] = set()
+        self._max_pending = max_pending_per_device
 
     def enqueue(self, device_id: str, tool: str, inputs: dict,
                 mission_id: Optional[str] = None,
                 execution_id: Optional[str] = None,
                 timeout_s: float = 30.0) -> DeviceJob:
+        with self._cond:
+            pending = sum(1 for j in self._jobs.values()
+                          if j.device_id == device_id and j.state == "pending")
+            if pending >= self._max_pending:
+                raise OverflowError(
+                    f"device {device_id} job queue full ({pending})")
         job = DeviceJob(id=f"job-{uuid.uuid4().hex[:12]}", device_id=device_id,
                         tool=tool, inputs=dict(inputs), mission_id=mission_id,
                         execution_id=execution_id, timeout_s=timeout_s,
