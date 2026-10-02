@@ -1,49 +1,18 @@
-# Zara Stage 4 — Todo
+# Zara Stage 5 — Todo (MCP + sandbox + real-world validation)
 
-Forensics (done):
-- [x] Repo at f299967, clean tree, 62/62 Python pass
-- [x] No physical Android (adb empty), no LLM keys, 22GB free / 14GB RAM
-- [x] opencode CLI present; Chrome + Playwright browsers cached; no ollama
+Baseline (done): 90/90 Python, 10/10 Flutter, analyze clean, HEAD 16d45f8,
+20GB free, no device, no keys. Old builds cleaned (1 APK, newest backups).
 
-Phase 1 — Real LLM path:
-- [x] Stub OpenAI-compatible server fixture; real-HTTP round-trip test
-- [x] Key-leak audit tests (header-only travel, no metadata/log leak)
-- [x] Retry/auth-fail-fast/stream-malformed covered
-
-Phase 2 — Android secure storage:
-- [x] `lib/secure_store.dart` (secure plugin + fallback abstraction)
-- [x] Claim flow stores key securely; never logs it
-- [x] Dart tests; hardware marked NOT VALIDATED
-
-Phase 3 — WebSocket realtime:
-- [x] Authenticated `/v1/stream` (dev token or device creds, events read-only)
-- [x] Bounded per-connection queue, heartbeat, `?since=` replay, invalid-msg reject
-- [x] Tests: auth, live event, replay, disconnect, no-exec-over-WS
-
-Phase 4 — Wake word honesty:
-- [x] Availability reporting endpoint/contract; no fake detection
-- [x] Tests for states; docs mark NOT VALIDATED on hardware
-
-Phase 5 — Auth hardening:
-- [x] Job-result idempotency; pairing single-use verified; rotation API
-- [x] Rate limiting middleware (pairing/auth stricter)
-- [x] Tests: replay, revoke, rotation, rate-limit, invalid token
-
-Phase 6 — Governor/queues:
-- [x] JobQueue per-device cap + overflow behavior; tests
-
-Phase 7 — OpenCode tools (scoped coding specialist):
-- [x] `core/opencode_tools.py`: inspect/read/search/test/diff + gated apply_patch
-- [x] Workspace scoping, timeouts, audit; TEST J live on scratch repo
-
-Phase 8 — Browser tools (Playwright, Chrome present):
-- [x] `core/browser_tools.py`: open/extract/click-allowlisted/fill/screenshot/close
-- [x] Untrusted-output wrapping; confirm+ for side effects; TEST K live local page
-
-Phase 9 — DB/recovery + deploy + observability:
-- [x] WAL, file-backed audit (env), backup/restore, restart-restore tests
-- [x] Dockerfile/compose, .env.example, /v1/ready, DEPLOYMENT.md (local-validated only)
-
-Phase 10 — Failure matrix + E2E A–L + reports:
-- [x] Missing failure tests (WS, replay, overflow, concurrency, restart)
-- [x] E2E runs, TEST_REPORT.md, STAGE4_STATUS.md, docs, commits, final report
+- [x] Forensic baseline + cleanup old builds/backups
+- [ ] MCP core adapter (`core/mcp.py`: config/client/descriptor/transport)
+- [ ] MCP registry: namespaced Zara tools, schema bounds, risk mapping
+- [ ] Deterministic MCP test server fixture (stdio, incl. malicious tool)
+- [ ] MCP tests: discovery, execution, 7 injection cases, bounds
+- [ ] Sandbox abstraction (`core/sandbox.py`, app-level, honest limits)
+- [ ] OpenCode/browser routed through sandbox; re-test
+- [ ] Real-world validation: LLM keys? android? STT/TTS? wake? opencode CLI?
+- [ ] Security regression (19-attack matrix)
+- [ ] Performance spot measures (real numbers)
+- [ ] E2E A–S final checklist live
+- [ ] Docs: MCP/SANDBOX/REAL_WORLD/STAGE5_STATUS/TEST_REPORT, README/TODO
+- [ ] APK rebuild (only if Android code changes), cleanup, final commit+report
