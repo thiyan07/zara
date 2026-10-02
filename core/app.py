@@ -24,6 +24,7 @@ from .notifications import NotificationManager
 from .policy import PolicyEngine
 from .protocol import CapabilityUpdate, ExecutionResult, HeartbeatPayload
 from .providers import provider_from_env
+from .ratelimit import RateLimiter
 from .routing import Router
 from .scheduler import Scheduler
 from .sessions import SessionStore
@@ -152,6 +153,8 @@ def build_stack(memory_db: str = ""):
                             sessions=sessions, tracer=tracer)
     voice = VoicePipeline(MockSTT(""), MockTTS(), loop, sessions)
     wake = MockWakeEngine()
+    limits = {"general": RateLimiter(600, 60.0),
+              "sensitive": RateLimiter(30, 60.0)}
     bus.subscribe("*", lambda ev: audit.record("bus", ev.type, ev.source, str(ev.payload)[:500]))
     return {"bus": bus, "audit": audit, "policy": policy, "registry": registry,
             "engine": engine, "missions": missions, "devices": devices,
@@ -160,12 +163,30 @@ def build_stack(memory_db: str = ""):
             "gov": gov, "model": model, "events_log": events_log,
             "jobs": jobs, "device_auth": device_auth, "router": router,
             "sessions": sessions, "tracer": tracer, "loop": loop,
-            "voice": voice, "wake": wake}
+            "voice": voice, "wake": wake, "limits": limits}
 
 def create_app(stack=None) -> FastAPI:
     s = stack or build_stack()
     app = FastAPI(title="Personal Assistant Core", version="0.1.0")
     app.state.stack = s
+
+    SENSITIVE_PATHS = ("/v1/agent/enroll", "/v1/agent/claim")
+
+    @app.middleware("http")
+    async def rate_limit(request, call_next):
+        if request.url.path == "/v1/health":
+            return await call_next(request)
+        client = request.client.host if request.client else "unknown"
+        bucket = "sensitive" if request.url.path in SENSITIVE_PATHS \
+            else "general"
+        allowed, retry_after = s["limits"][bucket].check(
+            f"{bucket}:{client}")
+        if not allowed:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=429,
+                                content={"detail": "rate limited",
+                                         "retry_after_s": round(retry_after, 1)})
+        return await call_next(request)
 
     async def auth(authorization: Optional[str] = Header(None)):
         if authorization != f"Bearer {TOKEN}":
@@ -394,8 +415,21 @@ def create_app(stack=None) -> FastAPI:
         s["audit"].record("device", "device_claim", device_id, "")
         return {"device_id": device_id, "device_key": key}
 
+    @app.post("/v1/agent/rotate")
+    def agent_rotate(device_id: str = Depends(agent_auth),
+                     x_device_key: Optional[str] = Header(None)):
+        """Credential rotation: caller proves the current key, receives a new
+        one (once). The old key dies immediately."""
+        try:
+            new_key = s["device_auth"].rotate(device_id, x_device_key or "")
+        except ValueError as e:
+            raise HTTPException(status_code=403, detail=str(e))
+        s["audit"].record("device", "credential_rotated", device_id, "")
+        return {"device_id": device_id, "device_key": new_key}
+
     @app.post("/v1/agent/register")
-    def agent_register(body: AgentRegisterIn, device_id: str = Depends(agent_auth)):
+    def agent_register(body: AgentRegisterIn,
+                       device_id: str = Depends(agent_auth)):
         s["devices"].register(DeviceState(
             device_id=device_id, kind=body.kind,
             capabilities=body.capabilities, online=True, status="online",

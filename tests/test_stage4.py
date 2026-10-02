@@ -190,3 +190,52 @@ def test_ws_device_auth_and_forged_rejected():
             assert e.code == 4401
             return
         raise AssertionError("revoked device should be refused")
+
+
+# ---------- auth hardening: rotation, replay, idempotency, rate limits ----------
+
+def test_credential_rotation_kills_old_key():
+    from core.device_auth import DeviceAuthStore
+    from core.models import DeviceKind
+    auth = DeviceAuthStore()
+    _, key = auth.claim(auth.enroll("d1", DeviceKind.LINUX))
+    assert auth.verify("d1", key)
+    new_key = auth.rotate("d1", key)
+    assert auth.verify("d1", new_key)
+    assert not auth.verify("d1", key)  # old key dead
+    with pytest.raises(ValueError):
+        auth.rotate("d1", "wrong-key")  # rotation needs current key
+
+
+def test_pairing_replay_and_job_idempotency():
+    from core.device_auth import DeviceAuthStore
+    from core.jobs import JobQueue
+    from core.models import DeviceKind
+    auth = DeviceAuthStore()
+    code = auth.enroll("d2", DeviceKind.LINUX)
+    auth.claim(code)
+    with pytest.raises(ValueError):
+        auth.claim(code)  # replayed pairing code fails
+    q = JobQueue()
+    j = q.enqueue("d2", "filesystem.list", {"path": "/tmp"})
+    q.poll("d2")
+    first = q.complete(j.id, True, {"entries": []})
+    again = q.complete(j.id, False, {"entries": ["evil"]})
+    assert again.state == "done" and again.result == {"entries": []}
+
+
+def test_rate_limiting_middleware():
+    c = TestClient(create_app(build_stack()))
+    statuses = [c.post("/v1/agent/enroll",
+                       json={"device_id": f"rl-{i}", "kind": "linux"},
+                       headers=H).status_code for i in range(35)]
+    assert 429 in statuses  # sensitive endpoint bounded at 30/min
+    assert c.get("/v1/health").status_code == 200  # health exempt
+
+
+def test_ratelimiter_unit():
+    from core.ratelimit import RateLimiter
+    rl = RateLimiter(2, window_s=60)
+    assert rl.check("k")[0] and rl.check("k")[0]
+    allowed, retry = rl.check("k")
+    assert not allowed and retry > 0

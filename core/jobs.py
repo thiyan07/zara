@@ -63,6 +63,8 @@ class JobQueue:
                  error: str = "") -> DeviceJob:
         with self._cond:
             job = self._jobs[job_id]
+            if job.state in ("done", "failed", "cancelled"):
+                return job  # idempotent: replays return the recorded outcome
             job.state = "done" if ok else "failed"
             job.result = result
             job.error = error

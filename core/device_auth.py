@@ -85,6 +85,22 @@ class DeviceAuthStore:
             cred.revoked = True
             return True
 
+    def rotate(self, device_id: str, old_key: str,
+               ttl_days: int = 365) -> str:
+        """Credential rotation: old key dies with the call, new key returned
+        once. A stolen old key is useless after rotation."""
+        from datetime import timedelta
+        with self._lock:
+            cred = self._creds.get(device_id)
+            if cred is None or cred.revoked or not cred.paired:
+                raise ValueError("unknown or revoked device")
+            if not secrets.compare_digest(cred.key_hash, _hash(old_key)):
+                raise ValueError("rotation requires the current key")
+            new_key = f"zara-dev-{secrets.token_urlsafe(24)}"
+            cred.key_hash = _hash(new_key)
+            cred.expires_at = (utcnow() + timedelta(days=ttl_days)).isoformat()
+            return new_key
+
     def is_revoked(self, device_id: str) -> bool:
         with self._lock:
             cred = self._creds.get(device_id)
