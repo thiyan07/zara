@@ -28,9 +28,12 @@ class EmbeddingProvider:
     dim: int = 128
 
     def embed(self, text: str) -> list[float]:
+        import hashlib
         v = [0.0] * self.dim
         for tok in _tokens(text):
-            v[hash(tok) % self.dim] += 1.0
+            # stable hash: Python hash() is seed-randomized per process
+            h = int(hashlib.md5(tok.encode()).hexdigest(), 16)
+            v[h % self.dim] += 1.0
         n = math.sqrt(sum(x * x for x in v)) or 1.0
         return [x / n for x in v]
 

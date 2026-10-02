@@ -135,14 +135,15 @@ def test_api_key_never_leaks(stub):
 
 def test_ws_rejects_unauthenticated():
     from starlette.testclient import TestClient as TC
+    from starlette.websockets import WebSocketDisconnect
     c = TC(create_app(build_stack()))
-    try:
-        with c.websocket_connect("/v1/stream") as ws:
+    with c.websocket_connect("/v1/stream") as ws:
+        try:
             ws.receive_json()
-            raise AssertionError("should have closed")
-    except Exception as e:
-        assert "4401" in str(e) or "close" in str(e).lower() or \
-            "disconnect" in str(e).lower()
+        except WebSocketDisconnect as e:
+            assert e.code == 4401
+            return
+        raise AssertionError("should have closed")
 
 
 def test_ws_live_event_replay_and_no_exec():
@@ -180,11 +181,12 @@ def test_ws_device_auth_and_forged_rejected():
             f"/v1/stream?device_id=ws-phone&device_key={key}") as ws:
         assert ws.receive_json()["identity"] == "device:ws-phone"
     stack["device_auth"].revoke("ws-phone")
-    try:
-        with c.websocket_connect(
-                f"/v1/stream?device_id=ws-phone&device_key={key}") as ws:
+    from starlette.websockets import WebSocketDisconnect
+    with c.websocket_connect(
+            f"/v1/stream?device_id=ws-phone&device_key={key}") as ws:
+        try:
             ws.receive_json()
-            raise AssertionError("revoked device should be refused")
-    except Exception as e:
-        assert "4401" in str(e) or "close" in str(e).lower() or \
-            "disconnect" in str(e).lower()
+        except WebSocketDisconnect as e:
+            assert e.code == 4401
+            return
+        raise AssertionError("revoked device should be refused")
