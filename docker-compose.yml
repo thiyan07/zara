@@ -1,0 +1,30 @@
+services:
+  zara:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+    env_file: .env
+    environment:
+      ZARA_MEMORY_DB: /data/memory.db
+      ZARA_MISSION_DB: /data/missions.db
+      ZARA_AUDIT_DB: /data/audit.db
+    volumes:
+      - zara-data:/data
+      - ./backups:/srv/zara/backups
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          memory: 256M
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8080/v1/ready',timeout=4)"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  zara-data:
