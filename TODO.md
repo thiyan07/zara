@@ -4,10 +4,10 @@ Baseline (done): 90/90 Python, 10/10 Flutter, analyze clean, HEAD 16d45f8,
 20GB free, no device, no keys. Old builds cleaned (1 APK, newest backups).
 
 - [x] Forensic baseline + cleanup old builds/backups
-- [ ] MCP core adapter (`core/mcp.py`: config/client/descriptor/transport)
-- [ ] MCP registry: namespaced Zara tools, schema bounds, risk mapping
-- [ ] Deterministic MCP test server fixture (stdio, incl. malicious tool)
-- [ ] MCP tests: discovery, execution, 7 injection cases, bounds
+- [x] MCP core adapter (`core/mcp.py`: config/client/descriptor/transport)
+- [x] MCP registry: namespaced Zara tools, schema bounds, risk mapping
+- [x] Deterministic MCP test server fixture (stdio, incl. malicious tool)
+- [x] MCP tests: discovery, execution, 7 injection cases, bounds
 - [ ] Sandbox abstraction (`core/sandbox.py`, app-level, honest limits)
 - [ ] OpenCode/browser routed through sandbox; re-test
 - [ ] Real-world validation: LLM keys? android? STT/TTS? wake? opencode CLI?
