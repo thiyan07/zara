@@ -514,3 +514,25 @@ def test_code_session_stubbed(tmp_path, monkeypatch):
                            "task": "summarize the test layout briefly"}, {})
     assert out["returncode"] == 0 and "untrusted" in out["note"]
     assert calls and calls[0][0][0] == "opencode"
+
+
+def test_degraded_recovers_on_healthy_heartbeat():
+    from fastapi.testclient import TestClient as TC
+    from core.app import create_app as CA, build_stack as BS
+    st = BS()
+    code = st["device_auth"].enroll("deg-1", __import__(
+        "core.models", fromlist=["DeviceKind"]).DeviceKind.LINUX)
+    _, key = st["device_auth"].claim(code)
+    tc = TC(CA(st))
+    dh = {"X-Device-Id": "deg-1", "X-Device-Key": key}
+    tc.post("/v1/agent/register",
+            json={"capabilities": [], "software_version": "",
+                  "kind": "linux"}, headers=dh)
+    low = tc.post("/v1/agent/heartbeat",
+                  json={"battery_pct": 10, "charging": False,
+                        "network": "wifi", "online": True}, headers=dh).json()
+    assert low["status"] == "degraded"
+    ok = tc.post("/v1/agent/heartbeat",
+                 json={"battery_pct": 80, "charging": False,
+                       "network": "wifi", "online": True}, headers=dh).json()
+    assert ok["status"] == "online"  # recovery clears the flag

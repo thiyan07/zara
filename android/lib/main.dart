@@ -30,7 +30,29 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _refresh();
+    _refresh().then((_) => _restore());
+  }
+
+  /// Restore a previous pairing from secure storage (Keystore survives
+  /// force-stop; only uninstall/clear wipes it). Re-registers and resumes
+  /// heartbeats without asking for a new pairing code.
+  Future<void> _restore() async {
+    final creds = await secureStore.loadDeviceCredentials();
+    if (creds.deviceId == null || creds.deviceKey == null) return;
+    client.deviceId = creds.deviceId;
+    client.deviceKey = creds.deviceKey;
+    setState(() => status = 'restoring…');
+    try {
+      await client.register(advertisedCapabilities(), 'zara-android 2.0.0');
+      await _beat();
+      setState(() => status = 'online as ${client.deviceId}');
+      _hb?.cancel();
+      _hb = Timer.periodic(const Duration(seconds: 30), (_) => _beat());
+    } catch (e) {
+      // Revoked/expired server-side (or backend restarted): stay
+      // disconnected and require a fresh pairing code. Never retry-loop.
+      setState(() => status = 'session expired — pair again');
+    }
   }
 
   Future<void> _refresh() async {
@@ -59,6 +81,13 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
   }
 
   Future<void> _beat() async {
+    // Re-read platform state every tick: values must never go stale.
+    // Two local channel calls per 30 s is negligible next to any radio use.
+    try {
+      final b = await bridge.battery();
+      final n = await bridge.network();
+      if (mounted) setState(() { battery = b; network = n; });
+    } catch (_) {/* keep last known on bridge failure */}
     try {
       await client.heartbeat(
         batteryPct: (battery['battery_pct'] as num?)?.toDouble(),

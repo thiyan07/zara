@@ -12,11 +12,12 @@ Voice: `POST /v1/voice/turn`; wake: `/v1/wake/*`. Provider config:
 
 ## Run (Zara: core + agent + reasoning)
 
-Stage 5 adds MCP interop + sandbox isolation + real-world validation. See `docs/STAGE4_STATUS.md`, `docs/TEST_REPORT.md`, `docs/DEPLOYMENT.md`.
+Stage 5 adds MCP interop + sandbox isolation + real-world validation.
+Stage 6 validated on the Android emulator (see `docs/STAGE6_EMULATOR_TEST_REPORT.md`). See `docs/STAGE4_STATUS.md`, `docs/TEST_REPORT.md`, `docs/DEPLOYMENT.md`.
 
 ```bash
 pip install -r requirements.txt
-python -m pytest              # 100 tests (Stages 1-5)
+python -m pytest              # 101 tests (Stages 1-6)
 ZARA_MEMORY_DB=assistant.db ASSISTANT_TOKEN=dev-token \
   uvicorn core.app:app --port 8080
 ```

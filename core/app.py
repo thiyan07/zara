@@ -497,6 +497,11 @@ def create_app(stack=None) -> FastAPI:
                 and not body.charging):
             s["devices"].set_status(device_id, "degraded")
             d = s["devices"].get(device_id)
+        elif d.status == "degraded" and (
+                body.battery_pct is None or body.battery_pct >= 25):
+            # recovery: healthy readings clear the degraded flag
+            s["devices"].set_status(device_id, "online")
+            d = s["devices"].get(device_id)
         return {"ok": True, "status": d.status}
 
     @app.post("/v1/agent/capabilities")

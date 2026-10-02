@@ -36,11 +36,14 @@ class DeviceBridge(private val context: Context) {
     }
 
     private fun battery(): Map<String, Any?> {
-        val bm = context.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
         return try {
-            val pct = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
-            val filter = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            // Sticky battery intent: honors emulator overrides and all devices.
+            val filter = context.registerReceiver(
+                null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            val level = filter?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+            val scale = filter?.getIntExtra(BatteryManager.EXTRA_SCALE, 100) ?: 100
             val status = filter?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+            val pct = if (level >= 0 && scale > 0) (level * 100 / scale) else -1
             val charging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
                 status == BatteryManager.BATTERY_STATUS_FULL
             val powerSave = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
