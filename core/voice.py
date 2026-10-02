@@ -481,29 +481,41 @@ def stt_from_env() -> STTProvider:
 
 def tts_from_env() -> TTSProvider:
     """auto (default): local Piper when available, else mock.
-    TTS_PROVIDER=edge selects the pre-existing cloud TTS explicitly."""
+    Values: auto | local | piper (=local) | nvidia | magpie (=nvidia) |
+    edge (pre-existing cloud TTS) | mock. Piper stays the effective
+    default; hosted backends run ONLY when explicitly selected."""
     import os as _os
     which = _os.environ.get("TTS_PROVIDER", "auto").strip().lower()
     if which == "mock":
         return MockTTS()
     if which == "edge":
         return EdgeTTSProvider()
-    if which in ("auto", "local"):
+    if which in ("nvidia", "magpie"):
+        from .tts_nvidia import MagpieTTS
+        return MagpieTTS(
+            server=_os.environ.get("TTS_NVIDIA_BASE_URL",
+                                   "grpc.nvcf.nvidia.com:443"),
+            function_id=_os.environ.get(
+                "TTS_NVIDIA_FUNCTION_ID",
+                "877104f7-e885-42b9-8de8-f6e4c6303969"),
+            voice=_os.environ.get("TTS_NVIDIA_VOICE",
+                                  "Magpie-Multilingual.EN-US.Aria"))
+    if which in ("auto", "local", "piper"):
         try:
             import os as _oo
             default = _oo.path.expanduser(
                 "~/.cache/zara-voice/en_US-lessac-medium.onnx")
             chosen = _os.environ.get("TTS_MODEL", "") or default
-            if which == "local" and not _oo.path.isfile(chosen):
+            if which in ("local", "piper") and not _oo.path.isfile(chosen):
                 raise RuntimeError(f"piper voice missing: {chosen}")
             tts = PiperTTS(model_path=chosen)
-            if which == "local":
+            if which in ("local", "piper"):
                 return tts
             import piper  # noqa: F401 — probe only
             if _oo.path.isfile(chosen):
                 return tts
         except (ImportError, RuntimeError):
-            if which == "local":
+            if which in ("local", "piper"):
                 raise
     return MockTTS()
 

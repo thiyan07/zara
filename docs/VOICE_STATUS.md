@@ -38,3 +38,12 @@
   has no functional mic for this purpose).
 - Whisper quirks observed: number words normalize ("one two three" ->
   "1 2 3"), punctuation varies run to run. Tests assert accordingly.
+
+## NVIDIA Magpie (optional hosted)
+
+REAL API TESTED 2026-10-02: "Hello, I am Zara." -> 1.2 s -> valid 22050 Hz
+WAV (39k frames), STT-verified exact, clean stop. Same Zara turn run with
+Piper (1.0 s, 62 KB) and Magpie (1.2 s, 78 KB): identical pipeline, both
+responded. Network-dependent by design; offline fails truthfully.
+`integrate.api.nvidia.com/v1` hosts NO TTS model (81 models listed, all
+LLM/vision/embed) — Magpie is reached via NVCF gRPC, not the LLM endpoint.

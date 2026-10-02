@@ -55,3 +55,16 @@ It is NOT always-on DSP and never executes — detection only moves voice
 state, subject to the existing battery gating. Push-to-talk/manual
 activation is the validated trigger path. See VOICE_STATUS.md for the
 honest capability table.
+
+## NVIDIA Magpie (optional hosted TTS, `core/tts_nvidia.py`)
+
+Same `TTSProvider` interface; selected ONLY via `TTS_PROVIDER=nvidia|magpie`.
+Contract verified live: gRPC `grpc.nvcf.nvidia.com:443`, function-id +
+Bearer metadata, model `magpie_tts_ensemble-Magpie-Multilingual`, voice
+`Magpie-Multilingual.EN-US.Aria`, LINEAR_PCM 22050 Hz mono. Per-sentence
+requests (<=200 chars) match Piper's barge-in granularity; cancel aborts
+the in-flight RPC without tearing down the client. Missing key or any
+failure raises `MagpieError` (never the key) — no silent Piper fallback.
+Reuses `LLM_API_KEY` unless `NVIDIA_TTS_API_KEY` is set. Piper remains the
+default and works with zero network. Free-endpoint status may change;
+nothing depends on Magpie.
