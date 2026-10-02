@@ -6,9 +6,9 @@ Forensics (done):
 - [x] opencode CLI present; Chrome + Playwright browsers cached; no ollama
 
 Phase 1 — Real LLM path:
-- [ ] Stub OpenAI-compatible server fixture; real-HTTP round-trip test
-- [ ] Key-leak audit tests (logs/errors/traces/audit/memory/API)
-- [ ] Timeouts/retries/cancel already covered — verify + extend
+- [x] Stub OpenAI-compatible server fixture; real-HTTP round-trip test
+- [x] Key-leak audit tests (header-only travel, no metadata/log leak)
+- [x] Retry/auth-fail-fast/stream-malformed covered
 
 Phase 2 — Android secure storage:
 - [ ] `lib/secure_store.dart` (secure plugin + fallback abstraction)
@@ -16,9 +16,9 @@ Phase 2 — Android secure storage:
 - [ ] Dart tests; hardware marked NOT VALIDATED
 
 Phase 3 — WebSocket realtime:
-- [ ] Authenticated `/v1/stream` (dev token or device creds, events read-only)
-- [ ] Bounded per-connection queue, heartbeat, `?since=` replay, invalid-msg reject
-- [ ] Tests: auth, live event, replay, disconnect, no-exec-over-WS
+- [x] Authenticated `/v1/stream` (dev token or device creds, events read-only)
+- [x] Bounded per-connection queue, heartbeat, `?since=` replay, invalid-msg reject
+- [x] Tests: auth, live event, replay, disconnect, no-exec-over-WS
 
 Phase 4 — Wake word honesty:
 - [ ] Availability reporting endpoint/contract; no fake detection
