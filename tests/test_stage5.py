@@ -145,3 +145,45 @@ def test_mcp_unknown_tool_and_transport_failure():
                                                           "/nonexistent.py"]))
     with pytest.raises(Exception):
         bad.connect()
+
+
+# ---------- sandbox ----------
+
+def test_sandbox_confinement_and_secrets(tmp_path, monkeypatch):
+    from core import sandbox as SB
+    import subprocess
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "ok.txt").write_text("hi")
+    pol = SB.SandboxPolicy(roots=(str(ws),), timeout_s=10.0,
+                           allowed_binaries=("ls", "cat", "env"))
+    r = SB.run(["ls", str(ws)], pol, cwd=str(ws))
+    assert r.returncode == 0 and "ok.txt" in r.output
+    with pytest.raises(PermissionError):
+        SB.run(["ls", "/etc"], pol, cwd=str(ws))
+    with pytest.raises(PermissionError):
+        SB.run(["rm", "-rf", str(ws)], pol, cwd=str(ws))
+    with pytest.raises(PermissionError):
+        SB.check_path("~/.ssh/id_rsa", pol)
+    # secrets never cross into the sandbox env
+    monkeypatch.setenv("LLM_API_KEY", "SHOULD-NOT-LEAK")
+    env = SB.scrub_env()
+    assert "SHOULD-NOT-LEAK" not in str(env.values())
+    assert "LLM_API_KEY" not in env
+    # temp workspace cleans itself
+    with SB.TempWorkspace() as tw:
+        assert os.path.isdir(tw)
+    assert not os.path.exists(tw)
+
+
+def test_sandbox_timeout_and_caps(tmp_path):
+    from core import sandbox as SB
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    pol = SB.SandboxPolicy(roots=(str(ws),), timeout_s=1.0,
+                           max_output_bytes=10,
+                           allowed_binaries=("sleep", "echo"))
+    with pytest.raises(subprocess.TimeoutExpired):
+        SB.run(["sleep", "30"], pol, cwd=str(ws))
+    r = SB.run(["echo", "0123456789ABCDEF"], pol, cwd=str(ws))
+    assert r.truncated and len(r.output) <= 10

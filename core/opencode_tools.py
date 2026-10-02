@@ -30,6 +30,15 @@ DESTRUCTIVE_GIT = [re.compile(p) for p in
                     r"\brm\b")]
 
 
+def _sandbox(workspace: str, timeout: float):
+    from .sandbox import SandboxPolicy
+    return SandboxPolicy(
+        roots=(os.path.realpath(workspace),), timeout_s=timeout,
+        allowed_binaries=("pytest", "python", "flutter", "npm", "go", "git",
+                          "opencode"),
+        extra_path_dirs=(os.path.expanduser("~/.local/bin"),))
+
+
 def _workspace(path: str, workspace: str) -> str:
     ws = os.path.realpath(workspace)
     if not ws.startswith(os.path.realpath(HOME) + os.sep) and ws != os.path.realpath(HOME):
@@ -126,33 +135,29 @@ def code_test(inputs: dict, ctx: dict) -> dict:
         ("/usr/bin", "/bin", os.path.expanduser("~/.local/bin"))))
     if binary is None:
         raise RuntimeError(f"test runner not installed: {first}")
-    parts[0] = binary
+    parts[0] = os.path.basename(binary)
     target = inputs.get("target", "")
     if target:
         t = _workspace(target, inputs["workspace"])
         parts.append(os.path.relpath(t, root))
-    env = {"PATH": "/usr/bin:/bin", "HOME": os.environ.get("HOME", ""),
-           "NO_COLOR": "1"}
-    p = subprocess.run(parts, cwd=root, capture_output=True, text=True,
-                       timeout=300, env=env)
-    out = (p.stdout + p.stderr)[-8000:]
-    return {"command": " ".join(parts), "returncode": p.returncode,
-            "passed": p.returncode == 0, "output": out}
+    from .sandbox import run as _sbrun
+    r = _sbrun(parts, _sandbox(inputs["workspace"], 300.0), cwd=root)
+    return {"command": " ".join(parts), "returncode": r.returncode,
+            "passed": r.returncode == 0, "output": r.output}
 
 
 def code_diff(inputs: dict, ctx: dict) -> dict:
     root = _workspace("", inputs["workspace"])
+    from .sandbox import run as _sbrun
+    sb = _sandbox(inputs["workspace"], 30.0)
     for args in (["git", "-C", root, "diff", "--stat"],
                  ["git", "-C", root, "diff"]):
-        p = subprocess.run(args, capture_output=True, text=True, timeout=30)
+        p = _sbrun(args, sb, cwd=root)
         if p.returncode != 0:
-            raise RuntimeError(f"git diff failed: {p.stderr[:200]}")
-    stat = subprocess.run(["git", "-C", root, "diff", "--stat"],
-                          capture_output=True, text=True,
-                          timeout=30).stdout[:2000]
-    full = subprocess.run(["git", "-C", root, "diff"],
-                          capture_output=True, text=True,
-                          timeout=30).stdout[:20000]
+            raise RuntimeError(f"git diff failed: {p.output[:200]}")
+    stat = _sbrun(["git", "-C", root, "diff", "--stat"], sb,
+                  cwd=root).output[:2000]
+    full = _sbrun(["git", "-C", root, "diff"], sb, cwd=root).output[:20000]
     return {"stat": stat, "diff": full}
 
 
@@ -171,16 +176,16 @@ def code_apply_patch(inputs: dict, ctx: dict) -> dict:
     for line in patch.splitlines():
         if line.startswith("command ") or line.startswith("GIT binary patch"):
             raise ValueError("patch contains non-diff directives")
-    check = subprocess.run(["git", "-C", root, "apply", "--check", "-"],
-                           input=patch, capture_output=True, text=True,
-                           timeout=30)
+    from .sandbox import run as _sbrun
+    sb = _sandbox(inputs["workspace"], 30.0)
+    check = _sbrun(["git", "-C", root, "apply", "--check", "-"], sb,
+                   cwd=root, input_text=patch)
     if check.returncode != 0:
-        raise ValueError(f"patch does not apply: {check.stderr[:300]}")
-    ap = subprocess.run(["git", "-C", root, "apply", "-"],
-                        input=patch, capture_output=True, text=True,
-                        timeout=30)
+        raise ValueError(f"patch does not apply: {check.output[:300]}")
+    ap = _sbrun(["git", "-C", root, "apply", "-"], sb, cwd=root,
+                input_text=patch)
     if ap.returncode != 0:
-        raise RuntimeError(f"git apply failed: {ap.stderr[:300]}")
+        raise RuntimeError(f"git apply failed: {ap.output[:300]}")
     return {"applied": True, "files": sorted(set(touched))}
 
 
@@ -190,11 +195,9 @@ Completed = subprocess.CompletedProcess
 
 
 def _default_runner(cmd: list[str], cwd: str, timeout: float):
-    env = {k: v for k, v in os.environ.items()
-           if k not in ("LLM_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
-                        "ASSISTANT_TOKEN")}
+    from .sandbox import scrub_env
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
-                          timeout=timeout, env=env)
+                          timeout=timeout, env=scrub_env())
 
 
 RUNNER: Runner = _default_runner
