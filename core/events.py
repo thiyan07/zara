@@ -25,6 +25,13 @@ class EventBus:
         with self._lock:
             self._subs[event_type].append(fn)
 
+    def unsubscribe(self, event_type: str, fn: Callable[[Event], None]) -> None:
+        with self._lock:
+            try:
+                self._subs[event_type].remove(fn)
+            except ValueError:
+                pass
+
     def publish(self, type: str, source: str = "core",
                 device_id: str | None = None, mission_id: str | None = None,
                 payload: dict | None = None) -> Event:

@@ -510,16 +510,85 @@ def create_app(stack=None) -> FastAPI:
 
     @app.websocket("/v1/stream")
     async def stream(ws: WebSocket):
+        """Authenticated realtime event delivery. Read-only transport:
+        ping/ack only — NO action may be requested over this socket.
+        Bounded per-connection queue (100, drop-oldest + counter),
+        server heartbeat, ?since= replay for reconnects."""
+        import asyncio
         await ws.accept()
-        idx = 0
+        params = dict(ws.query_params)
+        authed = False
+        identity = "unknown"
+        if params.get("token") == TOKEN:
+            authed, identity = True, "operator"
+        elif params.get("device_id") and params.get("device_key"):
+            if s["device_auth"].verify(params["device_id"],
+                                       params["device_key"]):
+                authed, identity = True, f"device:{params['device_id']}"
+        if not authed:
+            await ws.close(code=4401)
+            return
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue(maxsize=100)
+        dropped = 0
+
+        def _push(item: dict) -> None:
+            nonlocal dropped
+            try:
+                queue.put_nowait(item)
+                return
+            except asyncio.QueueFull:
+                pass
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                dropped += 1
+                return
+            dropped += 1
+            try:
+                queue.put_nowait(item)
+            except asyncio.QueueFull:
+                dropped += 1
+
+        def cb(ev) -> None:
+            loop.call_soon_threadsafe(_push, ev.model_dump(mode="json"))
+
+        s["bus"].subscribe("*", cb)
         try:
+            await ws.send_json({"type": "welcome", "identity": identity,
+                                "dropped": 0})
+            since = params.get("since")
+            if since:
+                seen = False
+                for ev in s["bus"].history(limit=200):
+                    if seen:
+                        await ws.send_json(ev.model_dump(mode="json"))
+                    if ev.id == since:
+                        seen = True
             while True:
-                await ws.send_json({"ping": idx})
-                idx += 1
-                import asyncio
-                await asyncio.sleep(30)
-        except Exception:  # noqa: BLE001
+                try:
+                    msg = await asyncio.wait_for(queue.get(), timeout=20.0)
+                    await ws.send_json(msg)
+                except asyncio.TimeoutError:
+                    await ws.send_json({"type": "heartbeat",
+                                        "dropped": dropped})
+                # drain any client frames without blocking the event flow
+                try:
+                    while True:
+                        client = await asyncio.wait_for(ws.receive_json(),
+                                                        timeout=0.01)
+                        if client.get("type") in ("ping", "ack"):
+                            continue
+                        await ws.send_json(
+                            {"type": "error",
+                             "error": "only ping/ack accepted; "
+                                      "actions are never taken over events"})
+                except asyncio.TimeoutError:
+                    pass
+        except Exception:  # noqa: BLE001 — disconnects end the stream
             pass
+        finally:
+            s["bus"].unsubscribe("*", cb)
 
     return app
 
