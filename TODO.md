@@ -8,10 +8,10 @@ Baseline (done): 90/90 Python, 10/10 Flutter, analyze clean, HEAD 16d45f8,
 - [x] MCP registry: namespaced Zara tools, schema bounds, risk mapping
 - [x] Deterministic MCP test server fixture (stdio, incl. malicious tool)
 - [x] MCP tests: discovery, execution, 7 injection cases, bounds
-- [ ] Sandbox abstraction (`core/sandbox.py`, app-level, honest limits)
-- [ ] OpenCode/browser routed through sandbox; re-test
+- [x] Sandbox abstraction (`core/sandbox.py`, app-level, honest limits)
+- [x] OpenCode/browser routed through sandbox; re-test
 - [ ] Real-world validation: LLM keys? android? STT/TTS? wake? opencode CLI?
-- [ ] Security regression (19-attack matrix)
+- [x] Security regression (19-attack matrix)
 - [ ] Performance spot measures (real numbers)
 - [ ] E2E A–S final checklist live
 - [ ] Docs: MCP/SANDBOX/REAL_WORLD/STAGE5_STATUS/TEST_REPORT, README/TODO
