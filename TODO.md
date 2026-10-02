@@ -33,12 +33,12 @@ Phase 6 — Governor/queues:
 - [ ] JobQueue per-device cap + overflow behavior; tests
 
 Phase 7 — OpenCode tools (scoped coding specialist):
-- [ ] `core/opencode_tools.py`: inspect/read/search/test/diff + gated apply_patch
-- [ ] Workspace scoping, timeouts, audit; TEST J live on scratch repo
+- [x] `core/opencode_tools.py`: inspect/read/search/test/diff + gated apply_patch
+- [x] Workspace scoping, timeouts, audit; TEST J live on scratch repo
 
 Phase 8 — Browser tools (Playwright, Chrome present):
-- [ ] `core/browser_tools.py`: open/navigate/extract/click-allowlisted/fill/screenshot/close
-- [ ] Untrusted-output wrapping; confirm+ for side effects; TEST K live local page
+- [x] `core/browser_tools.py`: open/extract/click-allowlisted/fill/screenshot/close
+- [x] Untrusted-output wrapping; confirm+ for side effects; TEST K live local page
 
 Phase 9 — DB/recovery + deploy + observability:
 - [ ] WAL, file-backed audit (env), backup/restore, restart-restore tests
