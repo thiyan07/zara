@@ -505,12 +505,12 @@ def test_code_session_stubbed(tmp_path, monkeypatch):
     calls = []
 
     def fake_runner(cmd, cwd, timeout):
-        calls.append(cmd)
-        assert "--cwd" in cmd
+        calls.append((cmd, cwd))
+        assert cwd.endswith("ws")
         return subprocess.CompletedProcess(cmd, 0, "stub diff ok", "")
 
     monkeypatch.setattr(OT, "RUNNER", fake_runner)
     out = OT.code_session({"workspace": ws,
                            "task": "summarize the test layout briefly"}, {})
     assert out["returncode"] == 0 and "untrusted" in out["note"]
-    assert calls and calls[0][0] == "opencode"
+    assert calls and calls[0][0][0] == "opencode"

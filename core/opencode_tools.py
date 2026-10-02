@@ -195,9 +195,14 @@ Completed = subprocess.CompletedProcess
 
 
 def _default_runner(cmd: list[str], cwd: str, timeout: float):
+    import shutil as _shutil
     from .sandbox import scrub_env
-    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
-                          timeout=timeout, env=scrub_env())
+    resolved = _shutil.which(cmd[0], path=os.pathsep.join(
+        ("/usr/bin", "/bin", os.path.expanduser("~/.local/bin"))))
+    if resolved is None:
+        raise RuntimeError("coding binary not installed")
+    return subprocess.run([resolved] + cmd[1:], cwd=cwd, capture_output=True,
+                          text=True, timeout=timeout, env=scrub_env())
 
 
 RUNNER: Runner = _default_runner
@@ -214,7 +219,7 @@ def code_session(inputs: dict, ctx: dict) -> dict:
     binary = inputs.get("binary", "opencode")
     if "/" in binary or binary not in ("opencode",):
         raise PermissionError("only the configured coding binary allowed")
-    cmd = [binary, "run", task, "--cwd", root]
+    cmd = [binary, "run", task]  # cwd carries the workspace; no --auto flag
     try:
         p = RUNNER(cmd, root, timeout=600)
     except FileNotFoundError:
