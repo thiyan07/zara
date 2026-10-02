@@ -30,7 +30,7 @@ Phase 5 — Auth hardening:
 - [x] Tests: replay, revoke, rotation, rate-limit, invalid token
 
 Phase 6 — Governor/queues:
-- [ ] JobQueue per-device cap + overflow behavior; tests
+- [x] JobQueue per-device cap + overflow behavior; tests
 
 Phase 7 — OpenCode tools (scoped coding specialist):
 - [x] `core/opencode_tools.py`: inspect/read/search/test/diff + gated apply_patch
