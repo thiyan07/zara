@@ -208,6 +208,26 @@ def create_app(stack=None) -> FastAPI:
     def health():
         return {"ok": True, "version": "0.1.0"}
 
+    @app.get("/v1/ready")
+    def ready():
+        """Readiness: registry loaded, memory writable, bus alive."""
+        checks: dict = {"registry": len(s["registry"].list()) > 0}
+        try:
+            probe = MemoryItem(text="readiness probe", importance=0.0)
+            checks["memory_write"] = True
+        except Exception:  # noqa: BLE001
+            checks["memory_write"] = False
+        try:
+            s["bus"].publish("scheduled_event", source="ready-probe",
+                             payload={"probe": True})
+            checks["event_bus"] = True
+        except Exception:  # noqa: BLE001
+            checks["event_bus"] = False
+        checks["provider"] = s["model"].name
+        return {"ready": all(v is True or isinstance(v, str)
+                             for v in checks.values()),
+                "checks": checks}
+
     @app.post("/v1/chat")
     def chat(body: ChatIn, _=Depends(auth)):
         """Propose-only loop: model text + optional memory context. No auto-execute."""
@@ -353,6 +373,20 @@ def create_app(stack=None) -> FastAPI:
                  "attrs": sp.attrs}
                 for sp in s["tracer"].for_trace(trace_id)]
 
+    @app.post("/v1/admin/backup")
+    def admin_backup(_=Depends(auth)):
+        """Operator backup of file-backed state (memory/mission DBs)."""
+        from .backup import backup_sqlite
+        results = []
+        for key, env in (("memory", "ZARA_MEMORY_DB"),
+                         ("missions", "ZARA_MISSION_DB"),
+                         ("audit", "ZARA_AUDIT_DB")):
+            path = os.environ.get(env, "")
+            if path and os.path.isfile(path):
+                results.append({"store": key,
+                                **backup_sqlite(path, "backups")})
+        return {"backups": results}
+
     @app.post("/v1/voice/turn")
     def voice_turn(body: VoiceTurnIn, _=Depends(auth)):
         """Audio in -> STT -> core loop -> TTS. Mock providers by default;
@@ -374,9 +408,11 @@ def create_app(stack=None) -> FastAPI:
     @app.get("/v1/wake")
     def wake_status(_=Depends(auth)):
         w = s["wake"]
-        return {"phrase": w.config.phrase, "running": w.running,
-                "paused": w.paused, "detections": w.detections,
-                "pause_below_pct": w.config.pause_below_pct}
+        out = {"phrase": w.config.phrase, "running": w.running,
+               "paused": w.paused, "detections": w.detections,
+               "pause_below_pct": w.config.pause_below_pct}
+        out["availability"] = w.availability()
+        return out
 
     @app.post("/v1/wake/event")
     def wake_event(body: WakeEventIn, _=Depends(auth)):

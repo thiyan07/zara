@@ -77,7 +77,11 @@ def browser_open(inputs: dict, ctx: dict) -> dict:
     if len(url) > 2000:
         raise ValueError("URL too long")
     page = _ensure()
-    page.goto(url)
+    try:
+        page.goto(url)
+    except Exception:
+        _close_all()  # never leave the shared session on an error document
+        raise
     return {"url": page.url, "title": page.title()[:200]}
 
 
