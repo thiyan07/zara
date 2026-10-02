@@ -16,4 +16,4 @@
 - [x] Docs (9 new + updates)
 - [x] Live E2E TEST 1–7 (text, memory, secret, policy, injection, wake, voice)
 - [x] APK rebuild (Kotlin changed)
-- [ ] Final commit + report
+- [x] Final commit + report
