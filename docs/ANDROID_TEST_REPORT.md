@@ -35,8 +35,52 @@ approval scoping enforced (403 cross-device).
 
 ## Not tested (need physical device)
 
-Mic signal, speaker audibility, always-on DSP, permission dialogs,
-FCM delivery, rotation sensor, metered radio, battery drain.
+~~Mic signal, speaker audibility, always-on DSP, permission dialogs,
+FCM delivery, rotation sensor, metered radio, battery drain.~~
+See "Physical device (vivo V2338, 2026-10-04)" below. Still open:
+human speaker audibility, live "Hey Zara" wake, acoustic barge-in,
+low/critical-battery governor, FCM delivery (no credentials).
+
+## Physical device (vivo V2338, Android 16 / API 36, OriginOS, 2026-10-04)
+
+`adb devices` → `10BEC514NJ006PQ device`. Model V2338, vivo, release 16,
+SDK 36, 1080x2408. Prior default assistant = Google GSA.
+
+- Assistant: `ZaraVoiceInteractionService` + session service declared with
+  `BIND_VOICE_INTERACTION`; own descriptor parses (infoValid/supportsAssist).
+  `ZaraAssistProxyActivity` (plain Activity, ACTION_ASSIST) got Zara listed
+  in the OS chooser; selected via Settings UI. OS confirms:
+  `settings get secure assistant` =
+  `dev.zara.zara_android/.ZaraAssistProxyActivity`, role holder =
+  `dev.zara.zara_android`. HOME long-press from Chrome → Zara MainActivity
+  (PHYSICAL_VERIFIED). Corner swipe: NOT_SUPPORTED (Jovi owns it; Chrome
+  stayed focused). VoiceInteractionSession: NOT_SUPPORTED (dumpsys =
+  "No active implementation"; OriginOS never binds third-party sessions).
+- Auth: fresh install + `install -r` reinstall both restore from Keystore
+  (online, no re-pair). Revoke → 403 → pair-again. Core restart → 403 →
+  pair-again. Re-pair via revoke-then-enroll (re-enroll while pending
+  correctly refuses; claim of stale code correctly 403s).
+- Mic: RECORD_AUDIO granted; 5 s captures of exactly 160044 B; peaks
+  −13.7/−18.1/−19.6 dBFS; faster-whisper transcribed live speech
+  ("Hello, how are you?"); empty-room capture → honest empty transcript.
+  Core `/v1/agent/voice/turn` + `/v1/agent/tts` (Piper, 520–528 kB).
+- Speaker: `USAGE_ASSISTANT`+`MODE_STATIC` failed init on OriginOS; fixed
+  to `USAGE_MEDIA`+`MODE_STREAM` → `{played: true, 524288 B, 22050 Hz,
+  audibility: manual-only}`. Software leg VERIFIED; human audibility
+  VERIFIED 2026-10-04 (user heard Piper reply; screenshot h1).
+- Approvals: `shell.safe_readonly` confirm-gate → card on phone →
+  Approve resolved through Core (`permission_granted`; device allowlist
+  refused execution — nothing ran; job later expired while app
+  backgrounded, execution recorded failure honestly) → second decide
+  honestly 409. Deny → execution cancelled, nothing ran. Device without
+  credentials → rejected. Stale-card 409 auto-dismiss added
+  (`isStaleApproval` + Dart test) and verified on device.
+- Resilience: Core down → "Reconnecting…", no fake online; restart →
+  re-pair recovery. Rotation both ways: state kept, still online.
+- logcat on this OEM returns nothing (even own PID); all device evidence
+  came from UI screenshots + Core audit (`/v1/audit`) + OS settings dumps.
+- Appium binary present (`~/.npm-global/bin/appium`) but NOT_USED;
+  adb + screenshots sufficed.
 
 ## Reproduce
 

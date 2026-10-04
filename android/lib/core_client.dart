@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 /// Zara Core REST client (dart:io only, no third-party deps).
 /// Device key is held in memory; long-term storage is SecureStore's job.
@@ -183,6 +184,35 @@ class CoreClient {
     try {
       await _post('/v1/agent/disconnect', {});
     } catch (_) {/* best-effort goodbye */}
+  }
+
+  /// Full voice turn: bounded WAV up, transcript+reply back (no audio down;
+  /// use [tts] to voice the reply through the configured provider).
+  Future<Map<String, dynamic>> voiceTurn(Uint8List wav,
+      {String sessionId = '', CancelScope? cancel}) async {
+    return _post('/v1/agent/voice/turn', {
+      'audio_base64': base64Encode(wav),
+      'session_id': sessionId,
+      'device_id': deviceId ?? 'android-phone',
+      'who': 'user',
+    }, cancel: cancel);
+  }
+
+  /// Provider TTS bytes for [text] (Piper default). Unprivileged synthesis.
+  Future<Uint8List> tts(String text, {CancelScope? cancel}) async {
+    final out = await _post(
+        '/v1/agent/tts', {'text': text.take(2000)}, cancel: cancel);
+    final b64 = out['audio_base64'];
+    if (b64 is! String || b64.isEmpty) {
+      throw const CoreException(-1, 'empty tts audio');
+    }
+    return base64Decode(b64);
+  }
+
+  Future<void> interruptVoice() async {
+    try {
+      await _post('/v1/agent/voice/interrupt', {});
+    } catch (_) {/* best-effort */}
   }
 }
 

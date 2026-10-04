@@ -49,6 +49,8 @@ class DeviceBridge(
         const val CHANNEL = "zara/device"
         const val RATE = 16000
         const val MAX_SECONDS = 30
+        /** Last-known battery pct for the assistant session UI (same process). */
+        @Volatile var lastBatteryPct: Int = -1
     }
 
     @Volatile private var capture: AudioRecord? = null
@@ -83,6 +85,7 @@ class DeviceBridge(
                         createChannels(); result.success(true)
                     }
                     "audioSelfTest" -> result.success(audioSelfTest())
+                    "getAssistantStatus" -> result.success(assistantStatus())
                     else -> result.notImplemented()
                 }
             }
@@ -181,13 +184,16 @@ class DeviceBridge(
             result.error("failed", "empty audio", null)
             return
         }
+        // NOTE: USAGE_ASSISTANT was rejected on Vivo OriginOS (AudioTrack
+        // init failed). USAGE_MEDIA is the compatible route; the clip is
+        // still Zara's own TTS reply, announced as software-only.
         val am = context.getSystemService(Context.AUDIO_SERVICE)
             as AudioManager
         val focus: Any? = if (Build.VERSION.SDK_INT >=
             Build.VERSION_CODES.O) {
             val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
                 .setAudioAttributes(AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
                     .setContentType(
                         AudioAttributes.CONTENT_TYPE_SPEECH).build())
                 .build()
@@ -221,26 +227,42 @@ class DeviceBridge(
                 val minBuf = AudioTrack.getMinBufferSize(
                     rate, AudioFormat.CHANNEL_OUT_MONO,
                     AudioFormat.ENCODING_PCM_16BIT)
+                if (minBuf <= 0) {
+                    result.error("unavailable",
+                        "no audio output for rate=$rate", null)
+                    return@Thread
+                }
+                // MODE_STREAM (not STATIC): large TTS clips exceed static
+                // buffer limits on some OEMs — stream in chunks instead.
                 track = AudioTrack(
                     AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
                         .setContentType(
                             AudioAttributes.CONTENT_TYPE_SPEECH).build(),
                     AudioFormat.Builder().setEncoding(
                         AudioFormat.ENCODING_PCM_16BIT)
                         .setSampleRate(rate).setChannelMask(
                             AudioFormat.CHANNEL_OUT_MONO).build(),
-                    maxOf(minBuf, body.size),
-                    AudioTrack.MODE_STATIC,
+                    maxOf(minBuf * 2, 32000),
+                    AudioTrack.MODE_STREAM,
                     AudioManager.AUDIOFOCUS_NONE)
                 synchronized(this) { player = track }
                 if (track.state != AudioTrack.STATE_INITIALIZED) {
-                    result.error("unavailable", "output init failed", null)
+                    result.error("unavailable",
+                        "output init failed state=${track.state} rate=$rate",
+                        null)
                     return@Thread
                 }
-                track.write(body, 0, body.size)
                 track.play()
-                // Bounded wait: at most clip length + 5 s, then report.
+                var off = 0
+                while (off < body.size) {
+                    val n = track.write(body, off, body.size - off)
+                    if (n <= 0) break
+                    off += n
+                    if (track.playState != AudioTrack.PLAYSTATE_PLAYING &&
+                        off < body.size) break
+                }
+                // Bounded wait for the tail: clip length + 5 s max.
                 val ms = (body.size * 1000L / (rate * 2)).coerceAtMost(60000)
                 val deadline = System.currentTimeMillis() + ms + 5000
                 while (track.playState == AudioTrack.PLAYSTATE_PLAYING &&
@@ -296,6 +318,101 @@ class DeviceBridge(
             NotificationManager.IMPORTANCE_LOW))
     }
 
+    // ---------- assistant-role compatibility (report only) ----------
+
+    /**
+     * Truthful assistant-role report. Declaring the service in the manifest
+     * does NOT make Zara the default — only the OS/user setting does, read
+     * from Settings.Secure. Role request via RoleManager is NOT possible
+     * for ROLE_ASSISTANT (Settings UI only); this reports that honestly.
+     */
+    private fun assistantStatus(): Map<String, Any?> {
+        val svc = android.content.ComponentName(
+            context, ZaraVoiceInteractionService::class.java)
+        val flattened = svc.flattenToString()
+        val current = try {
+            android.provider.Settings.Secure.getString(
+                context.contentResolver,
+                "assistant") ?: ""
+        } catch (e: Exception) { "" }
+        val roleAvailable = try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val rm = context.getSystemService(
+                    android.app.role.RoleManager::class.java)
+                rm?.isRoleAvailable(android.app.role.RoleManager.ROLE_ASSISTANT)
+                    ?: false
+            } else false
+        } catch (e: Exception) { false }
+        val roleHeld = try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val rm = context.getSystemService(
+                    android.app.role.RoleManager::class.java)
+                rm?.isRoleHeld(android.app.role.RoleManager.ROLE_ASSISTANT)
+                    ?: false
+            } else false
+        } catch (e: Exception) { false }
+        // OS-side read of OUR OWN descriptor: meta-data resid present,
+        // XML parseable, sessionService + supportsAssist as the OS sees
+        // them. If this fails, no chooser will ever list Zara.
+        var infoValid = false
+        var supportsAssist = false
+        var infoError = ""
+        var sessionSvc = ""
+        try {
+            val si = context.packageManager.getServiceInfo(
+                svc, PackageManager.GET_META_DATA)
+            val resId = si.metaData?.getInt("android.voice_interaction", 0)
+                ?: 0
+            if (resId == 0) {
+                infoError = "no android.voice_interaction meta-data"
+            } else {
+                val parser = context.resources.getXml(resId)
+                var event = parser.eventType
+                while (event != org.xmlpull.v1.XmlPullParser.END_DOCUMENT) {
+                    if (event == org.xmlpull.v1.XmlPullParser.START_TAG &&
+                        parser.name == "voice-interaction") {
+                        sessionSvc = parser.getAttributeValue(
+                            "http://schemas.android.com/apk/res/android",
+                            "sessionService") ?: ""
+                        supportsAssist = parser.getAttributeBooleanValue(
+                            "http://schemas.android.com/apk/res/android",
+                            "supportsAssist", false)
+                        infoValid = sessionSvc.isNotEmpty()
+                        if (!infoValid) {
+                            infoError = "sessionService empty/unresolved"
+                        }
+                        break
+                    }
+                    event = parser.next()
+                }
+                if (!infoValid && infoError.isEmpty()) {
+                    infoError = "no voice-interaction tag"
+                }
+            }
+        } catch (e: Exception) {
+            infoError = (e.javaClass.simpleName + ": " + (e.message ?: ""))
+                .take(160)
+        }
+        return mapOf(
+            "supported" to true,
+            "service_registered" to true,
+            "service_component" to flattened,
+            "current_assistant" to current,
+            "zara_is_default" to (current == flattened ||
+                current.endsWith("/" + svc.className) ||
+                current == svc.flattenToShortString()),
+            "role_available" to roleAvailable,
+            "role_held" to roleHeld,
+            // ROLE_ASSISTANT cannot be requested programmatically.
+            "role_request_possible" to false,
+            "role_request_note" to "assistant role requires Settings UI",
+            "service_info_valid" to infoValid,
+            "supports_assist" to supportsAssist,
+            "session_service" to sessionSvc,
+            "service_info_error" to infoError,
+        )
+    }
+
     // ---------- self-test: API path only, no permission, no audio ----------
 
     private fun audioSelfTest(): Map<String, Any?> {
@@ -331,6 +448,7 @@ class DeviceBridge(
             val scale = filter?.getIntExtra(BatteryManager.EXTRA_SCALE, 100) ?: 100
             val status = filter?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
             val pct = if (level >= 0 && scale > 0) (level * 100 / scale) else -1
+            lastBatteryPct = pct
             val charging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
                 status == BatteryManager.BATTERY_STATUS_FULL
             val powerSave = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {

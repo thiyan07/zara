@@ -310,3 +310,74 @@ def test_events_sync_bounded_and_offline_safe():
     big = [{"t": i} for i in range(500)]
     r = client.post("/v1/agent/events/sync", json={"events": big}, headers=h)
     assert r.json()["accepted"] == 200  # hard bound, rest dropped
+
+
+# ---------- Stage 10: device voice turn + TTS ----------
+
+def _silence_wav(seconds=1, rate=16000):
+    import io, wave
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"\x00\x00" * rate * seconds)
+    return buf.getvalue()
+
+
+def test_agent_voice_turn_silence_and_auth():
+    import base64
+    client, _ = make_client()
+    h = pair(client)
+    wav = _silence_wav()
+    b64 = base64.b64encode(wav).decode()
+    # unauthenticated -> 401/403, never processed
+    r = client.post("/v1/agent/voice/turn", json={"audio_base64": b64})
+    assert r.status_code in (401, 403)
+    # malformed base64 -> 422 ("a" is invalid padding)
+    r = client.post("/v1/agent/voice/turn", json={"audio_base64": "a"},
+                    headers=h)
+    assert r.status_code == 422
+    # oversize -> 413 (2MB + 1, base64-encoded)
+    big = base64.b64encode(b"\x00" * (2 * 1024 * 1024 + 1)).decode()
+    r = client.post("/v1/agent/voice/turn", json={"audio_base64": big},
+                    headers=h)
+    assert r.status_code == 413
+
+
+def test_agent_voice_turn_mock_turn_and_interrupt():
+    import base64
+    client, _ = make_client()
+    h = pair(client)
+    wav = _silence_wav()
+    b64 = base64.b64encode(wav).decode()
+    r = client.post("/v1/agent/voice/turn", json={"audio_base64": b64},
+                    headers=h)
+    # mock STT produces empty transcript -> pipeline rejects empty audio
+    # OR processes; either way it returns a well-formed dict, never an
+    # exception HTML page, and device_id is the CALLER's (not spoofable)
+    assert r.status_code == 200
+    out = r.json()
+    assert "state" in out and "transcript" in out
+    r = client.post("/v1/agent/voice/interrupt", headers=h)
+    assert r.status_code == 200
+    assert r.json()["interrupted"] is True
+
+
+def test_agent_tts_bounds_and_auth():
+    client, _ = make_client()
+    h = pair(client)
+    # unauthenticated -> rejected
+    r = client.post("/v1/agent/tts", json={"text": "hello"})
+    assert r.status_code in (401, 403)
+    # empty -> 400
+    r = client.post("/v1/agent/tts", json={"text": "   "}, headers=h)
+    assert r.status_code == 400
+    # real synthesis through configured provider (mock in tests)
+    r = client.post("/v1/agent/tts", json={"text": "Hey Zara"}, headers=h)
+    assert r.status_code == 200
+    out = r.json()
+    assert out["bytes"] > 0 and "provider" in out
+    import base64
+    raw = base64.b64decode(out["audio_base64"])
+    assert len(raw) == out["bytes"]

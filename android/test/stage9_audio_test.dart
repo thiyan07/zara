@@ -51,4 +51,23 @@ void main() {
     expect(AudioBounds.maxSeconds, equals(30));
     expect(AudioBounds.sampleRate, equals(16000));
   });
+
+  test('wav peak: silence null, tone measured, garbage null', () {
+    // 44-byte header + 4 silent samples
+    final silent = Uint8List(44 + 8);
+    silent[0] = 0x52;
+    silent[1] = 0x49;
+    expect(wavPeakDbfs(silent), isNull);
+    expect(wavPeakDbfs(Uint8List(10)), isNull); // too short
+    expect(wavPeakDbfs(Uint8List.fromList(List.filled(60, 7))), isNull);
+    // full-scale-ish tone: peak 16384 -> -6.02 dBFS
+    final tone = Uint8List(44 + 4);
+    tone[0] = 0x52;
+    tone[1] = 0x49;
+    tone[44] = 0x00;
+    tone[45] = 0x40; // 0x4000 = 16384
+    final db = wavPeakDbfs(tone);
+    expect(db, isNotNull);
+    expect((db! + 6.02).abs(), lessThan(0.05));
+  });
 }

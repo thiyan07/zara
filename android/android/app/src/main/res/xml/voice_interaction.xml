@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Zara voice-interaction descriptor (Stage 10 diagnostic spike).
+     Declares the session host + assist support. No recognition service:
+     Zara does not claim system hotword handling in this stage. -->
+<voice-interaction xmlns:android="http://schemas.android.com/apk/res/android"
+    android:sessionService=".ZaraVoiceInteractionSessionService"
+    android:supportsAssist="true" />

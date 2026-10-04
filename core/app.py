@@ -117,6 +117,11 @@ class VoiceTurnIn(BaseModel):
     who: str = "user"
 
 
+class TTSIn(BaseModel):
+    text: str
+    session_id: str = ""
+
+
 class WakeEventIn(BaseModel):
     phrase: str
 
@@ -621,6 +626,50 @@ def create_app(stack=None) -> FastAPI:
             pass
         s["audit"].record("operator", "device_revoke", device_id, "")
         return {"revoked": device_id}
+
+    # ---- Stage 10: device voice turn (same bounds as operator turn,
+    # device-scoped auth; the operator endpoint is unchanged).
+
+    @app.post("/v1/agent/voice/turn")
+    def agent_voice_turn(body: VoiceTurnIn,
+                         device_id: str = Depends(agent_auth)):
+        import base64 as _b64
+        try:
+            audio = _b64.b64decode(body.audio_base64) if body.audio_base64 \
+                else b"mock-audio"
+        except Exception:  # noqa: BLE001
+            raise HTTPException(status_code=422, detail="invalid audio_base64")
+        if len(audio) > 2 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="audio too large")
+        return s["voice"].handle_audio(audio,
+                                       session_id=body.session_id,
+                                       device_id=device_id, who=body.who)
+
+    @app.post("/v1/agent/voice/interrupt")
+    def agent_voice_interrupt(device_id: str = Depends(agent_auth)):
+        s["audit"].record(device_id, "voice_interrupt", "", "")
+        return s["voice"].interrupt()
+
+    # ---- Stage 10: device TTS (unprivileged synthesis for paired bodies).
+    # Text -> provider WAV. Bounded like the provider itself; device-scoped
+    # auth; no policy implications (synthesis is not execution).
+
+    @app.post("/v1/agent/tts")
+    def agent_tts(body: TTSIn, device_id: str = Depends(agent_auth)):
+        import base64 as _b64
+        text = (body.text or "")[:2000]
+        if not text.strip():
+            raise HTTPException(status_code=400, detail="empty text")
+        try:
+            wav = s["voice"].tts.speak(text)
+        except Exception as e:  # noqa: BLE001 — provider failure is 502
+            raise HTTPException(status_code=502,
+                                detail=f"tts failed: {str(e)[:200]}")
+        s["audit"].record(device_id, "agent_tts", body.session_id,
+                          f"{len(wav)}B")
+        return {"audio_base64": _b64.b64encode(wav).decode(),
+                "bytes": len(wav),
+                "provider": getattr(s["voice"].tts, "name", "unknown")}
 
     # ---- Stage 9: device notifications pull/ack (poll fallback for push) ----
 

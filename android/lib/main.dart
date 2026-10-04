@@ -1,6 +1,9 @@
 import 'dart:async';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'app_state.dart';
+import 'assistant.dart';
+import 'audio_io.dart';
 import 'battery_governor.dart';
 import 'capabilities.dart';
 import 'connection.dart';
@@ -15,6 +18,11 @@ import 'voice_session.dart';
 import 'zara_notifications.dart';
 
 void main() => runApp(const ZaraApp());
+
+/// 409 from Core on decide = execution already decided elsewhere
+/// (approved/denied/expired/cancelled): the approval card is stale and
+/// should be dismissed locally, not retried. Pure for testing.
+bool isStaleApproval(Object e) => e.toString().contains('409');
 
 /// Zara Android body (Stage 9): lifecycle-driven shell over the SAME Zara.
 ///
@@ -49,8 +57,16 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
       NetworkSnapshot('unavailable', timestamp: DateTime.now());
   Map<String, dynamic> voiceFlags = {};
   Map<String, dynamic> perms = {};
+  AssistantStatus assistant = const AssistantStatus();
   String lastError = '';
   int _failures = 0;
+  String voiceDiag = 'idle';
+  String voiceTranscript = '';
+  String voiceReply = '';
+  String voiceCapture = '';
+  String voicePlayback = '';
+  Uint8List? lastReplyAudio;
+  bool voiceBusy = false;
   Timer? _loop;
   bool _busy = false;
 
@@ -99,6 +115,20 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
     } catch (_) {/* self-test best-effort */}
     try {
       perms = await bridge.permissions();
+    } catch (_) {/* keep last */}
+    try {
+      final am = await bridge.assistantStatus();
+      assistant = AssistantStatus.fromMap(am);
+      // ignore: avoid_print
+      print('zara:assistant-status'
+          ' registered=${assistant.serviceRegistered}'
+          ' default=${assistant.zaraIsDefault}'
+          ' roleAvail=${assistant.roleAvailable}'
+          ' roleHeld=${assistant.roleHeld}'
+          ' current=${assistant.currentAssistant}'
+          ' infoValid=${am['service_info_valid']}'
+          ' supportsAssist=${am['supports_assist']}'
+          ' infoError=${am['service_info_error']}');
     } catch (_) {/* keep last */}
     if (!mounted) return;
     setState(() {
@@ -266,6 +296,88 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
     setState(() => conn = CoreLinkState.disconnected);
   }
 
+  /// Diagnostic voice loop (physical validation): bounded capture ->
+  /// Core turn -> provider TTS -> speaker. All legs report separately;
+  /// playback completion is logged as software-only, never audibility.
+  Future<void> _recordTest() async {
+    if (voiceBusy) return;
+    setState(() {
+      voiceBusy = true;
+      voiceDiag = 'recording… (speak now)';
+    });
+    try {
+      final wav = await bridge.audioCapture(seconds: 5.0);
+      if (wav == null || wav.isEmpty) {
+        setState(() => voiceDiag = 'capture returned no audio');
+        return;
+      }
+      final peak = wavPeakDbfs(wav);
+      voiceCapture =
+          'mic: ${wav.length}B peak=${peak?.toStringAsFixed(1) ?? 'silence'} dBFS';
+      setState(() => voiceDiag =
+          'captured ${wav.length}B peak=${peak?.toStringAsFixed(1) ?? 'silence'} dBFS; thinking…');
+      // ignore: avoid_print
+      print('zara:voice-capture bytes=${wav.length} '
+          'peakDb=${peak?.toStringAsFixed(1) ?? 'silence'}');
+      final out = await client.voiceTurn(wav);
+      voiceTranscript = '${out['transcript'] ?? ''}';
+      voiceReply = '${out['reply'] ?? ''}';
+      setState(() => voiceDiag =
+          'heard: "$voiceTranscript" (peak ${peak?.toStringAsFixed(1) ?? 'silence'} dBFS)');
+      // ignore: avoid_print
+      print('zara:voice-turn transcript="$voiceTranscript" '
+          'reply="$voiceReply" status=${out['status']}');
+      if (voiceReply.isNotEmpty) {
+        setState(() => voiceDiag += ' — fetching speech…');
+        lastReplyAudio = await client.tts(voiceReply);
+        setState(() => voiceDiag += ' (${lastReplyAudio!.length}B audio ready)');
+      }
+    } on AudioBridgeException catch (e) {
+      setState(() => voiceDiag = 'capture: $e');
+    } on CoreException catch (e) {
+      setState(() => voiceDiag = 'core: $e');
+    } finally {
+      if (mounted) setState(() => voiceBusy = false);
+    }
+  }
+
+  Future<void> _speakLast() async {
+    final audio = lastReplyAudio;
+    if (audio == null || voiceBusy) return;
+    setState(() {
+      voiceBusy = true;
+      voiceDiag = 'speaking…';
+    });
+    try {
+      final r = await bridge.audioPlay(audio);
+      voicePlayback = 'speaker: $r (software-only, NOT audibility)';
+      setState(() => voiceDiag = 'playback exited: $r (software-only)');
+      // ignore: avoid_print
+      print('zara:voice-playback $r');
+    } on AudioBridgeException catch (e) {
+      voicePlayback = 'speaker FAILED: $e';
+      setState(() => voiceDiag = 'playback: $e');
+    } finally {
+      if (mounted) setState(() => voiceBusy = false);
+    }
+  }
+
+  Future<void> _stopVoice() async {
+    try {
+      await bridge.audioStop();
+    } catch (_) {}
+    try {
+      await bridge.audioPlayStop();
+    } catch (_) {}
+    try {
+      await client.interruptVoice();
+    } catch (_) {}
+    if (mounted) setState(() => voiceDiag = 'stopped');
+  }
+
+/// 409 from Core on decide = execution already decided elsewhere
+/// (approved/denied/expired/cancelled): the approval card is stale and
+/// should be dismissed locally, not retried. Pure for testing.
   Future<void> _decide(
       DeviceNotification n, String execId, bool approve) async {
     try {
@@ -275,6 +387,17 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
         await client.ackNotification(n.id);
       } catch (_) {}
     } on CoreException catch (e) {
+      // 409 = Core already decided (approved/denied/expired elsewhere):
+      // the card is stale, so dismiss it locally instead of nagging.
+      // Anything else keeps the card for retry.
+      if (isStaleApproval(e)) {
+        notifCenter.ack(n.id);
+        try {
+          await client.ackNotification(n.id);
+        } catch (_) {}
+        if (mounted) setState(() {});
+        return;
+      }
       setState(() => lastError = 'approval: $e');
     }
     if (mounted) setState(() {});
@@ -332,6 +455,7 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
             Text('Battery: ${battery.pct?.toStringAsFixed(0) ?? '?'}% '
                 '(charging: ${battery.charging}, level: ${battery.level()})'),
             Text('Voice: ${voice.state} — wake phrase "$wakePhrase"'),
+            Text('Assistant: ${assistant.describe()}'),
             Text('Mic permission: ${perms['microphone'] ?? '?'} | '
                 'Notifications: ${perms['notifications'] ?? '?'}'),
             if (lastError.isNotEmpty)
@@ -408,6 +532,35 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
                     child: const Text('Enable notifications')),
                 OutlinedButton(
                     onPressed: _logout, child: const Text('Sign out')),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Text('Voice diagnostic (physical)',
+                style: Theme.of(context).textTheme.titleMedium),
+            Text(voiceDiag, style: Theme.of(context).textTheme.bodyMedium),
+            if (voiceCapture.isNotEmpty) Text(voiceCapture),
+            if (voiceTranscript.isNotEmpty) Text('Heard: $voiceTranscript'),
+            if (voiceReply.isNotEmpty) Text('Zara: $voiceReply'),
+            if (voicePlayback.isNotEmpty) Text(voicePlayback),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                FilledButton(
+                    onPressed: (voiceBusy ||
+                            lifecycle.state != DeviceLifecycleState.online)
+                        ? null
+                        : _recordTest,
+                    child: const Text('Record 3s test')),
+                OutlinedButton(
+                    onPressed: (voiceBusy || lastReplyAudio == null)
+                        ? null
+                        : _speakLast,
+                    child: const Text('Speak reply')),
+                OutlinedButton(
+                    onPressed: voiceBusy ? _stopVoice : null,
+                    child: const Text('Stop')),
               ],
             ),
             const SizedBox(height: 12),

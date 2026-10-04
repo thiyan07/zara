@@ -37,6 +37,43 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
+        <!-- Stage 10 diagnostic spike: Zara as a candidate system assistant.
+             Presence here claims NOTHING — the OS/user decide. Status is
+             reported truthfully via getAssistantStatus. -->
+        <service
+            android:name=".ZaraVoiceInteractionService"
+            android:permission="android.permission.BIND_VOICE_INTERACTION"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.service.voice.VoiceInteractionService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.voice_interaction"
+                android:resource="@xml/voice_interaction" />
+        </service>
+        <service
+            android:name=".ZaraVoiceInteractionSessionService"
+            android:permission="android.permission.BIND_VOICE_INTERACTION"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.service.voice.VoiceInteractionSessionService" />
+            </intent-filter>
+        </service>
+        <!-- ASSIST entry point: the OS enumerates assistant candidates
+             through ACTION_ASSIST activities. This proxy only opens the
+             normal app surface (same as the launcher icon) and finishes. -->
+        <activity
+            android:name=".ZaraAssistProxyActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@style/LaunchTheme">
+            <intent-filter>
+                <action android:name="android.intent.action.ASSIST" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and

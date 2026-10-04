@@ -59,7 +59,13 @@
   lifecycle/restore/revoke, allowlisted job execution, voice session with
   Core-identical limits, notification approvals via Core, mock push + poll
   fallback. EMULATOR VERIFIED 2026-10-03 (pairing, jobs, revoke, audio API
-  paths). PHYSICAL ANDROID: PENDING (mic signal, audibility, DSP wake).
+  paths). PHYSICAL ANDROID 2026-10-04 (vivo V2338): mic signal VERIFIED
+  (160044 B captures, peaks −13.7…−19.6 dBFS, live faster-whisper
+  transcripts), speaker software playback VERIFIED after
+  USAGE_MEDIA+MODE_STREAM fix (`{played: true, 524288 B, 22050 Hz}`);
+  human audibility VERIFIED 2026-10-04 (user heard Piper reply;
+  "Heard: Hey Zara, how are you?" screenshot h1);
+  DSP wake NOT_SUPPORTED on OriginOS.
 - Whisper quirks observed: number words normalize ("one two three" ->
   "1 2 3"), punctuation varies run to run. Tests assert accordingly.
 

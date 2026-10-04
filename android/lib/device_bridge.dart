@@ -12,6 +12,8 @@ class DeviceBridge {
       return Map<String, dynamic>.from(m ?? {});
     } on PlatformException {
       return {'supported': false};
+    } catch (_) {
+      return {'supported': false};
     }
   }
 
@@ -21,6 +23,8 @@ class DeviceBridge {
       return Map<String, dynamic>.from(m ?? {});
     } on PlatformException {
       return {'supported': false};
+    } catch (_) {
+      return {'supported': false};
     }
   }
 
@@ -29,6 +33,8 @@ class DeviceBridge {
       final m = await _ch.invokeMapMethod<String, dynamic>('getPermissions');
       return Map<String, dynamic>.from(m ?? {});
     } on PlatformException {
+      return {'supported': false};
+    } catch (_) {
       return {'supported': false};
     }
   }
@@ -43,6 +49,8 @@ class DeviceBridge {
       return Map<String, dynamic>.from(m ?? {});
     } on PlatformException {
       return {'supported': false};
+    } catch (_) {
+      return {'supported': false};
     }
   }
 
@@ -55,6 +63,8 @@ class DeviceBridge {
       return b;
     } on PlatformException catch (e) {
       throw AudioBridgeException(e.code, e.message ?? 'capture failed');
+    } catch (e) {
+      throw AudioBridgeException('failed', '$e');
     }
   }
 
@@ -63,6 +73,8 @@ class DeviceBridge {
       await _ch.invokeMethod('audioStop');
     } on PlatformException catch (e) {
       throw AudioBridgeException(e.code, e.message ?? 'stop failed');
+    } catch (e) {
+      throw AudioBridgeException('failed', '$e');
     }
   }
 
@@ -75,6 +87,8 @@ class DeviceBridge {
       return Map<String, dynamic>.from(m ?? {});
     } on PlatformException catch (e) {
       throw AudioBridgeException(e.code, e.message ?? 'play failed');
+    } catch (e) {
+      throw AudioBridgeException('failed', '$e');
     }
   }
 
@@ -83,6 +97,8 @@ class DeviceBridge {
       await _ch.invokeMethod('audioPlayStop');
     } on PlatformException catch (e) {
       throw AudioBridgeException(e.code, e.message ?? 'play-stop failed');
+    } catch (e) {
+      throw AudioBridgeException('failed', '$e');
     }
   }
 
@@ -95,6 +111,8 @@ class DeviceBridge {
       return Map<String, dynamic>.from(m ?? {});
     } on PlatformException {
       return {'granted': false};
+    } catch (_) {
+      return {'granted': false};
     }
   }
 
@@ -105,13 +123,28 @@ class DeviceBridge {
       return Map<String, dynamic>.from(m ?? {});
     } on PlatformException {
       return {'granted': false};
+    } catch (_) {
+      return {'granted': false};
     }
   }
 
   Future<void> createNotificationChannels() async {
     try {
       await _ch.invokeMethod('createNotificationChannels');
-    } on PlatformException {/* channels are best-effort */}
+    } catch (_) {/* channels are best-effort */}
+  }
+
+  /// Assistant-role report (Stage 10). Absence of data is never success.
+  Future<Map<String, dynamic>> assistantStatus() async {
+    try {
+      final m =
+          await _ch.invokeMapMethod<String, dynamic>('getAssistantStatus');
+      return Map<String, dynamic>.from(m ?? {});
+    } on PlatformException {
+      return {'service_registered': false};
+    } catch (_) {
+      return {'service_registered': false};
+    }
   }
 
   /// Debug/emulator self-test: sync mic+speaker API info, no permission
@@ -121,6 +154,8 @@ class DeviceBridge {
       final m = await _ch.invokeMapMethod<String, dynamic>('audioSelfTest');
       return Map<String, dynamic>.from(m ?? {});
     } on PlatformException {
+      return {'supported': false};
+    } catch (_) {
       return {'supported': false};
     }
   }
