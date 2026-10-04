@@ -32,6 +32,14 @@ bool shouldResumeLoop(String lifecycleState) =>
     lifecycleState == DeviceLifecycleState.online ||
     lifecycleState == DeviceLifecycleState.degraded;
 
+/// Re-register backoff: 5s, 10s, 20s, 40s, then 60s cap.
+/// Pure for testing. Timer-driven (no busy loop); cancelled on pause.
+Duration registerRetryDelay(int attempt) {
+  var secs = 5 * (1 << (attempt - 1).clamp(0, 10));
+  if (secs > 60) secs = 60;
+  return Duration(seconds: secs);
+}
+
 /// Zara Android body (Stage 9): lifecycle-driven shell over the SAME Zara.
 ///
 /// This widget owns NO authority: pairing/keys in SecureStore, jobs run
@@ -74,11 +82,15 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
   String voiceReply = '';
   String voiceCapture = '';
   String voicePlayback = '';
+  String voiceStt = '';
   Uint8List? lastReplyAudio;
   bool voiceBusy = false;
   Timer? _loop;
   bool _busy = false;
   final Set<String> _deciding = {};
+  Timer? _regRetry;
+  int _regAttempts = 0;
+  bool _registering = false;
 
   @override
   void initState() {
@@ -154,9 +166,14 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
   }
 
   Future<void> _register() async {
+    // Re-entrancy: retry timer + foreground resume must not overlap.
+    if (_registering) return;
+    _registering = true;
+    _regRetry?.cancel();
     setState(() => conn = CoreLinkState.connecting);
     try {
       await client.register(advertisedCapabilities(), 'zara-android 9.0.0');
+      _regAttempts = 0;
       lifecycle.move(DeviceLifecycleState.online);
       setState(() {
         conn = CoreLinkState.online;
@@ -165,6 +182,7 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
       });
       _startLoop();
     } on AuthException catch (e) {
+      _regRetry?.cancel();
       await secureStore.clearDeviceCredentials();
       lifecycle.handleHttp(403, hasIdentity: true);
       setState(() {
@@ -172,10 +190,28 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
         lastError = 'revoked: $e';
       });
     } catch (e) {
+      // Register-while-unreachable (Stage 11 fix): without a retry the
+      // lifecycle strands in `registering` forever — no loop ever starts.
+      // Timer-driven bounded backoff; cancelled on pause/dispose.
+      _regAttempts += 1;
+      _regRetry?.cancel();
+      _regRetry = Timer(registerRetryDelay(_regAttempts), () {
+        // Only retry if nobody moved the lifecycle meanwhile
+        // (logout/revoke/pairing wins over the timer).
+        if (mounted &&
+            (lifecycle.state == DeviceLifecycleState.registering ||
+                lifecycle.state == DeviceLifecycleState.reconnecting)) {
+          _register();
+        }
+      });
       setState(() {
-        conn = CoreLinkState.offline;
+        conn = _regAttempts <= 2
+            ? CoreLinkState.reconnecting
+            : CoreLinkState.offline;
         lastError = '$e';
       });
+    } finally {
+      _registering = false;
     }
   }
 
@@ -301,6 +337,7 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
 
   Future<void> _logout() async {
     _loop?.cancel();
+    _regRetry?.cancel();
     try {
       await client.disconnect();
     } catch (_) {}
@@ -337,6 +374,11 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
       final out = await client.voiceTurn(wav);
       voiceTranscript = '${out['transcript'] ?? ''}';
       voiceReply = '${out['reply'] ?? ''}';
+      final fb = out['stt_fallback_used'] == true
+          ? ' (fallback:${out['stt_fallback_reason']})'
+          : '';
+      voiceStt = 'stt: ${out['stt_provider'] ?? '?'}'
+          ' ${out['stt_model'] ?? ''}$fb';
       setState(() => voiceDiag =
           'heard: "$voiceTranscript" (peak ${peak?.toStringAsFixed(1) ?? 'silence'} dBFS)');
       // ignore: avoid_print
@@ -426,17 +468,23 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
     // resume + refresh on foreground. No state is lost: Core is the source.
     if (state == AppLifecycleState.paused) {
       _loop?.cancel();
+      _regRetry?.cancel();
     } else if (state == AppLifecycleState.resumed &&
         shouldResumeLoop(lifecycle.state)) {
       // Degraded included: backgrounding while degraded must not kill the
       // loop forever (Stage 11). _startLoop still refuses when critical.
       _startLoop();
+    } else if (state == AppLifecycleState.resumed &&
+        lifecycle.state == DeviceLifecycleState.registering) {
+      // Register-while-unreachable: resume retries instead of stranding.
+      _register();
     }
   }
 
   @override
   void dispose() {
     _loop?.cancel();
+    _regRetry?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     codeCtrl.dispose();
     super.dispose();
@@ -559,6 +607,7 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
                 style: Theme.of(context).textTheme.titleMedium),
             Text(voiceDiag, style: Theme.of(context).textTheme.bodyMedium),
             if (voiceCapture.isNotEmpty) Text(voiceCapture),
+            if (voiceStt.isNotEmpty) Text(voiceStt),
             if (voiceTranscript.isNotEmpty) Text('Heard: $voiceTranscript'),
             if (voiceReply.isNotEmpty) Text('Zara: $voiceReply'),
             if (voicePlayback.isNotEmpty) Text(voicePlayback),

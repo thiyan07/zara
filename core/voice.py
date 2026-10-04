@@ -105,6 +105,17 @@ class MockSTT(STTProvider):
         return self.transcript
 
 
+class _UnavailableLocal(STTProvider):
+    """Fallback placeholder when local STT cannot be built: always fails
+    so STTFallback re-raises the PRIMARY error instead of succeeding
+    silently with a mock transcript."""
+
+    name = "local-unavailable"
+
+    def transcribe(self, audio: bytes) -> str:
+        raise RuntimeError("local STT unavailable (faster-whisper missing)")
+
+
 class MockTTS(TTSProvider):
     name = "mock-tts"
 
@@ -460,11 +471,31 @@ class VADSpotterBackend:
 
 def stt_from_env() -> STTProvider:
     """auto (default): local whisper when importable, else mock.
-    Set STT_PROVIDER=mock to force the mock; local for explicit local."""
+    nvidia: hosted Parakeet primary + local faster-whisper fallback.
+    mock: force the mock. local: explicit local (raises if unavailable)."""
     import os as _os
     which = _os.environ.get("STT_PROVIDER", "auto").strip().lower()
     if which == "mock":
         return MockSTT()
+    if which == "nvidia":
+        from .stt_nvidia import NvidiaSTT, STTFallback
+        primary = NvidiaSTT(
+            server=_os.environ.get("NVIDIA_STT_SERVER",
+                                   "grpc.nvcf.nvidia.com:443"),
+            function_id=_os.environ.get(
+                "NVIDIA_STT_FUNCTION_ID",
+                "d3fe9151-442b-4204-a70d-5fcc597fd610"),
+            model_label=_os.environ.get("NVIDIA_STT_MODEL",
+                                        "parakeet-tdt-0_6b-v2"),
+            language=_os.environ.get("NVIDIA_STT_LANGUAGE", "en-US"))
+        try:
+            fallback = FasterWhisperSTT(
+                model=_os.environ.get("STT_MODEL", "tiny.en"))
+        except (ImportError, RuntimeError):
+            # No silent mock fallback: if local is unavailable the
+            # PRIMARY error must propagate (STTFallback re-raises it).
+            fallback = _UnavailableLocal()
+        return STTFallback(primary, fallback)
     if which in ("auto", "local"):
         try:
             stt = FasterWhisperSTT(
@@ -565,18 +596,40 @@ class VoicePipeline:
         audio_out = b"".join(self.tts.stream_speak(result.reply,
                                                    cancel=self._speak_cancel))
         self.states.move(VoiceState.IDLE)
-        return {"ok": True, "transcript": transcript, "reply": result.reply,
-                "audio_bytes": len(audio_out), "status": result.status,
-                "state": self.states.state.value,
-                "mission_id": result.mission_id,
-                "execution_id": result.execution_id,
-                "tool": result.tool, "device_id": result.device_id}
+        out = {"ok": True, "transcript": transcript, "reply": result.reply,
+               "audio_bytes": len(audio_out), "status": result.status,
+               "state": self.states.state.value,
+               "mission_id": result.mission_id,
+               "execution_id": result.execution_id,
+               "tool": result.tool, "device_id": result.device_id}
+        # STT provenance (additive): which engine produced the transcript
+        # and whether fallback fired. Never raw audio, never keys.
+        snap = getattr(self.stt, "last_result", None)
+        if snap is not None:
+            out["stt_provider"] = snap.provider or self.stt.name
+            out["stt_model"] = snap.model
+            out["stt_fallback_used"] = snap.fallback_used
+            out["stt_fallback_reason"] = snap.fallback_reason
+            out["stt_wall_ms"] = snap.wall_ms
+        else:
+            out["stt_provider"] = self.stt.name
+            out["stt_fallback_used"] = False
+            out["stt_fallback_reason"] = ""
+            out["stt_wall_ms"] = 0
+        return out
 
     def interrupt(self) -> dict:
-        """Barge-in: stop TTS, return to listening. One session, no fork."""
+        """Barge-in: stop TTS, cancel any in-flight hosted STT, return to
+        listening. One session, no fork. Cancelled results are discarded."""
         self._speak_cancel.set()
         if hasattr(self.tts, "stop"):
             self.tts.stop()
+        stop = getattr(self.stt, "stop", None)
+        if callable(stop):
+            try:
+                stop()
+            except Exception:  # noqa: BLE001 — best effort
+                pass
         try:
             self.states.move(VoiceState.INTERRUPTED)
             self.states.move(VoiceState.LISTENING)
