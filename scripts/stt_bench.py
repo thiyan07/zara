@@ -48,6 +48,32 @@ REFERENCE = {
     "numbers": "Postpone the meeting to 5 PM on room 204.",
     "filename": "Create a Python file called test agent.",
     "short": "Run the tests.",
+    "longcmd": "Move the photos from my phone to the laptop and send a "
+               "message saying the meeting is postponed.",
+    "pytest": "Run pytest tests slash test voice dot pie.",
+    "nim": "Use NVIDIA NIM with OpenCode on Android.",
+    "deletetemp": "Delete the temporary project folder.",
+    "threshold": "Set the battery threshold to twenty percent.",
+    "opencode": "Open the assistant project and check Git status.",
+    "fast": "What is my battery level? Run the tests now.",
+    "noisy": "What is my battery level?",
+}
+# Important command tokens per fixture: action/target/entity words whose
+# loss changes what Zara would DO. Recall is deterministic word-presence.
+IMPORTANT = {
+    "battery": ["battery", "level"],
+    "tech": ["fastapi", "postgresql"],
+    "numbers": ["postponed", "5", "204"],
+    "filename": ["create", "file", "test"],
+    "short": ["run", "tests"],
+    "longcmd": ["move", "photos", "laptop", "message", "postponed"],
+    "pytest": ["pytest", "voice"],
+    "nim": ["nvidia", "nim", "opencode", "android"],
+    "deletetemp": ["delete", "temporary", "folder"],
+    "threshold": ["battery", "threshold", "twenty"],
+    "opencode": ["open", "project", "git", "status"],
+    "fast": ["battery", "run", "tests"],
+    "noisy": ["battery", "level"],
 }
 
 
@@ -122,9 +148,14 @@ def main():
                 dt = time.monotonic() - t
                 w = wer(norm(ref), norm(hyp)) if hyp else 1.0
                 if best is None or w < best["wer"]:
+                    imp = IMPORTANT.get(name, [])
+                    hset = set(norm(hyp))
+                    rec = (sum(1 for t in imp if t in hset) / len(imp)
+                           if imp else 1.0)
                     best = {"provider": pname, "fixture": name,
                             "latency_s": round(dt, 2),
                             "wer": round(w, 3),
+                            "token_recall": round(rec, 3),
                             "exact": norm(ref) == norm(hyp),
                             "hypothesis": hyp, "error": err,
                             "bytes": len(audio)}
@@ -138,6 +169,8 @@ def main():
                 print(f"== {p}: mean_latency="
                       f"{sum(r['latency_s'] for r in pr)/len(pr):.2f}s "
                       f"mean_wer={sum(r['wer'] for r in pr)/len(pr):.3f} "
+                      f"mean_token_recall="
+                      f"{sum(r['token_recall'] for r in pr)/len(pr):.3f} "
                       f"exact={sum(r['exact'] for r in pr)}/{len(pr)}")
     return 0
 

@@ -586,8 +586,11 @@ class VoicePipeline:
             self.states.move(VoiceState.ERROR)
             return {"ok": False, "error": f"stt: {e}", "state": "error"}
         self.states.move(VoiceState.THINKING)
+        import time as _t
+        _think_start = _t.monotonic()
         result = self.loop.handle_text(transcript, session_id=session_id,
                                        device_id=device_id, who=who)
+        loop_ms = int((_t.monotonic() - _think_start) * 1000)
         self.states.move(VoiceState.EXECUTING if result.tool
                          else VoiceState.SPEAKING)
         if result.tool:
@@ -616,6 +619,17 @@ class VoicePipeline:
             out["stt_fallback_used"] = False
             out["stt_fallback_reason"] = ""
             out["stt_wall_ms"] = 0
+        out["loop_ms"] = loop_ms
+        # Deterministic transcript safety signals (advisory only;
+        # enforcement stays in policy + approvals).
+        from .voice_safety import assess_transcript
+        try:
+            assess = assess_transcript(transcript)
+        except Exception:  # noqa: BLE001 — never break a turn on flags
+            assess = {"flags": [], "needs_confirmation_hint": False,
+                      "tokens": 0}
+        out["transcript_flags"] = assess["flags"]
+        out["transcript_tokens"] = assess["tokens"]
         return out
 
     def interrupt(self) -> dict:

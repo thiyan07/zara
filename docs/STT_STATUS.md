@@ -71,18 +71,29 @@ Wake loop: unchanged — no always-on mic; "Hey Zara" via manual capture.
 
 ## Benchmark (2026-10-04, `scripts/stt_bench.py`, project-owned Piper fixtures)
 
-| provider | mean latency | mean WER* | exact |
+| provider | mean latency | mean WER* | mean token recall | exact |
+|---|---|---|---|---|
+| local tiny.en | 0.37 s | 0.266 | 0.705 | 6/13 |
+| nvidia parakeet | 0.62 s | 0.181 | 0.750 | 7/13 |
+
+13 fixtures: battery/tech/numbers/filename/short + longcmd/pytest/nim/
+deletetemp/threshold/opencode/fast(1.4x time-compressed)/noisy(10dB SNR).
+*WER on lowercased alnum normalization (punishes "FastAPI"->"fast api";
+read qualitatively). Neither dominates: NVIDIA wins numbers/postpone +
+overall WER; local is faster and matched NVIDIA on 10/13. Both fail
+`pytest tests/test_voice.py` spelling and 10dB noise ("factory level").
+Fast/noise fixtures are labeled stress (compressed/synthetic), not
+human speech. Accent/Tamil: NOT_TESTED here — covered physically instead.
+
+| provider | mean latency | mean WER* | exact (5-fixture pilot) |
 |---|---|---|---|
 | local tiny.en | 0.52 s | 0.067 | 4/5 |
 | nvidia parakeet | 0.71 s | 0.124 | 3/5 |
 
-*WER on lowercased alnum normalization (punishes "FastAPI"->"fast api";
-read qualitatively). Notable: NVIDIA got "postpone" right where
+*Pilot (Stage 12) WER on lowercased alnum normalization (punishes
+"FastAPI"->"fast api"; read qualitatively). The 13-fixture table above
+supersedes it. Notable: NVIDIA got "postpone" right where
 tiny.en heard "Post-pung" — the motivating quality gap.
-Fixtures: standard English + tech terms + numbers + filenames + short
-commands only. Accent/noise/fast/Tamil: NOT_TESTED here (single clean
-American-English TTS voice) — Indian English + noise covered by
-PHYSICAL validation on vivo V2338 instead.
 
 ## Language status
 
@@ -95,8 +106,9 @@ PHYSICAL validation on vivo V2338 instead.
 - Technical vocabulary: TEST_VERIFIED (FastAPI/PostgreSQL/OpenCode terms
   in fixtures; casing normalization caveat above).
 - Tamil: NOT_SUPPORTED by selected model (parakeet-tdt English-only).
-  Multilingual alt `ai-whisper-large-v3` exists but is UNTESTED here —
-  no claim made.
+  whisper-large-v3 function (ta-IN) answers requests (reachability
+  VERIFIED 2026-10-04) but no Tamil audio exists to test transcription
+  with — no claim made. INVESTIGATION_ONLY, never auto-selected.
 - Tanglish: NOT_TESTED (no fixture voice; no private recordings used).
 - Fast speech / noise: NOT_TESTED in harness; noise covered physically.
 
@@ -107,3 +119,24 @@ APK contains no secret (no Dart change; Core-only key). Transcript =
 untrusted data (existing hard-deny 403 intact, incl. new regression
 test). Empty/cancelled/timeout transcripts execute nothing (pipeline
 returns error state; verified by existing voice tests).
+
+## Stage 13 additions (2026-10-04)
+
+- Transcript safety signals (`core/voice_safety.py`): deterministic
+  empty/too-short/high-risk/missing-target/number/urgency flags,
+  attached to turn output as `transcript_flags` (advisory only;
+  enforcement stays in policy + approvals). TEST_VERIFIED.
+- Provider health (`STTHealth`): consecutive failures, last category,
+  60 s cooldown after 3 transient failures (fallback reason=cooldown),
+  rolling 20-sample mean latency. Memory-bounded, no audio persisted.
+- Latency breakdown: turn output now carries `loop_ms` alongside
+  `stt_wall_ms` (capture/upload/LLM/tool/TTS split: capture 5 s bounded,
+  STT 0.5–3.3 s, loop varies with LLM; live full turn 3.3 s NVIDIA /
+  8.5 s fallback path incl. retry).
+- Offline fallback validated LIVE (black-holed NVIDIA server ->
+  NETWORK_ERROR -> local "Run the tests.", fallback=True, responded).
+  True radio-off on hardware BLOCKED (laptop rides phone hotspot).
+- Barge-in: software cancellation TEST_VERIFIED (incl. STT stop +
+  failing-stop races); acoustic PENDING.
+- Cold-start register-retry deadlock fixed in app (separate fix, same
+  branch): PHYSICAL_VERIFIED (dead-tunnel boot -> auto-online).

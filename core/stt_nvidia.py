@@ -258,6 +258,47 @@ class NvidiaSTT(STTProvider):
                 "offline": False}
 
 
+class STTHealth:
+    """Bounded in-memory provider health. Operational metadata only:
+    consecutive failures, last category, cooldown, rolling mean latency
+    over the last 20 requests. No audio, no transcripts persisted."""
+
+    def __init__(self, cooldown_s: float = 60.0, window: int = 20) -> None:
+        self.cooldown_s = cooldown_s
+        self.window = window
+        self.consecutive_failures = 0
+        self.last_category: Optional[str] = None
+        self.last_failure_at: float = 0.0
+        self._latencies: list[float] = []
+
+    def record_success(self, wall_ms: int) -> None:
+        self.consecutive_failures = 0
+        self.last_category = None
+        self._latencies.append(float(wall_ms))
+        del self._latencies[:-self.window]
+
+    def record_failure(self, category: str) -> None:
+        self.consecutive_failures += 1
+        self.last_category = category
+        self.last_failure_at = time.monotonic()
+
+    def cooling_down(self) -> bool:
+        return (self.consecutive_failures >= 3 and
+                (time.monotonic() - self.last_failure_at) < self.cooldown_s)
+
+    def mean_latency_ms(self) -> Optional[float]:
+        if not self._latencies:
+            return None
+        return sum(self._latencies) / len(self._latencies)
+
+    def snapshot(self) -> dict:
+        return {"consecutive_failures": self.consecutive_failures,
+                "last_category": self.last_category,
+                "cooling_down": self.cooling_down(),
+                "mean_latency_ms": self.mean_latency_ms(),
+                "samples": len(self._latencies)}
+
+
 class STTFallback(STTProvider):
     """Primary (hosted) + local fallback. IS an STTProvider so the voice
     pipeline needs no changes. Fallback happens ONLY on transient
@@ -271,6 +312,7 @@ class STTFallback(STTProvider):
         self.primary = primary
         self.fallback = fallback
         self.last_result: Optional[STTResult] = None
+        self.health = STTHealth()
 
     def _snapshot(self, text: str, fallback_used: bool,
                   reason: str) -> STTResult:
@@ -286,9 +328,21 @@ class STTFallback(STTProvider):
                          fallback_reason=reason)
 
     def transcribe(self, audio: bytes) -> str:
+        # Health-aware routing: a repeatedly failing primary is skipped
+        # for one cooldown window instead of hammered. Recorded honestly
+        # as fallback with reason=cooldown.
+        if self.health.cooling_down():
+            text = self.fallback.transcribe(audio)
+            self.last_result = self._snapshot(text, True, "cooldown")
+            return text
         try:
             text = self.primary.transcribe(audio)
-            self.last_result = self._snapshot(text, False, "")
+            snap = self._snapshot(text, False, "")
+            if snap.wall_ms:
+                self.health.record_success(snap.wall_ms)
+            else:
+                self.health.record_success(0)
+            self.last_result = snap
             return text
         except Exception as e:  # noqa: BLE001
             cat = getattr(e, "category", None)
@@ -300,7 +354,11 @@ class STTFallback(STTProvider):
             except Exception:
                 # Local also failed: surface the PRIMARY error (the
                 # configured path), not the fallback's.
+                if cat:
+                    self.health.record_failure(cat)
                 raise e
+            if cat:
+                self.health.record_failure(cat)
             self.last_result = self._snapshot(text, True, reason)
             return text
 
@@ -314,7 +372,7 @@ class STTFallback(STTProvider):
                     pass
 
     def availability(self) -> dict:
-        out = {"backend": "stt-fallback"}
+        out = {"backend": "stt-fallback", "health": self.health.snapshot()}
         for key, p in (("primary", self.primary),
                        ("fallback", self.fallback)):
             avail = getattr(p, "availability", None)
