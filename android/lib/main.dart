@@ -24,6 +24,14 @@ void main() => runApp(const ZaraApp());
 /// should be dismissed locally, not retried. Pure for testing.
 bool isStaleApproval(Object e) => e.toString().contains('409');
 
+/// Foreground return restarts polling when the body is live (online) or
+/// throttled-but-alive (degraded). Every other state needs explicit user
+/// action (pairing) or is terminal (revoked/logged-out). Pure for testing.
+/// _startLoop still refuses to schedule while battery-critical.
+bool shouldResumeLoop(String lifecycleState) =>
+    lifecycleState == DeviceLifecycleState.online ||
+    lifecycleState == DeviceLifecycleState.degraded;
+
 /// Zara Android body (Stage 9): lifecycle-driven shell over the SAME Zara.
 ///
 /// This widget owns NO authority: pairing/keys in SecureStore, jobs run
@@ -60,6 +68,7 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
   AssistantStatus assistant = const AssistantStatus();
   String lastError = '';
   int _failures = 0;
+  String secureBackend = 'keystore';
   String voiceDiag = 'idle';
   String voiceTranscript = '';
   String voiceReply = '';
@@ -69,6 +78,7 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
   bool voiceBusy = false;
   Timer? _loop;
   bool _busy = false;
+  final Set<String> _deciding = {};
 
   @override
   void initState() {
@@ -89,6 +99,9 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
   Future<void> _boot() async {
     await bridge.createNotificationChannels();
     await _refresh();
+    secureBackend = secureStore.backend;
+    // ignore: avoid_print
+    print('zara:secure-backend=$secureBackend');
     final creds = await secureStore.loadDeviceCredentials();
     if (creds.deviceId == null || creds.deviceKey == null) {
       lifecycle.move(DeviceLifecycleState.pairing);
@@ -169,6 +182,7 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
   void _startLoop() {
     _loop?.cancel();
     // Battery-critical: no auto loop; user reconnects manually.
+    // (Loop may still be restarted later; _tick re-checks every round.)
     if (battery.level() == AndroidBatteryLevel.critical) return;
     final interval = battery.reduceBackgroundWork
         ? const Duration(seconds: 60)
@@ -275,6 +289,7 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
         deviceId: client.deviceId ?? 'android-phone',
         deviceKey: client.deviceKey ?? '',
       );
+      secureBackend = secureStore.backend;
       lifecycle.move(DeviceLifecycleState.enrolled);
       lifecycle.move(DeviceLifecycleState.registering);
       await _register();
@@ -375,11 +390,11 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
     if (mounted) setState(() => voiceDiag = 'stopped');
   }
 
-/// 409 from Core on decide = execution already decided elsewhere
-/// (approved/denied/expired/cancelled): the approval card is stale and
-/// should be dismissed locally, not retried. Pure for testing.
   Future<void> _decide(
       DeviceNotification n, String execId, bool approve) async {
+    // One in-flight decision per execution: double-taps collapse into the
+    // first request. Core 409 remains the real duplicate-execution guard.
+    if (!_deciding.add(execId)) return;
     try {
       await client.decideApproval(execId, approve);
       notifCenter.ack(n.id);
@@ -399,6 +414,8 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
         return;
       }
       setState(() => lastError = 'approval: $e');
+    } finally {
+      _deciding.remove(execId);
     }
     if (mounted) setState(() {});
   }
@@ -410,7 +427,9 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
     if (state == AppLifecycleState.paused) {
       _loop?.cancel();
     } else if (state == AppLifecycleState.resumed &&
-        lifecycle.state == DeviceLifecycleState.online) {
+        shouldResumeLoop(lifecycle.state)) {
+      // Degraded included: backgrounding while degraded must not kill the
+      // loop forever (Stage 11). _startLoop still refuses when critical.
       _startLoop();
     }
   }
@@ -458,6 +477,7 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
             Text('Assistant: ${assistant.describe()}'),
             Text('Mic permission: ${perms['microphone'] ?? '?'} | '
                 'Notifications: ${perms['notifications'] ?? '?'}'),
+            Text('Keys: $secureBackend'),
             if (lastError.isNotEmpty)
               Text('Error: $lastError',
                   style: const TextStyle(color: Colors.red)),
@@ -552,7 +572,7 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
                             lifecycle.state != DeviceLifecycleState.online)
                         ? null
                         : _recordTest,
-                    child: const Text('Record 3s test')),
+                    child: const Text('Record 5s test')),
                 OutlinedButton(
                     onPressed: (voiceBusy || lastReplyAudio == null)
                         ? null

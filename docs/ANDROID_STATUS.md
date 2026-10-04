@@ -48,11 +48,22 @@ EMULATOR_VERIFIED. Permissions: INTERNET/ACCESS_NETWORK_STATE (install),
 RECORD_AUDIO + POST_NOTIFICATIONS (runtime, denial = normal state) —
 manifest + flow VERIFIED, grant-dialog UX PHYSICAL_VALIDATION_PENDING.
 
-## Blocked / deferred
+## Stage 11 reliability hardening (vivo V2338, 2026-10-04, branch `stage11-android-reliability`)
 
-Physical Android device (`adb` had none): mic signal, audibility, DSP
-wake, grant dialogs, FCM delivery, rotation sensor, radio behavior —
-all PHYSICAL_VALIDATION_PENDING. Nothing in this file claims them.
+Reliability-only: no new features, no new permissions, no new providers.
+
+| Item | Status |
+|---|---|
+| SecureStore backend surfaced in UI (`Keys: keystore`) + boot log; silent memory-fallback can no longer hide | VERIFIED (unit test + screenshot) |
+| Approval double-tap: in-flight `_deciding` guard collapses second tap; Core 409 remains real guard; audit showed exactly one `permission_granted` | PHYSICAL_VERIFIED |
+| Resume-while-degraded: loop restarts on foreground for online+degraded (`shouldResumeLoop` + test); `_startLoop` still refuses when critical | VERIFIED (unit test) |
+| Mic revoked mid-run (`pm revoke`): `AudioBridgeException(denied)`, truthful `Mic permission: false`, connection stays Online | PHYSICAL_VERIFIED |
+| Battery override (safe `dumpsys`, no drain): 20%+discharging → UI `low`, status bar + Core heartbeat follow; charging-override subtlety documented (must override status too) | PHYSICAL_VERIFIED (degraded); critical-UI NOT_OBSERVED (reset to real 72% per user) |
+| `/v1/exec` hard-deny was unhandled 500 → truthful 403 + audit (`rm -rf /` probe); injection text through safe tool stays inert | VERIFIED (live probe + new regression test) |
+| Lock screen: face enroll present, swipe fallback works, no bypass attempted; Zara posts no sensitive content to lock screen (approvals in-app only) | PHYSICAL_VERIFIED (behavior) |
+| Airplane/radio toggles | NOT_TESTED (laptop internet rides phone hotspot; offline path already proven via reverse-tunnel death + Core-down tests) |
+| Perf (live Core): silence voice-turn 3.2 s, Piper TTS 0.1 s / 79 kB | MEASURED |
+| Acoustic barge-in latency, low/critical-battery physical, FCM, DSP | Still PENDING / NOT_SUPPORTED (unchanged) |
 
 ## Stage 10 physical validation (vivo V2338, Android 16, API 36, 2026-10-04)
 

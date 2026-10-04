@@ -309,8 +309,13 @@ def create_app(stack=None) -> FastAPI:
         gate = s["gov"].check(snap, tool.estimated_cost, tool.risk.value)
         if gate.action == "defer":
             return {"status": "deferred", "reason": gate.reason}
-        rec = s["engine"].submit(body.tool, body.inputs, body.device_id,
-                                 mission_id=body.mission_id)
+        try:
+            rec = s["engine"].submit(body.tool, body.inputs, body.device_id,
+                                     mission_id=body.mission_id)
+        except PolicyDenied as e:
+            # Hard-deny must be a truthful 403, never an unhandled 500.
+            s["audit"].record("api", "exec_deny", body.tool, str(e)[:300])
+            raise HTTPException(status_code=403, detail=str(e)[:300])
         s["audit"].record("api", "exec", body.tool, rec.state.value)
         return {"id": rec.id, "status": rec.state.value, "result": rec.result,
                 "error": rec.error, "verified": rec.verified}
