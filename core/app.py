@@ -50,6 +50,43 @@ class ExecIn(BaseModel):
     mission_id: Optional[str] = None
 
 
+# ---- Stage 14: Device Fabric request models (module level: FastAPI
+# requires importable body models for validation) ----
+
+class FabricDiscoverIn(BaseModel):
+    device_id: str
+    device_type: str = "unknown"
+    display_name: str = ""
+    transport: str = "unknown"
+    metadata: dict = {}
+
+
+class FabricRouteIn(BaseModel):
+    capability: str
+    device_id: str = ""
+    who: str = "user"
+
+
+class FabricGrantIn(BaseModel):
+    device_id: str
+    capabilities: list[str]
+    max_risk: str = "confirm"
+    ttl_s: int = 1800
+
+
+class FabricTransferIn(BaseModel):
+    source_device: str
+    dest_device: str
+    capability: str
+    metadata: dict = {}
+
+
+class FabricPrefIn(BaseModel):
+    device_id: str
+    key: str
+    value: str
+
+
 class MissionIn(BaseModel):
     goal: str
     steps: list[dict] = []
@@ -149,7 +186,7 @@ def _make_embedder():
 
 
 def build_stack(memory_db: str = "", audit_db: str = ":memory:",
-                mission_db: str = ""):
+                mission_db: str = "", fabric_db: str = ""):
     bus = EventBus()
     audit = AuditLog(audit_db)
     policy = PolicyEngine()
@@ -219,6 +256,17 @@ def build_stack(memory_db: str = "", audit_db: str = ":memory:",
                       device_id=rec.device_id, mission_id=rec.mission_id,
                       execution_id=rec.id)
     bus.subscribe("permission_required", lambda ev: _approval_notify(ev.payload))
+    # Stage 14: Device Fabric adapter over devices/auth/registry/policy/
+    # governor/jobs/engine. ZARA_FABRIC_DB enables sqlite persistence
+    # (revocation tombstones survive restart); empty = in-memory.
+    import os as _os
+    from .fabric import FabricRegistry, FabricStore
+    from .db import Database as _Database
+    _fabric_db_path = fabric_db or _os.environ.get("ZARA_FABRIC_DB", "")
+    _fabric_store = FabricStore(_Database(_fabric_db_path)
+                                if _fabric_db_path else None)
+    fabric = FabricRegistry(devices, device_auth, registry, policy, gov,
+                            jobs, engine, audit, bus, _fabric_store)
     return {"bus": bus, "audit": audit, "policy": policy, "registry": registry,
             "engine": engine, "missions": missions, "devices": devices,
             "memory": memory, "memory_service": memory_service,
@@ -226,7 +274,8 @@ def build_stack(memory_db: str = "", audit_db: str = ":memory:",
             "gov": gov, "model": model, "events_log": events_log,
             "jobs": jobs, "device_auth": device_auth, "router": router,
             "sessions": sessions, "tracer": tracer, "loop": loop,
-            "voice": voice, "wake": wake, "limits": limits, "push": push}
+            "voice": voice, "wake": wake, "limits": limits, "push": push,
+            "fabric": fabric}
 
 def create_app(stack=None) -> FastAPI:
     s = stack or build_stack()
@@ -361,6 +410,112 @@ def create_app(stack=None) -> FastAPI:
         caps = [c for c in capability.split(",") if c]
         d = s["devices"].select(caps)
         return d.model_dump() if d else {"selected": None}
+
+    # ---- Stage 14: Device Fabric API (dry-run routing; execution stays
+    # on the existing /v1/exec + device-job paths) ----
+
+    @app.get("/v1/fabric/devices")
+    def fabric_list(_=Depends(auth)):
+        return [v.as_dict() for v in s["fabric"].list_devices()]
+
+    @app.get("/v1/fabric/devices/{device_id}")
+    def fabric_get(device_id: str, _=Depends(auth)):
+        v = s["fabric"].device_view(device_id)
+        if v.trust == "unknown" and v.presence == "unknown":
+            raise HTTPException(status_code=404, detail="unknown device")
+        out = v.as_dict()
+        out["capabilities_detail"] = [
+            r.model_dump() for r in s["fabric"].capabilities_for(device_id)]
+        out["grants"] = [g.model_dump()
+                         for g in s["fabric"].list_grants(device_id)]
+        out["prefs"] = s["fabric"].get_prefs(device_id)
+        return out
+
+    @app.post("/v1/fabric/discover")
+    def fabric_discover(body: FabricDiscoverIn, _=Depends(auth)):
+        try:
+            return s["fabric"].discover(
+                body.device_id, body.device_type, body.display_name,
+                body.transport, body.metadata)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)[:300])
+
+    @app.post("/v1/fabric/devices/{device_id}/restrict")
+    def fabric_restrict(device_id: str, _=Depends(auth)):
+        from .fabric import TrustViolation
+        try:
+            trust = s["fabric"].set_restricted(device_id, True)
+        except TrustViolation as e:
+            raise HTTPException(status_code=409, detail=str(e)[:300])
+        return {"device_id": device_id, "trust": trust}
+
+    @app.post("/v1/fabric/devices/{device_id}/unrestrict")
+    def fabric_unrestrict(device_id: str, _=Depends(auth)):
+        trust = s["fabric"].set_restricted(device_id, False)
+        return {"device_id": device_id, "trust": trust}
+
+    @app.post("/v1/fabric/route")
+    def fabric_route(body: FabricRouteIn, _=Depends(auth)):
+        r = s["fabric"].route_capability(
+            body.capability, body.who, body.device_id or None)
+        return {"device_id": r.device_id, "action": r.action,
+                "reason": r.reason, "substituted": r.substituted,
+                "checks": r.checks}
+
+    @app.post("/v1/fabric/grants")
+    def fabric_grant(body: FabricGrantIn, _=Depends(auth)):
+        from .fabric import TrustViolation
+        try:
+            g = s["fabric"].create_grant(
+                body.device_id, body.capabilities, body.max_risk,
+                body.ttl_s)
+        except (TrustViolation, ValueError) as e:
+            raise HTTPException(status_code=409, detail=str(e)[:300])
+        return g.model_dump()
+
+    @app.get("/v1/fabric/grants")
+    def fabric_grants(device_id: str = "", _=Depends(auth)):
+        return [g.model_dump()
+                for g in s["fabric"].list_grants(device_id)]
+
+    @app.post("/v1/fabric/grants/{grant_id}/revoke")
+    def fabric_grant_revoke(grant_id: str, _=Depends(auth)):
+        if not s["fabric"].revoke_grant(grant_id):
+            raise HTTPException(status_code=404, detail="unknown grant")
+        return {"revoked": grant_id}
+
+    @app.post("/v1/fabric/transfers")
+    def fabric_transfer(body: FabricTransferIn, _=Depends(auth)):
+        from .fabric import TrustViolation
+        try:
+            t = s["fabric"].create_transfer(
+                body.source_device, body.dest_device, body.capability,
+                body.metadata)
+        except (TrustViolation, KeyError) as e:
+            raise HTTPException(status_code=409, detail=str(e)[:300])
+        return t.model_dump()
+
+    @app.post("/v1/fabric/transfers/{transfer_id}/transition")
+    def fabric_transfer_go(transfer_id: str, state: str = "",
+                           verification: str = "", _=Depends(auth)):
+        from .fabric import TrustViolation
+        try:
+            t = s["fabric"].transition_transfer(transfer_id, state,
+                                               verification)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="unknown transfer")
+        except TrustViolation as e:
+            raise HTTPException(status_code=409, detail=str(e)[:300])
+        return t.model_dump()
+
+    @app.post("/v1/fabric/prefs")
+    def fabric_pref(body: FabricPrefIn, _=Depends(auth)):
+        from .fabric import TrustViolation
+        try:
+            s["fabric"].set_pref(body.device_id, body.key, body.value)
+        except TrustViolation as e:
+            raise HTTPException(status_code=409, detail=str(e)[:300])
+        return {"device_id": body.device_id, "key": body.key}
 
     @app.post("/v1/memory")
     def remember(item: MemoryItem, _=Depends(auth)):
@@ -516,6 +671,13 @@ def create_app(stack=None) -> FastAPI:
             device_id, key = s["device_auth"].claim(body.pairing_code)
         except ValueError as e:
             raise HTTPException(status_code=403, detail=str(e))
+        # Stage 14: a FRESH credential is an explicit re-pair — it lifts
+        # the revocation tombstone (old keys stay dead; only the new key
+        # verifies). Trust derives from the new credential, never restored.
+        try:
+            s["fabric"].clear_revocation(device_id)
+        except Exception:  # noqa: BLE001 — claim already succeeded
+            pass
         s["audit"].record("device", "device_claim", device_id, "")
         return {"device_id": device_id, "device_key": key}
 
@@ -629,11 +791,31 @@ def create_app(stack=None) -> FastAPI:
             s["devices"].mark_offline(device_id)
         except KeyError:
             pass
+        # Stage 14: fabric tombstone (revocation survives Core restart).
+        try:
+            s["fabric"].revoke_device(device_id, "operator revoke")
+        except Exception:  # noqa: BLE001 — revoke itself already done
+            pass
         s["audit"].record("operator", "device_revoke", device_id, "")
         return {"revoked": device_id}
 
     # ---- Stage 10: device voice turn (same bounds as operator turn,
     # device-scoped auth; the operator endpoint is unchanged).
+
+    @app.post("/v1/agent/capabilities/describe")
+    def agent_capabilities_describe(body: dict,
+                                   device_id: str = Depends(agent_auth)):
+        """Device-authenticated capability advertisement with schemas.
+        Validated + stored; unknown names recorded unmapped (never
+        executable by themselves). Identity comes from auth, not body."""
+        recs = body.get("records", []) if isinstance(body, dict) else []
+        if not isinstance(recs, list) or len(recs) > 100:
+            raise HTTPException(status_code=400,
+                                detail="records must be a list (<=100)")
+        for r in recs:
+            if isinstance(r, dict):
+                r["device_id"] = device_id
+        return s["fabric"].advertise(recs)
 
     @app.post("/v1/agent/voice/turn")
     def agent_voice_turn(body: VoiceTurnIn,
