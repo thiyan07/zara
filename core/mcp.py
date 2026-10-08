@@ -323,6 +323,9 @@ def adapter_definition(desc: MCPToolDescriptor) -> ToolDefinition:
         success_criteria="MCP server returned content",
         failure_behavior="fail", verification="none",
         supported_devices=["cloud", "linux"], reversible=False,
+        # Envelope mirrors the MCP transport bound (MAX_ARGS_BYTES);
+        # pre-hardening behavior allowed up to the transport cap.
+        max_input_bytes=8192,
         version="5.0.0")
 
 

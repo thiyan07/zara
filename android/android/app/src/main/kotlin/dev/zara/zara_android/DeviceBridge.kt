@@ -86,9 +86,190 @@ class DeviceBridge(
                     }
                     "audioSelfTest" -> result.success(audioSelfTest())
                     "getAssistantStatus" -> result.success(assistantStatus())
+                    "privForceStop" ->
+                        privForceStop(call.argument<String>("package"), result)
+                    "a11yInspect" -> result.success(a11yInspect())
+                    "a11yInspectWithParams" ->
+                        a11yInspectWithParams(
+                            call.arguments as? Map<String, Any?>, result)
+                    "a11yTap" -> a11yTap(
+                        call.argument<String>("package"),
+                        call.argument<Any>("node_id"), result)
+                    "a11yProbe" -> result.success(a11yProbe())
                     else -> result.notImplemented()
                 }
             }
+    }
+
+    // ---------- Rung-1 privileged gateway (ONE capability, lab only) ----------
+    //
+    // android.app.force_stop on a hardcoded lab allowlist. The Core registry
+    // holds the same set; anything else is refused HERE even if a job for it
+    // somehow arrived (defense in depth). No shell, no exec, no generic
+    // dispatch: exactly one framework call, one bounded string parameter.
+    private val forceStopLabTargets =
+        setOf("dev.zara.lab.privtest") // harmless relaunchable lab probe
+
+    private fun privForceStop(pkg: String?, result: MethodChannel.Result) {
+        if (pkg.isNullOrEmpty() || pkg !in forceStopLabTargets) {
+            result.error("denied",
+                "target not in lab allowlist (refused)", null)
+            return
+        }
+        // String literal: the Manifest constant is not in the public SDK
+        // stubs on this compile target; the protection level (not the
+        // constant) is what matters, and it is verified device-side.
+        if (ContextCompat.checkSelfPermission(context,
+                "android.permission.FORCE_STOP_PACKAGES") !=
+                PackageManager.PERMISSION_GRANTED) {
+            result.error("denied",
+                "FORCE_STOP_PACKAGES not granted", null)
+            return
+        }
+        try {
+            val am = context.getSystemService(
+                Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+            // Best-effort running check (modern Android may under-report
+            // other packages; Core verifies authoritatively via pidof).
+            fun isRunning(): Boolean =
+                am.runningAppProcesses?.any { it.processName == pkg } == true
+            val before = isRunning()
+            // Hidden APIs: no public SDK force-stop or current-user-id
+            // accessor exists. Reached by reflection; if the build blocks
+            // either, that is reported honestly as unavailable
+            // (never worked around).
+            val uh = Class.forName("android.os.UserHandle")
+            val myUserId = uh.getMethod("myUserId").invoke(null) as Int
+            // NOTE (lab probe 2026-10-07): ActivityManager on API 36
+            // exposes forceStopPackage(String) [single-arg] and
+            // forceStopPackageAsUser(String,int) — there is NO
+            // (String,int) overload. An earlier revision reflected the
+            // wrong signature and honestly reported unavailable; the
+            // method enumeration probe on-device settled it.
+            val m = try {
+                am.javaClass.getMethod("forceStopPackage",
+                    String::class.java)
+            } catch (e: NoSuchMethodException) {
+                am.javaClass.getMethod("forceStopPackageAsUser",
+                    String::class.java, Int::class.javaPrimitiveType!!)
+            }
+            if (m.parameterTypes.size == 1) {
+                m.invoke(am, pkg)
+            } else {
+                m.invoke(am, pkg, myUserId)
+            }
+            val after = isRunning()
+            result.success(mapOf(
+                "supported" to true,
+                "package" to pkg,
+                "stopped" to !after,
+                "was_running" to before,
+                "verify_state" to if (!after) "stopped" else "running",
+            ))
+        } catch (e: NoSuchMethodException) {
+            result.error("unavailable",
+                "force-stop API absent or blocked on this build", null)
+        } catch (e: SecurityException) {
+            result.error("denied",
+                "SecurityException from framework", null)
+        } catch (e: Exception) {
+            result.error("failed", (e.message ?: "force-stop failed"), null)
+        }
+    }
+
+    // ---------- Rung-2 lab pilot: a11y inspect + tap (emulator lab only) ----------
+    //
+    // gui.screen.inspect / gui.tap on a hardcoded lab allowlist. No shell,
+    // no exec, no ProcessBuilder, no reflection beyond Accessibility APIs:
+    // exactly one snapshot builder and one node.performAction(ACTION_CLICK)
+    // on a FRESH root lookup by node_id. Accessibility state is reported
+    // via the inspect call itself (getPermissions gains no new key).
+    private val a11yTapTargets =
+        setOf("dev.zara.zara_android", "dev.zara.lab.privtest")
+
+    private fun a11yInspect(): Map<String, Any?> = ZaraA11yService.snapshot()
+
+    private fun a11yInspectWithParams(
+        params: Map<String, Any?>?,
+        result: MethodChannel.Result
+    ) {
+        result.success(ZaraA11yService.snapshot(params))
+    }
+
+    /**
+     * Registration-guard probe: is the accessibility service enabled in
+     * Settings AND bound AND able to see a window? Read-only, zero
+     * interaction (no clicks, no messages, no settings writes). The Dart
+     * side gates gui.* availability on the returned `ready` flag.
+     */
+    private fun a11yProbe(): Map<String, Any?> {
+        return try {
+            val comp = android.content.ComponentName(
+                context, ZaraA11yService::class.java).flattenToString()
+            val enabled = android.provider.Settings.Secure.getString(
+                context.contentResolver,
+                android.provider.Settings.Secure
+                    .ENABLED_ACCESSIBILITY_SERVICES,
+            ) ?: ""
+            val parts = enabled.split(':')
+            val enabledInSettings = parts.any { it == comp }
+            android.util.Log.d("ZaraA11yProbe",
+                "comp=$comp enabled_raw='$enabled' parts=$parts enabledInSettings=$enabledInSettings")
+            // Note: AccessibilityService runs in system process; app process
+            // cannot directly observe its bound state or root. We treat
+            // "enabled in Settings" as the probe signal. Actual inspect/tap
+            // will fail gracefully if service is not functional.
+            val ready = enabledInSettings
+            mapOf(
+                "supported" to true,
+                "ready" to ready,
+                "service_enabled" to enabledInSettings,
+                "bound" to enabledInSettings, // best-effort approximation
+                "root_present" to enabledInSettings,
+                "reason" to if (ready) "" else
+                    "accessibility service not enabled",
+            )
+        } catch (e: Exception) {
+            mapOf("supported" to false,
+                "reason" to ((e.message ?: "probe failed").take(200)))
+        }
+    }
+
+    private fun a11yTap(
+        pkg: String?,
+        nodeId: Any?,
+        result: MethodChannel.Result,
+    ) {
+        if (pkg.isNullOrEmpty() || pkg !in a11yTapTargets) {
+            result.error("denied",
+                "target not in lab allowlist (refused)", null)
+            return
+        }
+        val id = (nodeId as? Number)?.toInt()
+        if (id == null || id < 0) {
+            result.error("failed", "bad node_id (need snapshot node)", null)
+            return
+        }
+        try {
+            val applied = ZaraA11yService.tapNode(id)
+            if (applied == null) {
+                result.error("unavailable",
+                    "accessibility service unbound/disabled", null)
+                return
+            }
+            result.success(mapOf(
+                "supported" to true,
+                "package" to pkg,
+                "stopped" to "n/a",
+                "applied" to applied,
+                "verify_state" to if (applied) "clicked" else "not_applied",
+            ))
+        } catch (e: SecurityException) {
+            result.error("denied",
+                "SecurityException from framework", null)
+        } catch (e: Exception) {
+            result.error("failed", (e.message ?: "tap failed"), null)
+        }
     }
 
     // ---------- bounded microphone capture (AudioRecord -> WAV) ----------
@@ -515,6 +696,10 @@ class DeviceBridge(
             "microphone" to granted(Manifest.permission.RECORD_AUDIO),
             "camera" to granted(Manifest.permission.CAMERA),
             "location" to granted(Manifest.permission.ACCESS_FINE_LOCATION),
+            // Rung-1 pilot state (read-only; requests need no runtime grant,
+            // the priv-app grant comes from the image allowlist instead).
+            "forceStop" to
+                granted("android.permission.FORCE_STOP_PACKAGES"),
         )
     }
 

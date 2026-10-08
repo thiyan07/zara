@@ -9,6 +9,25 @@ from __future__ import annotations
 from .models import PermissionLevel, RiskLevel, ToolDefinition
 
 
+# Rung-1 pilot: exact lab packages the force-stop capability may target.
+# Mirrored on-device (Android job runner refuses anything else even if a
+# job arrives). No wildcards, no prefixes. New targets require a registry
+# change + audit + fresh consent — never silent enrollment.
+FORCE_STOP_LAB_TARGETS = frozenset({
+    "dev.zara.lab.privtest",  # harmless lab probe APK, relaunchable
+})
+
+
+# Rung-2 pilot: exact lab packages the GUI capabilities may target.
+# Mirrored on-device (Android job runner refuses anything else even if a
+# job arrives). No wildcards, no prefixes. New targets require a registry
+# change + audit + fresh consent — never silent enrollment.
+GUI_LAB_TARGETS = frozenset({
+    "dev.zara.zara_android",  # first-party lab app (Zara Android client)
+    "dev.zara.lab.privtest",  # harmless lab probe APK, relaunchable
+})
+
+
 def _def(name: str, desc: str, schema: dict, caps: list[str], cost: float,
          perm: PermissionLevel, risk: RiskLevel,
          timeout: float = 20.0) -> ToolDefinition:
@@ -53,6 +72,61 @@ DEVICE_TOOL_DEFS: list[ToolDefinition] = [
          {"type": "object", "required": ["command"],
           "properties": {"command": {"type": "string"}}},
          ["terminal.safe"], 0.05, PermissionLevel.CONFIRM, RiskLevel.CONFIRM),
+    _def("android.app.force_stop",
+         "Force-stop one lab-allowlisted package (priv-app only, "
+         "emulator lab). Destructive: kills process immediately.",
+         {"type": "object", "required": ["target_package"],
+          "additionalProperties": False,
+          "properties": {"target_package": {
+              "type": "string", "minLength": 3, "maxLength": 255,
+              "pattern": r"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$",
+              "enum": sorted(FORCE_STOP_LAB_TARGETS)}}},
+         ["android.app.force_stop"], 0.05,
+         PermissionLevel.RESTRICTED, RiskLevel.HIGH_RISK),
+    _def("gui.screen.inspect",
+         "Inspect the foreground screen (bounded accessibility snapshot). "
+         "Read-only: returns element text/bounds, never acts. "
+         "Supports expected_package filter, staleness check, and field selection.",
+         {"type": "object",
+           "additionalProperties": False,
+           "properties": {
+               "expected_package": {
+                   "type": "string",
+                   "description": "Regex pattern for expected foreground package name"
+               },
+               "expected_snapshot_id": {
+                   "type": "string",
+                   "description": "Previous snapshot ID for staleness detection"
+               },
+               "max_elements": {
+                   "type": "integer",
+                   "minimum": 1,
+                   "maximum": 50,
+                   "description": "Maximum elements to return (1-50)"
+               },
+               "include_text": {
+                   "type": "boolean",
+                   "description": "Include element text field"
+               },
+               "include_content_description": {
+                   "type": "boolean",
+                   "description": "Include element content description field"
+               }
+           }},
+         ["gui.screen.inspect"], 0.05,
+         PermissionLevel.RESTRICTED, RiskLevel.CONFIRM),
+    _def("gui.tap",
+         "Tap a node inside one lab-allowlisted package (foreground, "
+         "user-approved only). Acts on-device: changes UI state.",
+         {"type": "object", "required": ["target_package"],
+          "additionalProperties": False,
+          "properties": {"target_package": {
+              "type": "string", "minLength": 3, "maxLength": 255,
+              "pattern": r"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$",
+              "enum": sorted(GUI_LAB_TARGETS)},
+              "node_id": {"type": "string", "maxLength": 128}}},
+         ["gui.tap"], 0.05,
+         PermissionLevel.RESTRICTED, RiskLevel.HIGH_RISK),
 ]
 
 

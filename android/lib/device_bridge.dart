@@ -102,6 +102,84 @@ class DeviceBridge {
     }
   }
 
+  /// Rung-1 privileged gateway: force-stop one lab-allowlisted package.
+  /// The device-side allowlist mirror lives in native code; Core holds the
+  /// same set. Throws PrivBridgeException on denied/unavailable/failed —
+  /// never a fake success.
+  Future<Map<String, dynamic>> privForceStop(String packageName) async {
+    try {
+      final m = await _ch.invokeMapMethod<String, dynamic>(
+          'privForceStop', {'package': packageName});
+      return Map<String, dynamic>.from(m ?? {});
+    } on PlatformException catch (e) {
+      throw PrivBridgeException(e.code, e.message ?? 'force-stop failed');
+    } catch (e) {
+      throw PrivBridgeException('failed', '$e');
+    }
+  }
+
+  /// Rung-2 lab-pilot gateway: bounded screen snapshot via the optional
+  /// AccessibilityService. Unbound/disabled is reported as
+  /// {supported:false} by the native side — never a fake tree. Throws
+  /// A11yBridgeException on channel failure.
+  Future<Map<String, dynamic>> a11yInspect() async {
+    try {
+      final m = await _ch.invokeMapMethod<String, dynamic>('a11yInspect');
+      return Map<String, dynamic>.from(m ?? {});
+    } on PlatformException catch (e) {
+      throw A11yBridgeException(e.code, e.message ?? 'inspect failed');
+    } catch (e) {
+      throw A11yBridgeException('failed', '$e');
+    }
+  }
+
+  /// Rung-3: a11y snapshot with parameters (expected_package, max_elements,
+  /// include_text, include_content_description, expected_snapshot_id). Passes
+  /// params to native snapshot for validation and filtering. Throws
+  /// A11yBridgeException on channel failure.
+  Future<Map<String, dynamic>> a11yInspectWithParams(Map<String, dynamic> params) async {
+    try {
+      final m = await _ch.invokeMapMethod<String, dynamic>(
+          'a11yInspectWithParams', params);
+      return Map<String, dynamic>.from(m ?? {});
+    } on PlatformException catch (e) {
+      throw A11yBridgeException(e.code, e.message ?? 'inspect failed');
+    } catch (e) {
+      throw A11yBridgeException('failed', '$e');
+    }
+  }
+
+  /// Rung-2 lab-pilot gateway: tap one snapshot node in an allowlisted lab
+  /// package. The device-side allowlist mirror lives in native code; Core
+  /// holds the same set. Throws A11yBridgeException on denied/unavailable/
+  /// failed — never a fake success.
+  Future<Map<String, dynamic>> a11yTap(String package, int nodeId) async {
+    try {
+      final m = await _ch.invokeMapMethod<String, dynamic>(
+          'a11yTap', {'package': package, 'node_id': nodeId});
+      return Map<String, dynamic>.from(m ?? {});
+    } on PlatformException catch (e) {
+      throw A11yBridgeException(e.code, e.message ?? 'tap failed');
+    } catch (e) {
+      throw A11yBridgeException('failed', '$e');
+    }
+  }
+
+  /// Rung-2 registration-guard probe: is the AccessibilityService
+  /// enabled in Settings AND bound AND seeing a window? Read-only, zero
+  /// interaction. Returns {supported, ready, service_enabled, bound,
+  /// root_present, reason}. Never throws a fake ready state.
+  Future<Map<String, dynamic>> a11yProbe() async {
+    try {
+      final m = await _ch.invokeMapMethod<String, dynamic>('a11yProbe');
+      return Map<String, dynamic>.from(m ?? {});
+    } on PlatformException catch (e) {
+      throw A11yBridgeException(e.code, e.message ?? 'probe failed');
+    } catch (e) {
+      throw A11yBridgeException('failed', '$e');
+    }
+  }
+
   /// Runtime permission requests (Activity-mediated). Returns the
   /// post-request state; denial is a normal outcome, never an error.
   Future<Map<String, dynamic>> requestMicPermission() async {
@@ -168,4 +246,24 @@ class AudioBridgeException implements Exception {
   const AudioBridgeException(this.code, this.message);
   @override
   String toString() => 'AudioBridgeException($code): $message';
+}
+
+/// Structured privileged-gateway failure (Rung-1): same code contract as
+/// AudioBridgeException, separate type so privileged denials stay greppable.
+class PrivBridgeException implements Exception {
+  final String code;
+  final String message;
+  const PrivBridgeException(this.code, this.message);
+  @override
+  String toString() => 'PrivBridgeException($code): $message';
+}
+
+/// Structured a11y-gateway failure (Rung-2 lab pilot): same code contract
+/// as AudioBridgeException, separate type so a11y denials stay greppable.
+class A11yBridgeException implements Exception {
+  final String code;
+  final String message;
+  const A11yBridgeException(this.code, this.message);
+  @override
+  String toString() => 'A11yBridgeException($code): $message';
 }

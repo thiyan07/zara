@@ -130,6 +130,15 @@ class CoreClient {
     });
   }
 
+  /// Stage 16: advertise versioned capability descriptors (built by the
+  /// app from actually-implemented capabilities only). Identity comes
+  /// from device headers; Core validates strictly and diffs.
+  Future<Map<String, dynamic>> describeCapabilities(
+      List<Map<String, dynamic>> records, {CancelScope? cancel}) async {
+    return _post('/v1/agent/capabilities/describe', {'records': records},
+        cancel: cancel);
+  }
+
   Future<Map<String, dynamic>?> pollJobs({CancelScope? cancel}) async {
     final out = await _post('/v1/agent/jobs/poll', {}, cancel: cancel);
     return out['job'] as Map<String, dynamic>?;
@@ -213,6 +222,77 @@ class CoreClient {
     try {
       await _post('/v1/agent/voice/interrupt', {});
     } catch (_) {/* best-effort */}
+  }
+
+  /// Stage 15 byte transfers (Core-mediated chunked relay).
+  /// Identity always comes from device headers; sender/recipient binding
+  /// is enforced server-side. Hashes are computed by the caller with
+  /// transfer.dart (never trusted from Core alone).
+  Future<Map<String, dynamic>> xferRequest(
+      {required String recipient,
+      required String filename,
+      required int sizeBytes,
+      required String sha256,
+      String contentType = 'application/octet-stream',
+      String grantId = '',
+      CancelScope? cancel}) async {
+    return _post('/v1/agent/xfer/request', {
+      'recipient_device': recipient,
+      'filename': filename,
+      'size_bytes': sizeBytes,
+      'sha256': sha256,
+      'content_type': contentType,
+      'grant_id': grantId,
+    }, cancel: cancel);
+  }
+
+  Future<Map<String, dynamic>> xferChunk(String transferId, int seq,
+      Uint8List data, {CancelScope? cancel}) async {
+    return _post('/v1/agent/xfer/$transferId/chunk', {
+      'seq': seq,
+      'data_base64': base64Encode(data),
+    }, cancel: cancel);
+  }
+
+  Future<Map<String, dynamic>> _get(String path,
+      {Map<String, String> query = const {}, CancelScope? cancel}) async {
+    if (cancel?.isCancelled ?? false) {
+      throw const CoreException(-1, 'cancelled before send');
+    }
+    final client = HttpClient();
+    try {
+      final uri = Uri.parse('$baseUrl$path')
+          .replace(queryParameters: query.isEmpty ? null : query);
+      final req = await client.getUrl(uri);
+      _deviceHeaders.forEach(req.headers.set);
+      final resp = await req.close().timeout(timeout);
+      final text = await resp.transform(utf8.decoder).join();
+      if (resp.statusCode >= 400) _raise(path, resp.statusCode, text);
+      return jsonDecode(text) as Map<String, dynamic>;
+    } finally {
+      client.close();
+    }
+  }
+
+  Future<Map<String, dynamic>> xferPending({CancelScope? cancel}) async {
+    return _get('/v1/agent/xfer/pending', cancel: cancel);
+  }
+
+  Future<Map<String, dynamic>> xferBytes(String transferId, int offset,
+      int length, {CancelScope? cancel}) async {
+    return _get('/v1/agent/xfer/$transferId/bytes',
+        query: {'offset': '$offset', 'length': '$length'}, cancel: cancel);
+  }
+
+  Future<Map<String, dynamic>> xferAck(String transferId, String sha256,
+      {CancelScope? cancel}) async {
+    return _post('/v1/agent/xfer/$transferId/ack', {'sha256': sha256},
+        cancel: cancel);
+  }
+
+  Future<Map<String, dynamic>> xferCancel(String transferId,
+      {CancelScope? cancel}) async {
+    return _post('/v1/agent/xfer/$transferId/cancel', {}, cancel: cancel);
   }
 }
 

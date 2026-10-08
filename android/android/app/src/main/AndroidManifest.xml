@@ -6,6 +6,10 @@
     <!-- Normal permissions (auto-granted): backend connectivity + state. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Rung-1 pilot (emulator lab only): granted ONLY via priv-app image
+         allowlist, never via runtime request. Missing allowlist entry is
+         boot-fatal on enforcing builds; see docs/research. -->
+    <uses-permission android:name="android.permission.FORCE_STOP_PACKAGES" />
     <application
         android:label="zara_android"
         android:name="${applicationName}"
@@ -74,6 +78,21 @@
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity>
+        <!-- Rung-2 pilot (emulator lab only, never Vivo): optional
+              AccessibilityService for bounded screen snapshots + tap on
+              allowlisted lab packages. Disabled until the operator enables
+              it in Settings; the bridge reports supported=false until then. -->
+        <service
+            android:name=".ZaraA11yService"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/zara_a11y_config" />
+        </service>
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and

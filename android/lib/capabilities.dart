@@ -36,6 +36,15 @@ const List<ZaraCapability> androidCapabilities = [
   ZaraCapability('voice.input', true, 'Mic speech input: capture→STT→Core turn PHYSICAL_VERIFIED'),
   ZaraCapability('voice.output', true, 'Spoken replies: Piper TTS→AudioTrack→heard PHYSICAL_VERIFIED'),
   ZaraCapability('assistant.role', true, 'Default-assistant role via ASSIST proxy PHYSICAL_VERIFIED (session path NOT_SUPPORTED on OriginOS)'),
+  // ---- physically verified in Stage 15 (vivo V2338 ↔ laptop-1, 2026-10-04/05) ----
+  ZaraCapability('files.transfer', true, 'Chunked byte transfer via Core relay: uploaded 3 payloads (text+64KB+1MB, SHA-256 verified) and fetched 4 (all recipient-verified) PHYSICAL_VERIFIED'),
+  // ---- Rung-1 lab pilot (ZaraLab emulator ONLY, 2026-10-06) ----
+  // high_risk + human approval + device hardcoded allowlist; never Vivo.
+  ZaraCapability('android.app.force_stop', true, 'Force-stop one allowlisted lab package via priv-app FORCE_STOP_PACKAGES (Rung-1 pilot, emulator lab only)'),
+  // ---- Rung-2 lab pilot (ZaraLab emulator ONLY, never Vivo) ----
+  // confirm/high_risk + human approval + device hardcoded allowlist.
+  ZaraCapability('gui.screen.inspect', true, 'Bounded a11y screen snapshot via opt-in AccessibilityService (Rung-2 pilot, emulator lab only)'),
+  ZaraCapability('gui.tap', true, 'Tap one snapshot node in an allowlisted lab package via opt-in AccessibilityService (Rung-2 pilot, emulator lab only)'),
   // ---- reserved / by design ----
   ZaraCapability('voice.wake_word', false, 'Reserved wake phrase: "Hey Zara" — verified via manual capture only; no always-on DSP loop by design'),
   ZaraCapability('camera.available', false, 'Camera: not requested, no permission sought (by design)'),

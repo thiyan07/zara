@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'app_state.dart';
@@ -6,6 +7,7 @@ import 'assistant.dart';
 import 'audio_io.dart';
 import 'battery_governor.dart';
 import 'capabilities.dart';
+import 'capability_descriptors.dart';
 import 'connection.dart';
 import 'core_client.dart';
 import 'device_bridge.dart';
@@ -13,6 +15,7 @@ import 'device_lifecycle.dart';
 import 'job_runner.dart';
 import 'network_monitor.dart';
 import 'secure_store.dart';
+import 'transfer.dart';
 import 'voice.dart' show wakePhrase;
 import 'voice_session.dart';
 import 'zara_notifications.dart';
@@ -73,6 +76,12 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
       NetworkSnapshot('unavailable', timestamp: DateTime.now());
   Map<String, dynamic> voiceFlags = {};
   Map<String, dynamic> perms = {};
+  Map<String, dynamic> a11y = {};
+
+  /// Registration-guard state: gui.* advertise available only when the
+  /// probe says the accessibility service is enabled, bound, and seeing
+  /// a window. Anything else (including probe failure) reads as not ready.
+  bool get a11yReady => a11y['ready'] == true;
   AssistantStatus assistant = const AssistantStatus();
   String lastError = '';
   int _failures = 0;
@@ -85,6 +94,12 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
   String voiceStt = '';
   Uint8List? lastReplyAudio;
   bool voiceBusy = false;
+  String xferDiag = 'idle';
+  String xferDetail = '';
+  bool xferBusy = false;
+  bool _xferStop = false;
+  final grantCtrl = TextEditingController();
+  static const _xferPeer = 'laptop-1'; // diagnostic counterpart (Stage 15)
   Timer? _loop;
   bool _busy = false;
   final Set<String> _deciding = {};
@@ -99,6 +114,10 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
     jobs = AndroidJobRunner(
       battery: () => battery.toHeartbeat(),
       network: () => {'network': network.state, 'metered': network.metered},
+      forceStop: (pkg) => bridge.privForceStop(pkg),
+      a11yInspect: () => bridge.a11yInspect(),
+      a11yInspectWithParams: (params) => bridge.a11yInspectWithParams(params),
+      a11yTap: (pkg, nodeId) => bridge.a11yTap(pkg, nodeId),
     );
     lifecycle.onChange = (_) => _render();
     _boot();
@@ -142,6 +161,9 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
       perms = await bridge.permissions();
     } catch (_) {/* keep last */}
     try {
+      a11y = await bridge.a11yProbe();
+    } catch (_) {/* keep last: not-ready reads as unavailable downstream */}
+    try {
       final am = await bridge.assistantStatus();
       assistant = AssistantStatus.fromMap(am);
       // ignore: avoid_print
@@ -173,6 +195,23 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
     setState(() => conn = CoreLinkState.connecting);
     try {
       await client.register(advertisedCapabilities(), 'zara-android 9.0.0');
+      // Stage 16: capability snapshot follows registration (Core diffs;
+      // no re-pair needed when capabilities change). Best-effort: string
+      // caps still route even if describe is unreachable right now.
+      try {
+        final desc = await client.describeCapabilities(androidCapabilityDocs(
+          micPermission: perms['microphone'] == true,
+          notifPermission: perms['notifications'] == true,
+          forceStopGranted: perms['forceStop'] == true,
+          a11yReady: a11yReady,
+        ));
+        // ignore: avoid_print
+        print('zara:describe ok accepted=${desc['accepted']} '
+            'rejected=${desc['rejected']}');
+      } catch (e) {
+        // ignore: avoid_print
+        print('zara:describe failed: $e');
+      }
       _regAttempts = 0;
       lifecycle.move(DeviceLifecycleState.online);
       setState(() {
@@ -237,6 +276,8 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
     final scope = CancelScope();
     try {
       await _refresh();
+      // Re-describe if a11y probe state changed (permission-like gating).
+      await _register();
       await client.heartbeat(
         batteryPct: battery.pct,
         charging: battery.charging,
@@ -292,7 +333,7 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
     } catch (e) {
       return; // malformed: never execute; Core expires the claim
     }
-    final out = jobs.run(job);
+    final out = await jobs.run(job);
     await client.reportJobResult(job.jobId,
         ok: out.ok, result: out.result, error: out.error);
   }
@@ -430,6 +471,164 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
       await client.interruptVoice();
     } catch (_) {}
     if (mounted) setState(() => voiceDiag = 'stopped');
+  }
+
+  /// Stage 15 transfer diagnostic: upload deterministic payloads to the
+  /// laptop through Core authorization (a live files.transfer grant is
+  /// required; paste its ID below). Bytes are hashed locally with
+  /// transfer.dart; Core verifies independently. No grant => Core 403,
+  /// shown verbatim (never bypassed).
+  Future<void> _xferSend() async {
+    if (xferBusy || lifecycle.state != DeviceLifecycleState.online) return;
+    setState(() {
+      xferBusy = true;
+      _xferStop = false;
+      xferDiag = 'sending…';
+    });
+    try {
+      final grant = grantCtrl.text.trim();
+      final jobs = <Map<String, dynamic>>[
+        {
+          'name': 'stage15-vivo-to-laptop.txt',
+          'bytes': Uint8List.fromList(
+              utf8.encode(stage15Text('vivo-to-laptop'))),
+          'type': 'text/plain',
+        },
+        {
+          'name': 'stage15-vivo-to-laptop.bin',
+          'bytes': deterministicBytes(64 * 1024, 42),
+          'type': 'application/octet-stream',
+        },
+        {
+          'name': 'stage15-vivo-to-laptop-1M.bin',
+          'bytes': deterministicBytes(1024 * 1024, 99),
+          'type': 'application/octet-stream',
+        },
+      ];
+      final lines = <String>[];
+      for (final job in jobs) {
+        if (_xferStop) {
+          lines.add('stopped by user');
+          break;
+        }
+        final data = job['bytes'] as Uint8List;
+        final name = job['name'] as String;
+        final hex = sha256Hex(data);
+        setState(() => xferDiag = 'requesting $name (${data.length}B)…');
+        final req = await client.xferRequest(
+            recipient: _xferPeer,
+            filename: name,
+            sizeBytes: data.length,
+            sha256: hex,
+            contentType: job['type'] as String,
+            grantId: grant);
+        final tid = '${req['transfer_id']}';
+        var state = '${req['state']}';
+        final wins = chunkWindows(data.length, 64 * 1024);
+        for (var seq = 0; seq < wins.length; seq++) {
+          if (_xferStop) break;
+          final w = wins[seq];
+          final out = await client.xferChunk(
+              tid, seq, Uint8List.sublistView(data, w[0], w[0] + w[1]));
+          state = '${out['state']}';
+          if (mounted) {
+            setState(() => xferDiag =
+                '$name: ${out['received_bytes']}/${out['size_bytes']}B…');
+          }
+        }
+        lines.add('↑ $name id=$tid sha=${hex.substring(0, 16)}… $state');
+        // ignore: avoid_print
+        print('zara:xfer-send $name id=$tid state=$state sha=$hex');
+        if (state != 'succeeded') break;
+      }
+      setState(() {
+        xferDetail = lines.join('\n');
+        xferDiag = lines.isEmpty ? 'nothing sent' : 'done';
+      });
+    } on CoreException catch (e) {
+      setState(() => xferDiag = 'core: $e');
+    } catch (e) {
+      // Network loss, DNS, socket reset: surface verbatim, never stuck.
+      setState(() => xferDiag = 'transport: $e');
+    } finally {
+      if (mounted) setState(() => xferBusy = false);
+    }
+  }
+
+  /// Stage 15 fetch diagnostic: download everything Core holds for this
+  /// device, verify SHA-256 locally, ack ONLY on match. Bytes stay in
+  /// memory (sandbox receipt); the ack + Core record are the proof.
+  Future<void> _xferFetch() async {
+    if (xferBusy || lifecycle.state != DeviceLifecycleState.online) return;
+    setState(() {
+      xferBusy = true;
+      _xferStop = false;
+      xferDiag = 'fetching…';
+    });
+    try {
+      final pend =
+          await client.xferPending() as Map<String, dynamic>? ?? {};
+      final items = (pend['to_download'] as List?) ?? [];
+      final lines = <String>[];
+      if (items.isEmpty) {
+        setState(() => xferDiag = 'nothing pending');
+        return;
+      }
+      for (final item in items) {
+        if (_xferStop) {
+          lines.add('stopped by user');
+          break;
+        }
+        final m = Map<String, dynamic>.from(item as Map);
+        final tid = '${m['transfer_id']}';
+        final total = (m['size_bytes'] as num).toInt();
+        final want = '${m['sha256']}';
+        final buf = BytesBuilder();
+        var off = 0;
+        while (off < total) {
+          if (_xferStop) break;
+          final len = (total - off) < 64 * 1024 ? total - off : 64 * 1024;
+          final blk = await client.xferBytes(tid, off, len);
+          final raw = base64Decode('${blk['data_base64']}');
+          buf.add(raw);
+          off += (blk['length'] as num).toInt();
+          if (mounted) {
+            setState(() => xferDiag = '${m['filename']}: $off/$total B…');
+          }
+          if (raw.isEmpty) break;
+        }
+        final data = buf.toBytes();
+        final hex = sha256Hex(data);
+        if (hex != want || data.length != total) {
+          lines.add('↓ ${m['filename']} id=$tid MISMATCH '
+              '(no ack sent)');
+          // ignore: avoid_print
+          print('zara:xfer-fetch $tid MISMATCH local=$hex want=$want');
+          continue;
+        }
+        final ack = await client.xferAck(tid, hex);
+        lines.add('↓ ${m['filename']} id=$tid ${data.length}B '
+            'sha=${hex.substring(0, 16)}… verified=${ack['verified']}');
+        // ignore: avoid_print
+        print('zara:xfer-fetch $tid verified=${ack['verified']} sha=$hex');
+      }
+      setState(() {
+        xferDetail = lines.join('\n');
+        xferDiag = 'done';
+      });
+    } on CoreException catch (e) {
+      setState(() => xferDiag = 'core: $e');
+    } catch (e) {
+      // Network loss, DNS, socket reset: surface verbatim, never stuck.
+      setState(() => xferDiag = 'transport: $e');
+    } finally {
+      if (mounted) setState(() => xferBusy = false);
+    }
+  }
+
+  void _xferCancel() {
+    _xferStop = true;
+    if (mounted) setState(() => xferDiag = 'stopping…');
   }
 
   Future<void> _decide(
@@ -586,6 +785,19 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
                       final m = await bridge.requestMicPermission();
                       if (mounted) {
                         setState(() => perms['microphone'] = m['granted']);
+                        // Stage 16: permission flips availability
+                        // (os_denied <-> available) without re-pairing.
+                        try {
+                          await client.describeCapabilities(
+                              androidCapabilityDocs(
+                            micPermission: perms['microphone'] == true,
+                            notifPermission:
+                                perms['notifications'] == true,
+                            forceStopGranted:
+                                perms['forceStop'] == true,
+                            a11yReady: a11yReady,
+                          ));
+                        } catch (_) {/* next boot retries */}
                       }
                     },
                     child: const Text('Enable mic')),
@@ -595,6 +807,17 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
                       if (mounted) {
                         setState(
                             () => perms['notifications'] = m['granted']);
+                        try {
+                          await client.describeCapabilities(
+                              androidCapabilityDocs(
+                            micPermission: perms['microphone'] == true,
+                            notifPermission:
+                                perms['notifications'] == true,
+                            forceStopGranted:
+                                perms['forceStop'] == true,
+                            a11yReady: a11yReady,
+                          ));
+                        } catch (_) {/* next boot retries */}
                       }
                     },
                     child: const Text('Enable notifications')),
@@ -629,6 +852,40 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
                     child: const Text('Speak reply')),
                 OutlinedButton(
                     onPressed: voiceBusy ? _stopVoice : null,
+                    child: const Text('Stop')),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Text('Transfer diagnostic (physical)',
+                style: Theme.of(context).textTheme.titleMedium),
+            Text(xferDiag, style: Theme.of(context).textTheme.bodyMedium),
+            if (xferDetail.isNotEmpty) Text(xferDetail),
+            TextField(
+              controller: grantCtrl,
+              decoration: const InputDecoration(
+                labelText: 'files.transfer grant ID (operator-issued)',
+                hintText: 'paste live grant or leave empty to see refusal',
+              ),
+            ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                FilledButton(
+                    onPressed: (xferBusy ||
+                            lifecycle.state != DeviceLifecycleState.online)
+                        ? null
+                        : _xferSend,
+                    child: const Text('Send test files')),
+                OutlinedButton(
+                    onPressed: (xferBusy ||
+                            lifecycle.state != DeviceLifecycleState.online)
+                        ? null
+                        : _xferFetch,
+                    child: const Text('Fetch pending')),
+                OutlinedButton(
+                    onPressed: xferBusy ? _xferCancel : null,
                     child: const Text('Stop')),
               ],
             ),

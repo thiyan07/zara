@@ -81,6 +81,65 @@ class FabricTransferIn(BaseModel):
     metadata: dict = {}
 
 
+# ---- Stage 15: byte-transfer request models (module level) ----
+
+class XferRequestIn(BaseModel):
+    sender_device: str = ""  # operator sets; device endpoint ignores
+    recipient_device: str = ""
+    filename: str = ""
+    size_bytes: int = 0
+    sha256: str = ""
+    content_type: str = ""
+    grant_id: str = ""
+    metadata: dict = {}
+
+
+class XferChunkIn(BaseModel):
+    seq: int = 0
+    data_base64: str = ""
+
+
+class XferAckIn(BaseModel):
+    sha256: str = ""
+
+
+class FabricResolveIn(BaseModel):
+    capability: str = ""
+    device_id: str = ""
+    who: str = "user"
+    preferred_device: str = ""
+    constraints: dict = {}
+    allow_fallback: bool = True
+
+
+class FabricRelationshipIn(BaseModel):
+    capability: str = ""
+    related: str = ""
+    relation: str = "fallback_for"
+
+
+class IntentParseIn(BaseModel):
+    utterance: str = ""
+    requester_device: str = ""
+    who: str = "user"
+
+
+class IntentTurnIn(BaseModel):
+    utterance: str = ""
+    requester_device: str = ""
+    who: str = "user"
+
+
+class SessionCreateIn(BaseModel):
+    device_id: str = ""
+    who: str = "user"
+
+
+class SessionTurnIn(BaseModel):
+    utterance: str = ""
+    who: str = "user"
+
+
 class FabricPrefIn(BaseModel):
     device_id: str
     key: str
@@ -251,8 +310,19 @@ def build_stack(memory_db: str = "", audit_db: str = ":memory:",
             devices.get(rec.device_id)
         except KeyError:
             return  # unknown device: nobody to notify
-        notifs.create(f"Approval required: {rec.tool}",
-                      f"Execution {rec.id} on {rec.device_id} needs a decision.",
+        # Rung-1: approval UX must show the concrete effect (what package),
+        # not just the capability name — redacted + truncated like all
+        # notification bodies.
+        from .tracing import redact as _redact
+        try:
+            effect = _redact(", ".join(
+                f"{k}={v}" for k, v in dict(rec.inputs or {}).items()
+                if isinstance(v, (str, int, float, bool))))[:200]
+        except Exception:  # noqa: BLE001 — inputs never break notify
+            effect = ""
+        detail = (f"Execution {rec.id} on {rec.device_id} needs a decision."
+                  + (f" Effect: {effect}." if effect else ""))
+        notifs.create(f"Approval required: {rec.tool}", detail[:500],
                       device_id=rec.device_id, mission_id=rec.mission_id,
                       execution_id=rec.id)
     bus.subscribe("permission_required", lambda ev: _approval_notify(ev.payload))
@@ -267,6 +337,42 @@ def build_stack(memory_db: str = "", audit_db: str = ":memory:",
                                 if _fabric_db_path else None)
     fabric = FabricRegistry(devices, device_auth, registry, policy, gov,
                             jobs, engine, audit, bus, _fabric_store)
+    # Stage 15: byte-transfer engine over the fabric registry.
+    # Storage root from ZARA_TRANSFER_DIR (default
+    # ~/.local/share/zara/transfers). Transfer records persist in the
+    # same fabric sqlite DB when ZARA_FABRIC_DB is set.
+    from .transfer import engine_from_env as _xfer_from_env
+    xfer = _xfer_from_env(fabric)
+    # Stage 17: deterministic resolver over the fabric registry
+    # (orchestrates authorize/route; owns no authority itself).
+    from .resolver import CapabilityResolver
+    resolver = CapabilityResolver(fabric)
+    # Stage 18: natural-language intent service (proposal only; the
+    # resolver + policy/governor/execution stay authoritative). Hosted
+    # parsing is enabled only when a real provider is configured —
+    # otherwise the deterministic local parser serves offline.
+    from .intent import (CompositeIntentParser, HostedIntentParser,
+                         IntentTurnService, LocalIntentParser)
+    _hosted = None
+    try:
+        if getattr(model, "name", "echo") not in ("echo",):
+            _hosted = HostedIntentParser(model)
+    except Exception:  # noqa: BLE001 — local-only fallback
+        _hosted = None
+    intent_service = IntentTurnService(
+        fabric, resolver,
+        CompositeIntentParser(LocalIntentParser(), _hosted), audit)
+    # Stage 19: persistent conversation sessions (context only; the
+    # resolver + policy/governor/execution stay authoritative). DB path
+    # from ZARA_SESSION_DB; memory mode when unset (tests).
+    from .session import SessionStateStore, SessionTurnService
+    from .db import Database as _SessionDatabase
+    _session_db_path = _os.environ.get("ZARA_SESSION_DB", "")
+    session_service = SessionTurnService(
+        fabric, resolver, intent_service.parser, audit,
+        SessionStateStore(
+            _SessionDatabase(_session_db_path)
+            if _session_db_path else None))
     return {"bus": bus, "audit": audit, "policy": policy, "registry": registry,
             "engine": engine, "missions": missions, "devices": devices,
             "memory": memory, "memory_service": memory_service,
@@ -275,7 +381,8 @@ def build_stack(memory_db: str = "", audit_db: str = ":memory:",
             "jobs": jobs, "device_auth": device_auth, "router": router,
             "sessions": sessions, "tracer": tracer, "loop": loop,
             "voice": voice, "wake": wake, "limits": limits, "push": push,
-            "fabric": fabric}
+            "fabric": fabric, "xfer": xfer, "resolver": resolver,
+            "intent": intent_service, "session": session_service}
 
 def create_app(stack=None) -> FastAPI:
     s = stack or build_stack()
@@ -508,6 +615,288 @@ def create_app(stack=None) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(e)[:300])
         return t.model_dump()
 
+    # ---- Stage 15: byte-transfer endpoints (operator) ----
+
+    def _xfer_err(e: Exception):
+        from .transfer import TransferRejected
+        if isinstance(e, KeyError):
+            raise HTTPException(status_code=404, detail="unknown transfer")
+        if isinstance(e, TransferRejected):
+            raise HTTPException(status_code=e.status, detail=str(e)[:300])
+        raise HTTPException(status_code=400, detail=str(e)[:300])
+
+    @app.post("/v1/fabric/xfer/request")
+    def fabric_xfer_request(body: XferRequestIn, _=Depends(auth)):
+        from .transfer import TransferRejected
+        try:
+            t = s["xfer"].request(
+                body.sender_device, body.recipient_device, body.filename,
+                body.size_bytes, body.sha256, body.content_type,
+                body.grant_id, who="operator", metadata=body.metadata)
+        except (TransferRejected, KeyError, ValueError) as e:
+            _xfer_err(e)
+        return t.model_dump()
+
+    @app.get("/v1/fabric/xfer")
+    def fabric_xfer_list(device_id: str = "", _=Depends(auth)):
+        return [t.model_dump() for t in s["xfer"].list(device_id)]
+
+    @app.get("/v1/fabric/xfer/{transfer_id}")
+    def fabric_xfer_get(transfer_id: str, _=Depends(auth)):
+        try:
+            return s["xfer"].get(transfer_id).model_dump()
+        except KeyError:
+            raise HTTPException(status_code=404, detail="unknown transfer")
+
+    @app.post("/v1/fabric/xfer/{transfer_id}/cancel")
+    def fabric_xfer_cancel(transfer_id: str, _=Depends(auth)):
+        from .transfer import TransferRejected
+        try:
+            return s["xfer"].cancel(transfer_id, "operator").model_dump()
+        except (TransferRejected, KeyError) as e:
+            _xfer_err(e)
+
+    @app.post("/v1/fabric/xfer/sweep")
+    def fabric_xfer_sweep(_=Depends(auth)):
+        return {"expired": s["xfer"].sweep()}
+
+    # ---- Stage 16: capability discovery API (read-only; no execution,
+    # no authorization granted — describe remains the only write path) ----
+
+    @app.get("/v1/fabric/capabilities")
+    def fabric_cap_index(_=Depends(auth)):
+        """Fleet-wide capability index: capability -> devices with trust,
+        presence, availability, version, staleness. Facts for matching;
+        authorization still happens per-request at route/execute time."""
+        out = []
+        for v in s["fabric"].list_devices():
+            for r in s["fabric"].capabilities_for(v.device_id):
+                if r.capability_id.startswith("legacy:"):
+                    continue
+                out.append({
+                    "capability": r.capability_id,
+                    "device_id": v.device_id,
+                    "trust": v.trust, "presence": v.presence,
+                    "availability": r.availability,
+                    "availability_reason": r.availability_reason,
+                    "usable": r.usable(), "version": r.version,
+                    "risk": r.risk.value,
+                    "descriptor_version": r.descriptor_version,
+                    "stale": r.stale, "advertised_at": r.advertised_at,
+                    "source": r.source})
+        return sorted(out, key=lambda e: (e["capability"], e["device_id"]))
+
+    @app.post("/v1/fabric/resolve")
+    def fabric_resolve(body: FabricResolveIn, _=Depends(auth)):
+        """Deterministic resolution (Stage 17 resolver): ranked candidates
+        with per-device trust/presence/availability/policy/governor
+        verdicts, a terminal status, and the ladder rung required when
+        nothing resolves. Read-only: no execution, no authorization
+        granted. `capability` + `candidates` keys keep Stage 16 shape."""
+        if not isinstance(body.constraints, dict) or \
+                len(body.constraints) > 8:
+            raise HTTPException(status_code=400,
+                                detail="constraints must be an object (<=8)")
+        r = s["resolver"].resolve(
+            body.capability, body.device_id, body.who,
+            body.constraints, body.preferred_device,
+            body.allow_fallback)
+        out = r.model_dump()
+        # Stage 16-compatible candidate rows (superset: status/reason kept).
+        out["candidates"] = [
+            {**c, "authorization":
+             ("approve" if c["approval_required"]
+              else ("allow" if c["authorized"] else "deny"))}
+            for c in out["candidates"]]
+        return out
+
+    @app.post("/v1/fabric/resolve/proposal")
+    def fabric_resolve_proposal(body: dict, _=Depends(auth)):
+        """Validate an untrusted LLM proposal. Security-claim fields in
+        the proposal are IGNORED; Core derives everything. Read-only."""
+        if not isinstance(body, dict) or len(body) > 20:
+            raise HTTPException(status_code=400,
+                                detail="proposal must be an object (<=20)")
+        return s["resolver"].resolve_proposal(body).model_dump()
+
+    @app.get("/v1/fabric/relationships")
+    def fabric_relationships(_=Depends(auth)):
+        """Explicit Core-controlled fallback/relationship metadata."""
+        return s["resolver"].fallbacks.as_dict()
+
+    @app.post("/v1/fabric/relationships")
+    def fabric_relationship_add(body: FabricRelationshipIn,
+                                _=Depends(auth)):
+        """Register a fallback/relationship (operator only). Validated:
+        known references, known type, no cycles, risk discipline.
+        Metadata only — never authority, never executable."""
+        from .resolver import RelationshipRejected
+        try:
+            out = s["resolver"].register_fallback(
+                body.capability, body.related, body.relation)
+        except RelationshipRejected as e:
+            raise HTTPException(status_code=400, detail=str(e)[:300])
+        s["audit"].record("operator", "capability_relationship",
+                          body.capability,
+                          f"{body.relation} -> {body.related}"[:300])
+        return out
+
+    @app.get("/v1/fabric/ladder")
+    def fabric_ladder(_=Depends(auth)):
+        """Escalation ladder representation: rung per known capability.
+        GUI/HUMAN rungs are planning outputs, never executable."""
+        from .resolver import EscalationLevel, level_of
+        reg = s["registry"]
+        levels = {lv.name: [] for lv in EscalationLevel}
+        seen: set[str] = set()
+        for v in s["fabric"].list_devices():
+            for r in s["fabric"].capabilities_for(v.device_id):
+                if r.capability_id.startswith("legacy:") or \
+                        r.capability_id in seen:
+                    continue
+                seen.add(r.capability_id)
+                levels[EscalationLevel.NATIVE.name].append(
+                    r.capability_id)
+        try:
+            for d in reg.list():
+                if d.name in seen:
+                    continue
+                seen.add(d.name)
+                levels[level_of(d.name, reg).name].append(d.name)
+        except Exception:  # noqa: BLE001 — registry unreadable
+            pass
+        return {"levels": {k: sorted(v) for k, v in levels.items()},
+                "note": "GUI is future-only and HUMAN is terminal: "
+                        "neither rung is executable."}
+
+    # ---- Stage 18: natural-language intent (proposal only, never exec) ----
+
+    @app.post("/v1/intent/parse")
+    def intent_parse(body: IntentParseIn, _=Depends(auth)):
+        """Parse an utterance into a grounded IntentProposal. Read-only:
+        validates, grounds, and returns the proposal — never executes."""
+        if not isinstance(body.utterance, str) or \
+                len(body.utterance) > 2000:
+            raise HTTPException(status_code=400,
+                                detail="utterance must be text (<=2000)")
+        from .intent import build_context
+        try:
+            proposal = s["intent"].parser.parse(
+                body.utterance[:500],
+                build_context(s["fabric"], body.requester_device))
+        except Exception as e:  # noqa: BLE001 — parser failure is 400
+            raise HTTPException(status_code=400, detail=str(e)[:300])
+        return proposal.model_dump()
+
+    @app.post("/v1/intent/turn")
+    def intent_turn(body: IntentTurnIn, _=Depends(auth)):
+        """Full intent turn: parse -> resolve -> message, executing ONLY
+        safe resolved intents through the existing fabric execution path.
+        Approval-gated or blocked intents return honest messages."""
+        if not isinstance(body.utterance, str) or \
+                len(body.utterance) > 2000:
+            raise HTTPException(status_code=400,
+                                detail="utterance must be text (<=2000)")
+        out = s["intent"].handle_utterance(
+            body.utterance[:2000], body.who or "user",
+            body.requester_device or "")
+        return out
+
+    # ---- Stage 19: persistent conversation sessions (context only) ----
+
+    def _get_session(session_id: str):
+        if not isinstance(session_id, str) or not session_id or \
+                len(session_id) > 64:
+            raise HTTPException(status_code=400, detail="bad session_id")
+        try:
+            return s["session"].get_session(session_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="unknown session")
+
+    @app.post("/v1/session")
+    def session_create(body: SessionCreateIn, _=Depends(auth)):
+        try:
+            sess = s["session"].create(body.who or "user",
+                                       body.device_id or "")
+        except Exception as e:  # noqa: BLE001
+            from .session import SessionRejected
+            raise HTTPException(status_code=400, detail=str(e)[:200])
+        return sess.model_dump()
+
+    @app.get("/v1/session/{session_id}")
+    def session_get(session_id: str, _=Depends(auth)):
+        return _get_session(session_id).model_dump()
+
+    @app.post("/v1/session/{session_id}/turn")
+    def session_turn(session_id: str, body: SessionTurnIn,
+                     _=Depends(auth)):
+        if not isinstance(body.utterance, str) or \
+                len(body.utterance) > 2000:
+            raise HTTPException(status_code=400,
+                                detail="utterance must be text (<=2000)")
+        sess = _get_session(session_id)
+        return s["session"].turn(sess, body.utterance[:2000],
+                                 body.who or "user")
+
+    @app.post("/v1/session/{session_id}/close")
+    def session_close(session_id: str, _=Depends(auth)):
+        sess = _get_session(session_id)
+        return s["session"].close(sess).model_dump()
+
+    @app.get("/v1/fabric/devices/{device_id}/capabilities")
+    def fabric_device_caps(device_id: str, _=Depends(auth)):
+        """Validated descriptor snapshot for one device (advertised facts
+        + live availability + staleness). Read-only; authorization stays
+        per-request at route/execute time."""
+        try:
+            recs = s["fabric"].capabilities_for(device_id)
+        except Exception:  # noqa: BLE001 — unknown device reads empty
+            recs = []
+        out = []
+        for r in recs:
+            if r.capability_id.startswith("legacy:"):
+                continue
+            out.append({
+                "capability": r.capability_id, "version": r.version,
+                "description": r.description,
+                "risk": r.risk.value,
+                "requires": list(r.required_permissions),
+                "platforms": list(r.platforms), "execution": r.execution,
+                "requires_foreground": r.requires_foreground,
+                "requires_network": r.requires_network,
+                "battery_sensitive": r.battery_sensitive,
+                "supports_cancellation": r.supports_cancellation,
+                "supports_streaming": r.supports_streaming,
+                "timeout_s": r.timeout_s,
+                "input_schema": r.input_schema,
+                "output_schema": r.output_schema,
+                "availability": r.availability,
+                "availability_reason": r.availability_reason,
+                "usable": r.usable(), "stale": r.stale,
+                "advertised_at": r.advertised_at, "source": r.source,
+                "aliases": list(r.aliases), "examples": list(r.examples),
+                "keywords": list(r.keywords)})
+        return sorted(out, key=lambda e: e["capability"])
+
+    @app.get("/v1/fabric/devices/{device_id}/capabilities/{capability_id}")
+    def fabric_device_cap_one(device_id: str, capability_id: str,
+                              _=Depends(auth)):
+        """Single validated descriptor. 404 when the device does not
+        advertise it (supported-but-absent is not silently invented)."""
+        for r in s["fabric"].capabilities_for(device_id):
+            if r.capability_id == capability_id or r.name == capability_id:
+                if r.capability_id.startswith("legacy:"):
+                    break
+                return {
+                    "capability": r.capability_id, "version": r.version,
+                    "description": r.description,
+                    "risk": r.risk.value,
+                    "availability": r.availability,
+                    "availability_reason": r.availability_reason,
+                    "usable": r.usable(), "stale": r.stale,
+                    "advertised_at": r.advertised_at}
+        raise HTTPException(status_code=404, detail="unknown capability")
+
     @app.post("/v1/fabric/prefs")
     def fabric_pref(body: FabricPrefIn, _=Depends(auth)):
         from .fabric import TrustViolation
@@ -700,6 +1089,13 @@ def create_app(stack=None) -> FastAPI:
             device_id=device_id, kind=body.kind,
             capabilities=body.capabilities, online=True, status="online",
             software_version=body.software_version))
+        # Stage 16: re-registration marks the old descriptor snapshot
+        # stale (routing still works; resolve reports staleness). The
+        # device clears it by describing — no re-pair needed.
+        try:
+            s["fabric"].mark_stale(device_id)
+        except Exception:  # noqa: BLE001 — register already done
+            pass
         s["audit"].record("device", "device_register", device_id,
                           f"{len(body.capabilities)} caps")
         return {"registered": device_id, "capabilities": body.capabilities}
@@ -796,6 +1192,12 @@ def create_app(stack=None) -> FastAPI:
             s["fabric"].revoke_device(device_id, "operator revoke")
         except Exception:  # noqa: BLE001 — revoke itself already done
             pass
+        # Stage 15: eager transfer cancel (revoked endpoints never move
+        # again; chunk-time trust checks remain as defense in depth).
+        try:
+            s["xfer"].revoke_device(device_id)
+        except Exception:  # noqa: BLE001 — revoke itself already done
+            pass
         s["audit"].record("operator", "device_revoke", device_id, "")
         return {"revoked": device_id}
 
@@ -806,16 +1208,94 @@ def create_app(stack=None) -> FastAPI:
     def agent_capabilities_describe(body: dict,
                                    device_id: str = Depends(agent_auth)):
         """Device-authenticated capability advertisement with schemas.
-        Validated + stored; unknown names recorded unmapped (never
-        executable by themselves). Identity comes from auth, not body."""
+        Strict Stage 16 validation: versioned descriptors, bounded,
+        no authority fields. Identity comes ONLY from auth (passed as
+        the device_id parameter); documents carrying their own device_id
+        are rejected outright."""
         recs = body.get("records", []) if isinstance(body, dict) else []
         if not isinstance(recs, list) or len(recs) > 100:
             raise HTTPException(status_code=400,
                                 detail="records must be a list (<=100)")
-        for r in recs:
-            if isinstance(r, dict):
-                r["device_id"] = device_id
-        return s["fabric"].advertise(recs)
+        return s["fabric"].advertise(recs, device_id)
+
+    # ---- Stage 15: device byte-transfer endpoints (identity from auth;
+    # sender/recipient binding enforced by the engine, never the body) ----
+
+    @app.post("/v1/agent/xfer/request")
+    def agent_xfer_request(body: XferRequestIn,
+                           device_id: str = Depends(agent_auth)):
+        from .transfer import TransferRejected
+        try:
+            t = s["xfer"].request(
+                device_id, body.recipient_device, body.filename,
+                body.size_bytes, body.sha256, body.content_type,
+                body.grant_id, who=f"device:{device_id}",
+                metadata=body.metadata)
+        except (TransferRejected, KeyError, ValueError) as e:
+            _xfer_err(e)
+        return t.model_dump()
+
+    @app.post("/v1/agent/xfer/{transfer_id}/chunk")
+    def agent_xfer_chunk(transfer_id: str, body: XferChunkIn,
+                         device_id: str = Depends(agent_auth)):
+        import base64 as _b64
+        from .transfer import MAX_CHUNK_BYTES, TransferRejected
+        if len(body.data_base64) > MAX_CHUNK_BYTES // 3 * 4 + 128:
+            raise HTTPException(status_code=400, detail="chunk too large")
+        try:
+            data = _b64.b64decode(body.data_base64, validate=True)
+        except Exception:  # noqa: BLE001 — malformed base64, not bytes
+            raise HTTPException(status_code=400, detail="bad base64")
+        try:
+            return s["xfer"].post_chunk(
+                transfer_id, device_id, body.seq, data).model_dump()
+        except (TransferRejected, KeyError) as e:
+            _xfer_err(e)
+
+    @app.get("/v1/agent/xfer/pending")
+    def agent_xfer_pending(device_id: str = Depends(agent_auth)):
+        return s["xfer"].pending_for(device_id)
+
+    @app.get("/v1/agent/xfer/{transfer_id}/bytes")
+    def agent_xfer_bytes(transfer_id: str, offset: int = 0,
+                         length: int = 65536,
+                         device_id: str = Depends(agent_auth)):
+        import base64 as _b64
+        from .transfer import TransferRejected
+        try:
+            data, rec = s["xfer"].read(transfer_id, device_id,
+                                       offset, length)
+        except (TransferRejected, KeyError) as e:
+            _xfer_err(e)
+        return {"transfer_id": transfer_id, "offset": offset,
+                "length": len(data), "size_bytes": rec.size_bytes,
+                "sha256": rec.sha256,
+                "data_base64": _b64.b64encode(data).decode()}
+
+    @app.post("/v1/agent/xfer/{transfer_id}/ack")
+    def agent_xfer_ack(transfer_id: str, body: XferAckIn,
+                       device_id: str = Depends(agent_auth)):
+        from .transfer import TransferRejected
+        try:
+            ok, rec = s["xfer"].ack(transfer_id, device_id, body.sha256)
+        except (TransferRejected, KeyError) as e:
+            _xfer_err(e)
+        return {"transfer_id": transfer_id, "verified": ok,
+                "state": rec.state}
+
+    @app.post("/v1/agent/xfer/{transfer_id}/cancel")
+    def agent_xfer_cancel(transfer_id: str,
+                          device_id: str = Depends(agent_auth)):
+        from .transfer import TransferRejected
+        try:
+            # Sender, recipient, or operator path: the engine records who.
+            rec = s["xfer"].get(transfer_id)
+            if device_id not in (rec.source_device, rec.dest_device):
+                raise TransferRejected("only transfer parties may cancel")
+            return s["xfer"].cancel(
+                transfer_id, f"device:{device_id}").model_dump()
+        except (TransferRejected, KeyError) as e:
+            _xfer_err(e)
 
     @app.post("/v1/agent/voice/turn")
     def agent_voice_turn(body: VoiceTurnIn,

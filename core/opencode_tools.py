@@ -53,7 +53,7 @@ def _workspace(path: str, workspace: str) -> str:
 
 def _def(name: str, desc: str, schema: dict, cap: str, cost: float,
          perm: PermissionLevel, risk: RiskLevel,
-         timeout: float = 60.0) -> ToolDefinition:
+         timeout: float = 60.0, max_input_bytes: int = 4096) -> ToolDefinition:
     props = dict(schema.get("properties", {}))
     props["workspace"] = {"type": "string"}
     schema = dict(schema, required=["workspace"] + schema.get("required", []),
@@ -65,7 +65,8 @@ def _def(name: str, desc: str, schema: dict, cap: str, cost: float,
                           success_criteria="scoped result returned",
                           failure_behavior="fail", verification="none",
                           supported_devices=["cloud", "linux"],
-                          reversible=True, version="4.0.0")
+                          reversible=True, version="4.0.0",
+                          max_input_bytes=max_input_bytes)
 
 
 def code_inspect(inputs: dict, ctx: dict) -> dict:
@@ -252,7 +253,11 @@ OPENCODE_TOOLS: list[tuple[ToolDefinition, object]] = [
     (_def("code.apply_patch", "Apply unified diff in workspace (gated)",
           {"type": "object", "required": ["patch"],
            "properties": {"patch": {"type": "string"}}},
-          "code.patch", 0.2, PermissionLevel.HIGH_RISK, RiskLevel.HIGH_RISK),
+          # Envelope mirrors the handler's own 100KB contract
+          # (code_apply_patch enforces length itself); validator default
+          # would otherwise shrink a shipped contract. Never authority.
+          "code.patch", 0.2, PermissionLevel.HIGH_RISK, RiskLevel.HIGH_RISK,
+          max_input_bytes=102400),
      code_apply_patch),
     (_def("code.session", "Bounded specialist coding session (gated)",
           {"type": "object", "required": ["task"],

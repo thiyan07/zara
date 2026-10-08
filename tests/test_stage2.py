@@ -305,17 +305,43 @@ def test_linux_tools_safe_and_scoped(tmp_path):
 
 
 def test_contract_parity_core_vs_linux():
-    """Same tool names, capabilities, risk, and input schemas on both sides."""
+    """Same tool names, capabilities, risk, and input schemas on both sides.
+
+    Platform-scoped tools (android.* and gui.* namespaces) are Android-only
+    by design: the Linux agent has no twin and refuses them as unimplemented
+    (see test_android_only_tools_absent_on_linux below)."""
     linux = {d.name: d for d, _ in LT.LINUX_TOOLS}
     for core_def in DEVICE_TOOL_DEFS:
+        if core_def.name.startswith(("android.", "gui.")):
+            assert core_def.name not in linux, \
+                f"android-only tool leaked to linux: {core_def.name}"
+            continue
         assert core_def.name in linux, f"missing on device: {core_def.name}"
         ldev = linux[core_def.name]
         assert set(core_def.required_capabilities) == \
             set(ldev.required_capabilities)
         assert core_def.risk == ldev.risk
         assert core_def.input_schema == ldev.input_schema
-    assert (sorted({c for d in DEVICE_TOOL_DEFS for c in d.required_capabilities})
-            == LT.LINUX_CAPABILITIES)
+    shared = sorted({c for d in DEVICE_TOOL_DEFS for c in d.required_capabilities
+                     if not d.name.startswith(("android.", "gui."))})
+    assert shared == [c for c in LT.LINUX_CAPABILITIES
+                      if not c.startswith(("android.", "gui."))]
+
+
+def test_android_only_tools_absent_on_linux():
+    """The Linux agent must not implement, advertise, or accept
+    Android-only capabilities. Unknown tools are refused, never executed."""
+    import device.linux.agent as _agent_mod
+    import inspect as _inspect
+    names = {d.name for d, _ in LT.LINUX_TOOLS}
+    assert "android.app.force_stop" not in names
+    assert "android.app.force_stop" not in LT.LINUX_CAPABILITIES
+    assert "gui.screen.inspect" not in names
+    assert "gui.tap" not in names
+    assert "gui.screen.inspect" not in LT.LINUX_CAPABILITIES
+    assert "gui.tap" not in LT.LINUX_CAPABILITIES
+    src = _inspect.getsource(_agent_mod)
+    assert "tool not implemented on device" in src
 
 
 def test_no_secrets_in_audit_or_tools():

@@ -257,7 +257,8 @@ class ConversationLoop:
         except KeyError:
             return f"unknown tool '{action.tool}'"
         errors = validate_against_schema(action.arguments or {},
-                                         definition.input_schema)
+                                         definition.input_schema,
+                                         definition.max_input_bytes)
         if errors:
             return f"invalid arguments: {errors}"
         return ""

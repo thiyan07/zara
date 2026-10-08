@@ -143,12 +143,34 @@ class CapabilityRecord(BaseModel):
     output_schema: dict = Field(default_factory=dict)
     risk: RiskLevel = RiskLevel.SAFE
     required_permissions: list[str] = Field(default_factory=list)
-    # available | os_denied | unimplemented — advertised-but-unusable is
-    # represented truthfully, never hidden, never claimed as working.
+    # available | unavailable | os_denied | unimplemented —
+    # advertised-but-unusable is represented truthfully, never hidden,
+    # never claimed as working.
     availability: str = "available"
+    availability_reason: str = ""
     os_permission_granted: Optional[bool] = None
     constraints: dict = Field(default_factory=dict)
     metadata: dict = Field(default_factory=dict)
+    # ---- Stage 16 dynamic descriptor fields (defaults = legacy record).
+    # descriptor_version "0" means pre-descriptor/legacy; "1" means the
+    # record passed strict descriptor validation.
+    descriptor_version: str = "0"
+    platforms: list[str] = Field(default_factory=list)
+    execution: str = "on-device"
+    requires_foreground: bool = False
+    requires_network: bool = False
+    battery_sensitive: bool = False
+    supports_cancellation: bool = False
+    supports_streaming: bool = False
+    timeout_s: float = 30.0
+    aliases: list[str] = Field(default_factory=list)
+    examples: list[str] = Field(default_factory=list)
+    keywords: list[str] = Field(default_factory=list)
+    # ---- Core-attached snapshot (never device-supplied) ----
+    advertised_at: str = ""
+    source: str = ""
+    snapshot_software: str = ""
+    stale: bool = False
 
     def validate_record(self) -> None:
         if not _CAP_ID.match(self.capability_id):
@@ -156,9 +178,13 @@ class CapabilityRecord(BaseModel):
         if not isinstance(self.input_schema, dict) or \
                 not isinstance(self.output_schema, dict):
             raise ValueError("capability schemas must be objects")
-        if self.availability not in ("available", "os_denied",
-                                     "unimplemented"):
+        if self.availability not in ("available", "unavailable",
+                                     "os_denied", "unimplemented"):
             raise ValueError(f"bad availability: {self.availability!r}")
+        if self.availability != "available" and \
+                not self.availability_reason and \
+                self.descriptor_version != "0":
+            raise ValueError("unavailable descriptor needs a reason")
 
     def usable(self) -> bool:
         return self.availability == "available" and \
@@ -204,19 +230,35 @@ class TransferRecord(BaseModel):
     dest_device: str = ""
     capability: str = ""
     state: str = "proposed"  # proposed|authorized|running|verifying|
-                             # succeeded|failed|cancelled|rejected
+                             # succeeded|failed|cancelled|rejected|expired
     progress: float = 0.0
     verification: str = ""
     metadata: dict = Field(default_factory=dict)
+    # ---- Stage 15 byte-transfer contract (defaults = signaling-only,
+    # as in Stage 14; set when real bytes move through TransferEngine) ----
+    filename: str = ""
+    size_bytes: int = 0
+    sha256: str = ""
+    content_type: str = "application/octet-stream"
+    grant_id: str = ""
+    seq_expected: int = 0
+    received_bytes: int = 0
+    created_at: str = ""
+    updated_at: str = ""
+    expires_at: str = ""
+    completed_at: str = ""
+    recipient_verified: bool = False
+    error: str = ""
 
 
 TRANSFER_TRANSITIONS = {
-    "proposed": {"authorized", "rejected", "cancelled"},
-    "authorized": {"running", "cancelled"},
-    "running": {"verifying", "failed", "cancelled"},
-    "verifying": {"succeeded", "failed"},
+    "proposed": {"authorized", "rejected", "cancelled", "expired"},
+    "authorized": {"running", "cancelled", "expired"},
+    "running": {"verifying", "failed", "cancelled", "expired"},
+    "verifying": {"succeeded", "failed", "expired"},
     "succeeded": frozenset(), "failed": frozenset(),
     "cancelled": frozenset(), "rejected": frozenset(),
+    "expired": frozenset(),
 }
 
 
@@ -290,6 +332,10 @@ CREATE TABLE IF NOT EXISTS fabric_prefs (
 );
 CREATE TABLE IF NOT EXISTS fabric_revocations (
   device_id TEXT PRIMARY KEY, revoked_at TEXT NOT NULL, reason TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS fabric_transfers (
+  transfer_id TEXT PRIMARY KEY, record_json TEXT NOT NULL,
+  updated_at TEXT NOT NULL
 );
 """
 
@@ -452,6 +498,38 @@ class FabricStore:
         return {r[0]: r[1] for r in self._db.execute(
             "SELECT key, value FROM fabric_prefs WHERE device_id=?",
             (device_id,))}
+
+    # -- byte transfers (Stage 15; record JSON keyed by transfer_id) --
+
+    def save_transfer(self, record_json: str, transfer_id: str) -> None:
+        if self._db is None:
+            return
+        self._db.execute(
+            "INSERT INTO fabric_transfers (transfer_id, record_json, "
+            "updated_at) VALUES (?,?,?) "
+            "ON CONFLICT(transfer_id) DO UPDATE SET "
+            "record_json=excluded.record_json, "
+            "updated_at=excluded.updated_at",
+            (transfer_id, record_json, utcnow().isoformat()))
+
+    def load_transfers(self) -> list[dict]:
+        if self._db is None:
+            return []
+        import json as _json
+        out = []
+        for r in self._db.execute(
+                "SELECT record_json FROM fabric_transfers"):
+            try:
+                out.append(_json.loads(r[0]))
+            except Exception:  # noqa: BLE001 — corrupt row never fatal
+                continue
+        return out
+
+    def delete_transfer(self, transfer_id: str) -> None:
+        if self._db is None:
+            return
+        self._db.execute("DELETE FROM fabric_transfers WHERE transfer_id=?",
+                         (transfer_id,))
 
 
 # ---------- registry (adapter; owns no device truth of its own) ----------
@@ -666,25 +744,127 @@ class FabricRegistry:
 
     # ----- capabilities -----
 
-    def advertise(self, records: list[dict]) -> dict:
-        """Device-advertised capability records (device-auth endpoint).
-        Validated + stored. Unknown names are recorded as discovered
-        (unmapped); they NEVER become executable tools by themselves."""
-        accepted, rejected = [], []
-        for raw in records:
-            try:
-                rec = CapabilityRecord(**raw)
-                rec.validate_record()
-                self._caps.setdefault(rec.device_id, {})[
-                    rec.capability_id] = rec
-                self.store.save_capability(rec)
-                accepted.append(rec.capability_id)
-                self._audit("capability_discovered", rec.device_id,
-                            rec.capability_id)
-            except Exception as e:  # noqa: BLE001 — one bad record
-                rejected.append({"record": str(raw)[:120],
-                                 "error": str(e)[:200]})
+    def advertise(self, records: list[dict], device_id: str = "",
+                    source: str = "describe") -> dict:
+        """Device-advertised capability descriptors (device-auth endpoint).
+        Strict validation (Stage 16): bounded, versioned, no authority
+        fields, no schema bombs. Identity comes ONLY from the device_id
+        parameter (forced from auth by the endpoint) — documents carrying
+        their own device_id are rejected, so spoofing is structural, not
+        just overwritten. Accepted docs become the device's FULL snapshot
+        (refresh semantics): added/removed/changed are diffed and audited;
+        absent records are dropped. Unknown names are never executable by
+        themselves."""
+        from .capabilities import (descriptor_fingerprint,
+                                   validate_describe_batch)
+        if not isinstance(records, list):
+            return {"accepted": [], "rejected": [{
+                "record": str(records)[:120],
+                "error": "records must be a list"}]}
+        if not device_id:
+            return {"accepted": [], "rejected": [{
+                "record": "batch", "error": "missing device identity"}]}
+        try:
+            descs, rejected = validate_describe_batch(records)
+        except Exception as e:  # noqa: BLE001 — batch-level refusal
+            return {"accepted": [], "rejected": [{
+                "record": f"{len(records)} records",
+                "error": str(e)[:300]}]}
+        if not descs:
+            # Nothing valid: keep the old snapshot (never destroy state
+            # on garbage), report what failed.
+            return {"accepted": [], "rejected": rejected}
+        prev = self._caps.get(device_id, {})
+        prev_fp = {cid: self._record_fingerprint(r)
+                   for cid, r in prev.items()}
+        new_fp = {d.id: descriptor_fingerprint(d) for d in descs}
+        old_ids, new_ids = set(prev_fp), set(new_fp)
+        for cid in sorted(new_ids - old_ids):
+            self._audit("capability_added", device_id, cid)
+        for cid in sorted(old_ids - new_ids):
+            self._audit("capability_removed", device_id, cid)
+        for cid in sorted(old_ids & new_ids):
+            if prev_fp[cid] != new_fp[cid]:
+                self._audit("capability_changed", device_id, cid)
+        try:
+            sw = self.devices.get(device_id).software_version
+        except Exception:  # noqa: BLE001 — unknown to manager
+            sw = ""
+        now = utcnow().isoformat()
+        fresh: dict[str, CapabilityRecord] = {}
+        accepted: list[str] = []
+        for d in descs:
+            fresh[d.id] = CapabilityRecord(
+                capability_id=d.id, name=d.id, device_id=device_id,
+                version=d.version, description=d.description[:500],
+                input_schema=d.input_schema,
+                output_schema=d.output_schema, risk=d.risk,
+                required_permissions=list(d.requires),
+                availability=d.availability,
+                availability_reason=d.availability_reason,
+                os_permission_granted=d.os_permission_granted,
+                descriptor_version=d.descriptor_version,
+                platforms=list(d.platforms), execution=d.execution,
+                requires_foreground=d.requires_foreground,
+                requires_network=d.requires_network,
+                battery_sensitive=d.battery_sensitive,
+                supports_cancellation=d.supports_cancellation,
+                supports_streaming=d.supports_streaming,
+                timeout_s=d.timeout_s, aliases=list(d.aliases),
+                examples=list(d.examples), keywords=list(d.keywords),
+                advertised_at=now, source=source[:32],
+                snapshot_software=sw[:64], stale=False)
+            accepted.append(d.id)
+        self._caps[device_id] = fresh
+        self._rewrite_capabilities(device_id, fresh)
         return {"accepted": accepted, "rejected": rejected}
+
+    def _rewrite_capabilities(self, device_id: str,
+                              fresh: dict) -> None:
+        """Persist full-replace snapshot (refresh semantics)."""
+        self.store.delete_capabilities(device_id)
+        for rec in fresh.values():
+            self.store.save_capability(rec)
+
+    @staticmethod
+    def _record_fingerprint(rec: CapabilityRecord) -> str:
+        from .capabilities import descriptor_fingerprint
+        try:
+            from .capabilities import CapabilityDescriptor
+            d = CapabilityDescriptor(
+                id=rec.capability_id, name=rec.name, version=rec.version,
+                description=rec.description, risk=rec.risk,
+                requires=list(rec.required_permissions),
+                platforms=list(rec.platforms) or ["any"],
+                execution=rec.execution or "on-device",
+                requires_foreground=rec.requires_foreground,
+                requires_network=rec.requires_network,
+                battery_sensitive=rec.battery_sensitive,
+                supports_cancellation=rec.supports_cancellation,
+                supports_streaming=rec.supports_streaming,
+                timeout_s=rec.timeout_s, input_schema=rec.input_schema,
+                output_schema=rec.output_schema,
+                availability=rec.availability,
+                availability_reason=rec.availability_reason,
+                aliases=list(rec.aliases), keywords=list(rec.keywords))
+            return descriptor_fingerprint(d)
+        except Exception:  # noqa: BLE001 — legacy oddity: raw hash
+            import hashlib as _hl
+            return _hl.sha256(
+                rec.model_dump_json().encode()).hexdigest()[:16]
+
+    def mark_stale(self, device_id: str) -> None:
+        """Registration without a fresh describe leaves the previous
+        snapshot usable-but-stale: routing still works, resolve reports
+        staleness honestly. Cleared by the next describe."""
+        for rec in self._caps.get(device_id, {}).values():
+            rec.stale = True
+            try:
+                self.store.save_capability(rec)
+            except Exception:  # noqa: BLE001 — memory mode
+                pass
+        self._audit("capability_stale", device_id,
+                    "re-registered without fresh describe")
 
     def capabilities_for(self, device_id: str) -> list[CapabilityRecord]:
         out = []

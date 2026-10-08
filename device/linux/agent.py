@@ -87,6 +87,23 @@ class DeviceAgent:
             "software_version": self.software_version,
             "kind": "linux"})
 
+    def describe_capabilities(self) -> dict:
+        """Stage 16: advertise versioned capability descriptors built
+        from the safe tool allowlist (single source of truth — what is
+        advertised is exactly what is implemented, no more)."""
+        import urllib.request as _urllib
+        from core.capabilities import linux_descriptors
+        body = json.dumps({"records": linux_descriptors()}).encode()
+        req = _urllib.Request(
+            f"{self.core_url}/v1/agent/capabilities/describe",
+            data=body, headers=self._headers())
+        try:
+            with _urllib.urlopen(req, timeout=30) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(
+                f"capabilities/describe: HTTP {e.code} {e.read()[:200]}")
+
     def heartbeat(self) -> dict:
         try:
             bat = system_battery({}, {})
@@ -159,6 +176,81 @@ class DeviceAgent:
         except (OSError, RuntimeError):
             pass
 
+    # ---------- Stage 15: byte transfers (Core-mediated, chunked) ----------
+
+    def xfer_request(self, recipient: str, filename: str, data: bytes,
+                     content_type: str = "application/octet-stream",
+                     grant_id: str = "") -> dict:
+        import hashlib as _hl
+        return self._post("/v1/agent/xfer/request", {
+            "recipient_device": recipient, "filename": filename,
+            "size_bytes": len(data),
+            "sha256": _hl.sha256(data).hexdigest(),
+            "content_type": content_type, "grant_id": grant_id})
+
+    def xfer_upload(self, transfer_id: str, data: bytes,
+                    chunk: int = 65536) -> dict:
+        import base64 as _b64
+        out: dict = {}
+        seq = 0
+        for i in range(0, len(data), chunk):
+            out = self._post(f"/v1/agent/xfer/{transfer_id}/chunk", {
+                "seq": seq,
+                "data_base64": _b64.b64encode(
+                    data[i:i + chunk]).decode()})
+            seq += 1
+        return out
+
+    def xfer_pending(self) -> dict:
+        import urllib.request as _urllib
+        req = _urllib.Request(f"{self.core_url}/v1/agent/xfer/pending",
+                              headers=self._headers())
+        try:
+            with _urllib.urlopen(req, timeout=15) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(
+                f"xfer/pending: HTTP {e.code} {e.read()[:200]}")
+
+    def xfer_download(self, transfer_id: str,
+                      size_bytes: int = -1) -> tuple[bytes, dict]:
+        """Download all chunks, verify SHA-256 locally, ack. Returns
+        (bytes, ack_response). Raises on hash mismatch (no false ack)."""
+        import base64 as _b64
+        import hashlib as _hl
+        import urllib.request as _urllib
+        import urllib.parse as _up
+        out = bytearray()
+        expected = size_bytes
+        offset = 0
+        while True:
+            length = 65536 if expected < 0 else min(65536, expected - offset)
+            if length <= 0:
+                break
+            qs = _up.urlencode({"offset": offset, "length": length})
+            req = _urllib.Request(
+                f"{self.core_url}/v1/agent/xfer/{transfer_id}/bytes?{qs}",
+                headers=self._headers())
+            try:
+                with _urllib.urlopen(req, timeout=30) as r:
+                    blk = json.load(r)
+            except urllib.error.HTTPError as e:
+                raise RuntimeError(
+                    f"xfer/bytes: HTTP {e.code} {e.read()[:200]}")
+            raw = _b64.b64decode(blk["data_base64"])
+            out += raw
+            expected = blk["size_bytes"]
+            offset += blk["length"]
+            if offset >= expected or not raw:
+                break
+        data = bytes(out)
+        digest = _hl.sha256(data).hexdigest()
+        if digest != blk["sha256"]:
+            raise ValueError("recipient hash mismatch: refusing ack")
+        ack = self._post(f"/v1/agent/xfer/{transfer_id}/ack",
+                         {"sha256": digest})
+        return data, ack
+
     # ---------- main loop ----------
 
     def serve_forever(self) -> None:
@@ -166,6 +258,12 @@ class DeviceAgent:
         signal.signal(signal.SIGINT, lambda *_: self._stop.set())
         self.load_key()
         self.register()
+        try:
+            # Stage 16: capability snapshot follows registration (refresh
+            # semantics; no re-pair needed when capabilities change).
+            self.describe_capabilities()
+        except (OSError, RuntimeError):
+            pass  # describe retries on next boot; strings still route
         last_hb = 0.0
         backoff = POLL_IDLE_S
         while not self._stop.is_set():
