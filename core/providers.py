@@ -36,11 +36,14 @@ class ModelProvider:
 
     def stream_reason(self, system: str, user: str, tools: list[dict],
                       cancel: Optional[threading.Event] = None,
-                      timeout: float = 60.0) -> Iterator[str]:
-        """Yield response text chunks; fallback = single complete chunk."""
+                      timeout: float = 60.0) -> Iterator:
+        """Yield response chunks: raw text pieces, or a single LLMOutcome
+        when the full action is already parsed (non-token streams).
+        Fallback yields the complete parsed outcome (action preserved —
+        yielding text alone would force an unsafe re-parse downstream)."""
         outcome = self.reason(system, user, tools, cancel, timeout)
-        if outcome.text:
-            yield outcome.text
+        if outcome.text or outcome.action is not None:
+            yield outcome
 
     def metadata(self) -> dict:
         return {"provider": self.name, "model": self.model}
@@ -110,6 +113,7 @@ class OpenAICompatibleProvider(ModelProvider):
     def complete(self, prompt: str, **kwargs) -> ModelResponse:
         import json
         import urllib.request
+        import urllib.error
         body = json.dumps({"model": self.model,
                            "messages": [{"role": "user", "content": prompt}],
                            "max_tokens": kwargs.get("max_tokens", 512)}).encode()
@@ -117,23 +121,50 @@ class OpenAICompatibleProvider(ModelProvider):
             f"{self.base_url}/chat/completions", data=body,
             headers={"Content-Type": "application/json",
                      "Authorization": f"Bearer {self.api_key}"})
-        with urllib.request.urlopen(req, timeout=kwargs.get("timeout", 60)) as r:
-            data = json.load(r)
-        text = data["choices"][0]["message"]["content"]
+        try:
+            with urllib.request.urlopen(req, timeout=kwargs.get("timeout", 60)) as r:
+                try:
+                    data = json.load(r)
+                except ValueError as e:
+                    raise LLMError(LLMErrorKind.MALFORMED,
+                                   f"provider returned non-JSON: {e}")
+        except urllib.error.HTTPError as e:
+            raise classify_http_error(e.code, e.read().decode()[:500])
+        except TimeoutError:
+            raise LLMError(LLMErrorKind.TIMEOUT, "provider timed out")
+        except OSError as e:
+            raise LLMError(LLMErrorKind.NETWORK, f"provider network: {e}")
+        try:
+            text = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as e:
+            raise LLMError(LLMErrorKind.MALFORMED,
+                           f"provider response has no content: "
+                           f"{type(e).__name__}")
         return ModelResponse(text=text, tool_calls=[], provider=self.name)
 
     def _post(self, payload: dict, timeout: float) -> dict:
         import json
         import urllib.request
         import urllib.error
-        body = json.dumps(payload).encode()
-        req = urllib.request.Request(
-            f"{self.base_url}/chat/completions", data=body,
-            headers={"Content-Type": "application/json",
-                     "Authorization": f"Bearer {self.api_key}"})
+        try:
+            body = json.dumps(payload).encode()
+            req = urllib.request.Request(
+                f"{self.base_url}/chat/completions", data=body,
+                headers={"Content-Type": "application/json",
+                         "Authorization": f"Bearer {self.api_key}"})
+        except (ValueError, KeyError, TypeError) as e:
+            # Unusable endpoint configuration (e.g. empty base_url) must
+            # surface as a safe provider error, never a raw exception that
+            # crashes the turn.
+            raise LLMError(LLMErrorKind.NETWORK,
+                           f"provider misconfigured: {type(e).__name__}")
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                return json.load(r)
+                try:
+                    return json.load(r)
+                except ValueError as e:  # non-JSON 200 body
+                    raise LLMError(LLMErrorKind.MALFORMED,
+                                   f"provider returned non-JSON: {e}")
         except urllib.error.HTTPError as e:
             raise classify_http_error(e.code, e.read().decode()[:500])
         except TimeoutError:
@@ -161,8 +192,14 @@ class OpenAICompatibleProvider(ModelProvider):
         for attempt in range(self.MAX_RETRIES + 1):
             try:
                 data = self._post(payload, timeout)
-                text = data["choices"][0]["message"]["content"]
-                usage = data.get("usage", {})
+                try:
+                    text = data["choices"][0]["message"]["content"]
+                except (KeyError, IndexError, TypeError) as e:
+                    raise LLMError(LLMErrorKind.MALFORMED,
+                                   f"provider response has no content: "
+                                   f"{type(e).__name__}")
+                usage = data.get("usage", {}) if isinstance(data, dict) \
+                    else {}
                 action = parse_llm_action(text)
                 return LLMOutcome(action=action, text=action.text or text,
                                   provider=self.name, model=self.model,
@@ -195,27 +232,90 @@ class OpenAICompatibleProvider(ModelProvider):
             data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json",
                      "Authorization": f"Bearer {self.api_key}"})
+        import codecs
+
+        def _sse_lines(text: str):
+            """Split decoded text into complete SSE lines, holding any
+            trailing partial line in the closure buffer (TCP segments
+            split lines arbitrarily, like multibyte characters)."""
+            _sse_lines.buf += text
+            *complete, _sse_lines.buf = _sse_lines.buf.split("\n")
+            return [ln.strip() for ln in complete if ln.strip()]
+        _sse_lines.buf = ""
+        buf_done = [False]
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 buf = ""
-                for raw in r:
+                # Incremental UTF-8: TCP segments split multibyte
+                # characters arbitrarily; naive per-chunk decode throws
+                # mid-stream (observed live). Buffer partial sequences.
+                decoder = codecs.getincrementaldecoder("utf-8")()
+                it = iter(r)
+                while True:
+                    try:
+                        raw = next(it)
+                    except StopIteration:
+                        break
+                    except OSError:
+                        # Some endpoints reset the connection after the
+                        # final content chunk instead of sending [DONE].
+                        # Tolerate the trailer reset ONLY when content
+                        # already arrived: the assembled text still goes
+                        # through strict parse, so truncation can never
+                        # become a false success (partial JSON is
+                        # MALFORMED). No content yet -> real failure below.
+                        if not buf:
+                            raise LLMError(
+                                LLMErrorKind.NETWORK,
+                                "provider stream failed before content")
+                        break
                     if cancel is not None and cancel.is_set():
                         raise LLMError(LLMErrorKind.CANCELLED, "stream cancelled")
-                    line = raw.decode().strip()
-                    if not line.startswith("data:"):
-                        continue
-                    chunk = line[5:].strip()
-                    if chunk == "[DONE]":
-                        break
                     try:
-                        delta = json.loads(chunk)["choices"][0]["delta"]
-                        piece = delta.get("content", "")
-                    except (ValueError, KeyError):
+                        text = decoder.decode(raw)
+                    except UnicodeDecodeError as e:
                         raise LLMError(LLMErrorKind.MALFORMED,
-                                       "malformed stream chunk")
-                    if piece:
-                        buf += piece
-                        yield piece
+                                       f"stream bytes not decodable: {e}")
+                    for line in _sse_lines(text):
+                        if not line.startswith("data:"):
+                            continue
+                        chunk = line[5:].strip()
+                        if chunk == "[DONE]":
+                            buf_done[0] = True
+                            break
+                        try:
+                            payload = json.loads(chunk)
+                            choices = payload["choices"]
+                        except ValueError:
+                            raise LLMError(LLMErrorKind.MALFORMED,
+                                           "malformed stream chunk")
+                        except (KeyError, TypeError, AttributeError):
+                            raise LLMError(LLMErrorKind.MALFORMED,
+                                           "stream chunk has no choices")
+                        if not isinstance(choices, list) or not choices:
+                            continue  # usage/control chunk, no content
+                        delta = choices[0].get("delta") or {}
+                        piece = (delta.get("content", "")
+                                 if isinstance(delta, dict) else "")
+                        if piece:
+                            buf += piece
+                            yield piece
+                    if buf_done[0]:
+                        break
+                # Flush a final unterminated line, if any.
+                tail = _sse_lines.buf.strip()
+                if tail.startswith("data:"):
+                    chunk = tail[5:].strip()
+                    if chunk and chunk != "[DONE]":
+                        try:
+                            delta = json.loads(chunk)["choices"][0]["delta"]
+                            piece = delta.get("content", "")
+                        except (ValueError, KeyError):
+                            raise LLMError(LLMErrorKind.MALFORMED,
+                                           "malformed stream chunk")
+                        if piece:
+                            buf += piece
+                            yield piece
         except urllib.error.HTTPError as e:
             raise classify_http_error(e.code, e.read().decode()[:500])
         except TimeoutError:

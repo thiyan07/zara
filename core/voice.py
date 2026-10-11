@@ -3,12 +3,58 @@ engine, and the voice pipeline. All providers replaceable; deterministic
 mocks for tests. Text mode always works without voice.
 """
 from __future__ import annotations
+import re as _re
 import threading
+import warnings as _warnings
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Iterator, Optional
 
 WAKE_PHRASE = "Hey Zara"
+
+# ---------- voice language (BCP-47 plumbing, NOT an acoustic claim) ----------
+# ZARA_VOICE_LANG selects the *requested* language tag threaded through
+# STT/TTS providers and turn results. It does not conjure acoustic support:
+# English-only local models still fail loudly on non-English (never silently
+# transcribe English as Tamil), and Piper with only an en_US voice refuses
+# non-English synthesis explicitly. No Tamil acoustic model exists locally.
+
+DEFAULT_VOICE_LANG = "en-US"
+_VOICE_LANG_RE = _re.compile(r"^[a-z]{2}(-[A-Z]{2})?$")
+
+
+def parse_voice_lang(raw: str | None = None) -> str:
+    """Validated BCP-47 voice language. Default "en-US"; invalid input ->
+    safe fallback "en-US" + UserWarning, never a crash. Secret-free:
+    the value is a short language tag, never key material."""
+    import os as _os
+    if raw is None:
+        raw = _os.environ.get("ZARA_VOICE_LANG", DEFAULT_VOICE_LANG)
+    raw = (raw or "").strip()
+    if _VOICE_LANG_RE.match(raw):
+        return raw
+    _warnings.warn(
+        f"invalid ZARA_VOICE_LANG {raw!r}; falling back to "
+        f"{DEFAULT_VOICE_LANG!r}")
+    return DEFAULT_VOICE_LANG
+
+
+def _whisper_lang(lang: str) -> str:
+    """BCP-47 ("ta-IN") -> whisper language code ("ta")."""
+    return (lang or "en").split("-")[0].lower() or "en"
+
+
+# EdgeTTS voice map for trivially supported languages. NOT acoustically
+# validated here (no hardware/speakers available); the tag is threaded so
+# the cloud voice matches the requested language instead of defaulting to
+# English speech for a Tamil request.
+EDGE_VOICE_DEFAULT = "en-US-AriaNeural"
+EDGE_VOICES = {
+    "en-US": "en-US-AriaNeural",
+    "en": "en-US-AriaNeural",
+    "ta-IN": "ta-IN-PallaviNeural",
+    "ta": "ta-IN-PallaviNeural",
+}
 
 
 class VoiceState(str, Enum):
@@ -127,6 +173,23 @@ class MockTTS(TTSProvider):
         self.spoken.append(text)
         return f"audio:{text[:50]}".encode()
 
+    def stream_speak(self, text: str,
+                     cancel: Optional[threading.Event] = None) -> Iterator[bytes]:
+        """Word-chunked synthesis honoring cancel per chunk, so barge-in
+        tests exercise real mid-speech cancellation. The full reply is
+        recorded in spoken only when synthesis completes; a cancelled turn
+        records a partial marker, never the unspoken reply as fact."""
+        if cancel is not None and cancel.is_set():
+            return
+        words = text.split() or [text]
+        for i, word in enumerate(words):
+            if cancel is not None and cancel.is_set():
+                self.spoken.append("[cancelled-partial] "
+                                   + " ".join(words[:i]))
+                return
+            yield f"audio:{word[:50]}".encode()
+        self.spoken.append(text)
+
     def stop(self) -> None:
         self.stopped = True
 
@@ -137,8 +200,19 @@ class EdgeTTSProvider(TTSProvider):
     barge-in support. NOT the default: local PiperTTS is the default."""
     name = "edge-tts"
 
-    def __init__(self, voice: str = "en-US-AriaNeural", rate: str = "+0%") -> None:
-        self.voice = voice
+    def __init__(self, voice: str | None = None, rate: str = "+0%",
+                 language: str = DEFAULT_VOICE_LANG) -> None:
+        self.language = language
+        if voice:
+            self.voice = voice
+        else:
+            mapped = EDGE_VOICES.get(language) or \
+                EDGE_VOICES.get(_whisper_lang(language))
+            if mapped is None and _whisper_lang(language) != "en":
+                raise RuntimeError(
+                    f"edge-tts voice missing for language {language!r}: "
+                    "no mapped Edge voice; set TTS_EDGE_VOICE explicitly")
+            self.voice = mapped or EDGE_VOICE_DEFAULT
         self.rate = rate
 
     def speak(self, text: str) -> bytes:
@@ -170,10 +244,12 @@ class FasterWhisperSTT(STTProvider):
     name = "local-whisper"
 
     def __init__(self, model: str = "tiny.en", device: str = "cpu",
-                 timeout_s: float = 120.0) -> None:
+                 timeout_s: float = 120.0,
+                 language: str = "en") -> None:
         self.model_name = model
         self.device = device
         self.timeout_s = timeout_s
+        self.language = language or "en"
         self._model = None
         self._lock = threading.Lock()
 
@@ -210,13 +286,22 @@ class FasterWhisperSTT(STTProvider):
         return pcm
 
     def transcribe(self, audio: bytes) -> str:
+        base = _whisper_lang(self.language)
+        if base != "en" and self.model_name.endswith(".en"):
+            # Loud refusal BEFORE any audio validation/model load: an
+            # English-only model must never silently transcribe English
+            # audio as Tamil (or any other language).
+            raise RuntimeError(
+                f"language unsupported by local model: {self.language!r} "
+                f"needs a multilingual faster-whisper model, have "
+                f"{self.model_name!r}")
         from .audio import validate_wav
         props = validate_wav(audio)
         if props["frames"] == 0:
             raise ValueError("empty audio")
         model = self._load()
         pcm = self._to_mono16k(audio, props)
-        segments, info = model.transcribe(pcm, beam_size=1, language="en",
+        segments, info = model.transcribe(pcm, beam_size=1, language=base,
                                           condition_on_previous_text=False)
         text = " ".join(s.text.strip() for s in segments).strip()
         return " ".join(text.split())
@@ -238,13 +323,34 @@ class PiperTTS(TTSProvider):
     name = "local-piper"
     MAX_CHARS = 2000
 
-    def __init__(self, model_path: str = "", timeout_s: float = 120.0) -> None:
+    def __init__(self, model_path: str = "", timeout_s: float = 120.0,
+                 language: str = DEFAULT_VOICE_LANG) -> None:
         import os as _os
         self.model_path = model_path or _os.path.expanduser(
             "~/.cache/zara-voice/en_US-lessac-medium.onnx")
         self.timeout_s = timeout_s
+        self.language = language or DEFAULT_VOICE_LANG
         self._voice = None
         self._lock = threading.Lock()
+
+    def _check_language(self) -> None:
+        """Refuse wrong-language synthesis: with only the en_US voice
+        installed, a non-English request is an explicit error naming the
+        missing voice — never English audio served as another language.
+        A user-supplied voice file whose name carries the requested base
+        code (e.g. ta_IN-...) is attempted normally."""
+        base = _whisper_lang(self.language)
+        if base == "en":
+            return
+        import os as _os
+        stem = _os.path.basename(self.model_path).lower()
+        if stem.startswith(base) or f"{base}_" in stem or \
+                f"{base}-" in stem:
+            return
+        raise RuntimeError(
+            f"piper voice missing for language {self.language!r}: no "
+            f"{base!r} voice installed (have {self.model_path!r}); "
+            f"refusing to synthesize {base} with an English voice")
 
     def _load(self):
         with self._lock:
@@ -280,6 +386,7 @@ class PiperTTS(TTSProvider):
         return buf.getvalue()
 
     def speak(self, text: str) -> bytes:
+        self._check_language()
         if not text or not text.strip():
             raise ValueError("empty text")
         if len(text) > self.MAX_CHARS:
@@ -307,6 +414,7 @@ class PiperTTS(TTSProvider):
     def stream_speak(self, text: str,
                      cancel: Optional[threading.Event] = None
                      ) -> Iterator[bytes]:
+        self._check_language()
         if not text or not text.strip():
             raise ValueError("empty text")
         if len(text) > self.MAX_CHARS:
@@ -469,12 +577,157 @@ class VADSpotterBackend:
                         "validated path; continuous listening not implemented"}
 
 
+class KeywordModelDetector:
+    """Modular on-device keyword-model adapter (openWakeWord ONNX, etc).
+
+    Opt-in and inert without a model file: construction never downloads,
+    inference never runs in a loop here. The caller arms one bounded
+    snippet at a time; battery gating lives in WakeWordEngine. Missing
+    package or model raises an explicit error — never silent non-detection
+    reported as "no wake word".
+    """
+
+    DEFAULT_MODEL = "~/.cache/zara-wake/hey_zara.onnx"
+    MAX_SECONDS = 5.0
+
+    def __init__(self, model_path: str | None = None,
+                 threshold: float = 0.5) -> None:
+        import os as _os
+        self.model_path = _os.path.expanduser(
+            model_path or self.DEFAULT_MODEL)
+        self.threshold = threshold
+        self._model = None
+
+    def _load(self):
+        if self._model is not None:
+            return self._model
+        try:
+            import openwakeword  # noqa: F401
+        except ImportError:
+            raise RuntimeError(
+                "openwakeword not installed: pip install openwakeword "
+                "(keyword-model wake detection unavailable)")
+        import os as _os
+        if not _os.path.isfile(self.model_path):
+            raise RuntimeError(
+                f"wake model missing: {self.model_path} "
+                f"(place an openWakeWord 'hey_zara' model there; "
+                f"nothing is downloaded automatically)")
+        raise RuntimeError(
+            f"wake model present but no validated inference binding: "
+            f"{self.model_path} (physical validation pending)")
+
+    def detect(self, pcm16k_mono_s16: bytes) -> dict:
+        """Score one bounded snippet. Raises when unavailable."""
+        if len(pcm16k_mono_s16) > int(16000 * 2 * self.MAX_SECONDS):
+            raise ValueError(
+                f"snippet exceeds {self.MAX_SECONDS}s")
+        self._load()  # honest failure before any claim
+        return {"detected": False, "score": 0.0}  # unreachable
+
+    def availability(self) -> dict:
+        import os as _os
+        try:
+            import openwakeword  # noqa: F401
+            installed = True
+        except ImportError:
+            installed = False
+        return {"engine": "keyword-model",
+                "phrase": WAKE_PHRASE,
+                "installed": installed,
+                "model_present": _os.path.isfile(self.model_path),
+                "always_on_dsp": False,
+                "physically_validated": False,
+                "note": "opt-in adapter; inert without an installed model"}
+
+
+def voice_capabilities(language: str | None = None) -> dict:
+    """Honest per-language STT/TTS support matrix. Probe-only: imports
+    and file-existence checks, never model loads or network calls.
+
+    Returns {language, stt: {backend, supported, reason},
+             tts: {backend, supported, reason}}. Unsupported languages
+    are reported with the missing piece named — never silent fallback
+    to English behavior presented as Tamil support."""
+    import os as _os
+    lang = (language or parse_voice_lang()).strip() or DEFAULT_VOICE_LANG
+    base = _whisper_lang(lang)
+    stt_model = _os.environ.get("STT_MODEL", "tiny.en")
+    try:
+        import faster_whisper  # noqa: F401
+        fw_installed = True
+    except ImportError:
+        fw_installed = False
+    if base == "en":
+        if fw_installed:
+            stt = {"backend": "local-whisper", "supported": True,
+                   "reason": f"faster-whisper model {stt_model!r} handles "
+                             f"{lang!r} locally"}
+        else:
+            stt = {"backend": "mock", "supported": False,
+                   "reason": "faster-whisper not installed"}
+    elif fw_installed and not stt_model.endswith(".en"):
+        stt = {"backend": "local-whisper", "supported": True,
+               "reason": f"multilingual model {stt_model!r} handles "
+                         f"{lang!r} locally"}
+    elif fw_installed:
+        stt = {"backend": "local-whisper", "supported": False,
+               "reason": f"language {lang!r} needs a multilingual "
+                         f"faster-whisper model, have {stt_model!r}"}
+    else:
+        stt = {"backend": "none", "supported": False,
+               "reason": f"faster-whisper not installed; {lang!r} "
+                         f"unavailable offline"}
+    try:
+        import piper  # noqa: F401
+        piper_installed = True
+    except ImportError:
+        piper_installed = False
+    voice_path = _os.environ.get("TTS_MODEL", "") or _os.path.expanduser(
+        "~/.cache/zara-voice/en_US-lessac-medium.onnx")
+    stem = _os.path.basename(voice_path).lower()
+    piper_matches = base == "en" or stem.startswith(base) or \
+        f"{base}_" in stem or f"{base}-" in stem
+    try:
+        import edge_tts  # noqa: F401
+        edge_installed = True
+    except ImportError:
+        edge_installed = False
+    if piper_installed and _os.path.isfile(voice_path) and piper_matches:
+        tts = {"backend": "local-piper", "supported": True,
+               "reason": f"piper voice {voice_path!r} matches {lang!r}"}
+    elif base in ("ta",) and edge_installed:
+        tts = {"backend": "edge-tts", "supported": True,
+               "reason": f"cloud voice {EDGE_VOICES.get(base)!r} for "
+                         f"{lang!r} (network needed, acoustically "
+                         f"unvalidated)"}
+    elif base == "en" and edge_installed:
+        tts = {"backend": "edge-tts", "supported": True,
+               "reason": "cloud English voice (network needed)"}
+    elif not piper_matches:
+        tts = {"backend": "local-piper", "supported": False,
+               "reason": f"piper voice missing for {lang!r}: no {base!r} "
+                         f"voice installed (have {voice_path!r})"}
+    elif not piper_installed:
+        tts = {"backend": "none", "supported": False,
+               "reason": "piper-tts not installed and no cloud TTS selected"}
+    else:
+        tts = {"backend": "none", "supported": False,
+               "reason": f"no TTS voice for {lang!r}"}
+    return {"language": lang, "stt": stt, "tts": tts}
+
+
 def stt_from_env() -> STTProvider:
     """auto (default): local whisper when importable, else mock.
     nvidia: hosted Parakeet primary + local faster-whisper fallback.
-    mock: force the mock. local: explicit local (raises if unavailable)."""
+    mock: force the mock. local: explicit local (raises if unavailable).
+    Language: ZARA_VOICE_LANG (validated BCP-47, default en-US);
+    NVIDIA_STT_LANGUAGE overrides it when explicitly set."""
     import os as _os
     which = _os.environ.get("STT_PROVIDER", "auto").strip().lower()
+    voice_lang = parse_voice_lang()
+    nvidia_lang = _os.environ.get("NVIDIA_STT_LANGUAGE", "").strip() \
+        or voice_lang
     if which == "mock":
         return MockSTT()
     if which == "nvidia":
@@ -487,10 +740,11 @@ def stt_from_env() -> STTProvider:
                 "d3fe9151-442b-4204-a70d-5fcc597fd610"),
             model_label=_os.environ.get("NVIDIA_STT_MODEL",
                                         "parakeet-tdt-0_6b-v2"),
-            language=_os.environ.get("NVIDIA_STT_LANGUAGE", "en-US"))
+            language=nvidia_lang)
         try:
             fallback = FasterWhisperSTT(
-                model=_os.environ.get("STT_MODEL", "tiny.en"))
+                model=_os.environ.get("STT_MODEL", "tiny.en"),
+                language=voice_lang)
         except (ImportError, RuntimeError):
             # No silent mock fallback: if local is unavailable the
             # PRIMARY error must propagate (STTFallback re-raises it).
@@ -499,7 +753,8 @@ def stt_from_env() -> STTProvider:
     if which in ("auto", "local"):
         try:
             stt = FasterWhisperSTT(
-                model=_os.environ.get("STT_MODEL", "tiny.en"))
+                model=_os.environ.get("STT_MODEL", "tiny.en"),
+                language=voice_lang)
             if which == "local":
                 return stt
             import faster_whisper  # noqa: F401 — probe only
@@ -514,13 +769,18 @@ def tts_from_env() -> TTSProvider:
     """auto (default): local Piper when available, else mock.
     Values: auto | local | piper (=local) | nvidia | magpie (=nvidia) |
     edge (pre-existing cloud TTS) | mock. Piper stays the effective
-    default; hosted backends run ONLY when explicitly selected."""
+    default; hosted backends run ONLY when explicitly selected.
+    Language: ZARA_VOICE_LANG (validated BCP-47, default en-US) threads
+    into every backend; TTS_EDGE_VOICE overrides the Edge voice map."""
     import os as _os
     which = _os.environ.get("TTS_PROVIDER", "auto").strip().lower()
+    voice_lang = parse_voice_lang()
     if which == "mock":
         return MockTTS()
     if which == "edge":
-        return EdgeTTSProvider()
+        return EdgeTTSProvider(
+            voice=_os.environ.get("TTS_EDGE_VOICE", "").strip() or None,
+            language=voice_lang)
     if which in ("nvidia", "magpie"):
         from .tts_nvidia import MagpieTTS
         return MagpieTTS(
@@ -530,7 +790,8 @@ def tts_from_env() -> TTSProvider:
                 "TTS_NVIDIA_FUNCTION_ID",
                 "877104f7-e885-42b9-8de8-f6e4c6303969"),
             voice=_os.environ.get("TTS_NVIDIA_VOICE",
-                                  "Magpie-Multilingual.EN-US.Aria"))
+                                  "Magpie-Multilingual.EN-US.Aria"),
+            language=voice_lang)
     if which in ("auto", "local", "piper"):
         try:
             import os as _oo
@@ -539,7 +800,7 @@ def tts_from_env() -> TTSProvider:
             chosen = _os.environ.get("TTS_MODEL", "") or default
             if which in ("local", "piper") and not _oo.path.isfile(chosen):
                 raise RuntimeError(f"piper voice missing: {chosen}")
-            tts = PiperTTS(model_path=chosen)
+            tts = PiperTTS(model_path=chosen, language=voice_lang)
             if which in ("local", "piper"):
                 return tts
             import piper  # noqa: F401 — probe only
@@ -567,29 +828,41 @@ class VoicePipeline:
     the phone never becomes the execution authority."""
 
     def __init__(self, stt: STTProvider, tts: TTSProvider,
-                 loop, sessions) -> None:
+                 loop, sessions,
+                 language: str | None = None) -> None:
         self.stt = stt
         self.tts = tts
         self.loop = loop
         self.sessions = sessions
+        # Effective session language (validated BCP-47). Additive: existing
+        # 4-arg construction keeps working and resolves ZARA_VOICE_LANG.
+        self.language = parse_voice_lang(language) \
+            if language is not None else parse_voice_lang()
         self.states = VoiceStateMachine()
         self._speak_cancel = threading.Event()
 
     def handle_audio(self, audio: bytes, session_id: str = "",
                      device_id: str = "android-phone",
                      who: str = "user") -> dict:
+        import uuid as _uuid
+        # Pre-created turn id: voice turns join the same turn registry as
+        # text turns, so clients can cancel a running voice turn via
+        # POST /v1/talk/cancel and correlate streamed/text outcomes.
+        turn_id = _uuid.uuid4().hex
         self.states.move(VoiceState.LISTENING)
         self.states.move(VoiceState.TRANSCRIBING)
         try:
             transcript = self.stt.transcribe(audio)
         except Exception as e:  # noqa: BLE001
             self.states.move(VoiceState.ERROR)
-            return {"ok": False, "error": f"stt: {e}", "state": "error"}
+            return {"ok": False, "error": f"stt: {e}", "state": "error",
+                    "language": self.language, "turn_id": turn_id}
         self.states.move(VoiceState.THINKING)
         import time as _t
         _think_start = _t.monotonic()
         result = self.loop.handle_text(transcript, session_id=session_id,
-                                       device_id=device_id, who=who)
+                                       device_id=device_id, who=who,
+                                       turn_id=turn_id)
         loop_ms = int((_t.monotonic() - _think_start) * 1000)
         self.states.move(VoiceState.EXECUTING if result.tool
                          else VoiceState.SPEAKING)
@@ -602,6 +875,8 @@ class VoicePipeline:
         out = {"ok": True, "transcript": transcript, "reply": result.reply,
                "audio_bytes": len(audio_out), "status": result.status,
                "state": self.states.state.value,
+               "language": self.language,
+               "turn_id": getattr(result, "turn_id", "") or turn_id,
                "mission_id": result.mission_id,
                "execution_id": result.execution_id,
                "tool": result.tool, "device_id": result.device_id}
@@ -686,6 +961,9 @@ class VoiceConversation:
         self.pending_approval: str = ""
         self.ended = False
         self.end_reason = ""
+        # Per-turn effective language tags (mixed-language sessions keep
+        # one tag per executed turn, in order).
+        self.languages: list[str] = []
 
     def _check_bounds(self) -> tuple[bool, str]:
         if self.ended:
@@ -702,16 +980,25 @@ class VoiceConversation:
         return True, "ok"
 
     def turn(self, audio: bytes, session_id: str = "",
-             device_id: str = "local-voice", who: str = "user") -> dict:
+             device_id: str = "local-voice", who: str = "user",
+             language: str | None = None) -> dict:
         """One bounded turn. Returns the pipeline result plus conversation
-        metadata. Approval holds set pending_approval instead of ending."""
+        metadata. Approval holds set pending_approval instead of ending.
+        language: per-turn BCP-47 override (validated); defaults to the
+        pipeline's effective language. Every result carries `language` so
+        the UI can display it and mixed sessions keep per-turn tags."""
         allowed, reason = self._check_bounds()
         if not allowed:
             self.ended = True
             self.end_reason = reason
-            return {"ok": False, "ended": True, "reason": reason}
+            return {"ok": False, "ended": True, "reason": reason,
+                    "language": self.pipeline.language}
         out = self.pipeline.handle_audio(audio, session_id=session_id,
                                          device_id=device_id, who=who)
+        effective = parse_voice_lang(language) \
+            if language is not None else self.pipeline.language
+        out["language"] = effective
+        self.languages.append(effective)
         self.turns += 1
         self.last_activity = _time.time()
         out["turn"] = self.turns
@@ -742,7 +1029,8 @@ class VoiceConversation:
         self.pipeline.states.move(VoiceState.IDLE)
         return {"ok": True, "reply": res.reply,
                 "audio_bytes": len(audio_out),
-                "mission_id": res.mission_id}
+                "mission_id": res.mission_id,
+                "language": self.pipeline.language}
 
     def cancel(self) -> dict:
         out = self.pipeline.interrupt()

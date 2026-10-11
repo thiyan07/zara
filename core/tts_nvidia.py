@@ -47,12 +47,17 @@ class MagpieTTS(TTSProvider):
 
     def __init__(self, api_key: str = "", server: str = DEFAULT_SERVER,
                  function_id: str = DEFAULT_FUNCTION_ID,
-                 voice: str = DEFAULT_VOICE, timeout_s: float = 60.0) -> None:
+                 voice: str = DEFAULT_VOICE, timeout_s: float = 60.0,
+                 language: str = "en-US") -> None:
         self._explicit_key = api_key
         self.server = server
         self.function_id = function_id
         self.voice = voice
         self.timeout_s = timeout_s
+        # Threaded from ZARA_VOICE_LANG by tts_from_env (default en-US).
+        # No acoustic claim: the voice must support this language; a
+        # mismatched voice/language pair fails at the service, loudly.
+        self.language = language or "en-US"
         self._lock = threading.Lock()
         self._service = None
         self._active_call = None
@@ -117,7 +122,7 @@ class MagpieTTS(TTSProvider):
         except ImportError:
             raise MagpieError("nvidia-riva-client not installed")
         req = rtts.SynthesizeSpeechRequest(
-            text=text, language_code="en-US", sample_rate_hz=SAMPLE_RATE,
+            text=text, language_code=self.language, sample_rate_hz=SAMPLE_RATE,
             encoding=raudio.AudioEncoding.LINEAR_PCM, voice_name=self.voice)
         call = None
         try:
@@ -208,6 +213,7 @@ class MagpieTTS(TTSProvider):
             installed = False
         return {"backend": "magpie-nim", "model": "magpie_tts_ensemble-"
                 "Magpie-Multilingual", "voice": self.voice,
+                "language": self.language,
                 "offline": False, "installed": installed,
                 "key_configured": bool(self._explicit_key or
                                        os.environ.get("NVIDIA_TTS_API_KEY",

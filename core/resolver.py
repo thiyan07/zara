@@ -32,6 +32,44 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
+CONSTRAINT_ALLOWLIST = ("platform", "min_version", "risk_max", "online_only")
+
+
+def normalize_constraints(raw) -> dict:
+    """Close an untrusted constraints mapping to the 4-key model.
+
+    - None → {} (no constraints).
+    - ResolveConstraints → validated dump.
+    - dict → full model validation when clean; otherwise lenient
+      allowlist pick (known keys, correctly typed values only).
+    Unknown keys are stripped (never evaluated, never truth); mistyped
+    values are dropped so evaluation fail-closes downstream. Never raises.
+    """
+    from .models import ResolveConstraints
+    if raw is None:
+        return {}
+    if isinstance(raw, ResolveConstraints):
+        return raw.model_dump()
+    if isinstance(raw, dict):
+        try:
+            return ResolveConstraints(**raw).model_dump()
+        except Exception:  # noqa: BLE001 — lenient legacy path below
+            pass
+        out: dict = {}
+        try:
+            if isinstance(raw.get("platform"), str):
+                out["platform"] = raw["platform"][:64]
+            if isinstance(raw.get("min_version"), str):
+                out["min_version"] = raw["min_version"][:64]
+            if isinstance(raw.get("risk_max"), str):
+                out["risk_max"] = raw["risk_max"][:16]
+            if isinstance(raw.get("online_only"), bool):
+                out["online_only"] = raw["online_only"]
+        except Exception:  # noqa: BLE001 — fail closed to empty
+            return {}
+        return out
+    return {}
+
 _CAP_ID_RE = None  # lazy: reuse fabric's pattern to avoid duplication
 
 
@@ -365,21 +403,22 @@ class CapabilityResolver:
 
     def _rank_key(self, c: Candidate, pinned: str,
                   preferred: str, kind_order: dict) -> tuple:
+        # Data fetching stays here (battery lookup with unknown-last
+        # fallback); key assembly is canonical (core.scheduler).
         batt = -1.0
         try:
             v = self.fabric.device_view(c.device_id)
             batt = v.battery_pct if v.battery_pct is not None else -1.0
         except Exception:  # noqa: BLE001 — unknown battery sorts last
             pass
-        return (not c.authorized, not c.available,
-                not (pinned and c.device_id == pinned),
-                not (preferred and c.device_id == preferred),
-                _TRUST_RANK.get(c.trust, 9),
-                _PRESENCE_RANK.get(c.presence, 9),
-                kind_order.get(self._device_kind(c.device_id), 9),
-                -batt if batt is not None else 0.0,
-                tuple(-p for p in _version_key(c.version)),
-                c.device_id)
+        from .scheduler import resolver_rank_key
+        return resolver_rank_key(
+            c.authorized, c.available,
+            bool(pinned and c.device_id == pinned),
+            bool(preferred and c.device_id == preferred),
+            c.trust, c.presence, self._device_kind(c.device_id), batt,
+            tuple(_version_key(c.version)), c.device_id,
+            kind_ranks=kind_order)
 
     def _device_kind(self, device_id: str) -> str:
         try:
@@ -398,7 +437,7 @@ class CapabilityResolver:
         presence -> support -> availability -> constraints -> policy ->
         governor -> approval -> rank. Later stages never bypass earlier
         ones (each candidate carries its own authorize verdict)."""
-        constraints = dict(constraints or {})
+        constraints = normalize_constraints(constraints)
         if not _cap_id_ok(capability):
             return Resolution(
                 capability=capability, status="no_capability",
@@ -474,6 +513,57 @@ class CapabilityResolver:
             required_escalation=self._escalation_for(
                 capability, status),
             reason=top.reason[:300])
+
+    def explain_resolution(self, res: Resolution,
+                             constraints: Optional[dict] = None,
+                             request_id: str = "") -> dict:
+        """Build a bounded non-authoritative explanation from an already-
+        computed Resolution. Pure read of the object; never re-resolves,
+        never authorizes, never dispatches."""
+        from .scheduler import explain_decision
+        cands = []
+        for c in res.candidates:
+            try:
+                code = {
+                    "resolved": "eligible",
+                    "requires_approval": "policy-requires-approval",
+                    "governor_blocked": "governor-defer",
+                    "policy_blocked": "policy-deny",
+                    "offline": "presence-offline",
+                    "unavailable": "os-unusable",
+                    "unauthorized": "trust-ineligible",
+                }.get(c.status, "eligible" if c.authorized else "no-capability")
+            except Exception:  # noqa: BLE001 — closed fallback
+                code = "eligible"
+            cands.append({"device_id": c.device_id, "eligible": bool(
+                res.device_id == c.device_id),
+                "reason_code": code, "detail": str(
+                    getattr(c, "reason", ""))[:200]})
+        return explain_decision(
+            request_id=request_id, capability=res.capability,
+            constraints=normalize_constraints(constraints),
+            candidates=cands, selected=res.device_id,
+            tiebreak={"decided_by": "device_id-asc", "tied_with": []},
+            telemetry={}, approval_required=(
+                res.status == "requires_approval"))
+
+    def resolve_explained(self, capability: str, device_id: str = "",
+                          who: str = "user",
+                          constraints: Optional[dict] = None,
+                          preferred_device: str = "",
+                          allow_fallback: bool = True,
+                          request_id: str = "") -> tuple:
+        """Resolve + canonical explanation (read-only twin of resolve).
+
+        Runs the identical resolve() path, then builds a bounded
+        non-authoritative explanation from its outputs via
+        core.scheduler.explain_decision. Returns (Resolution, dict).
+        Explanation never alters the verdict. Used by the Governor v2
+        explainable path and shadow comparison.
+        """
+        res = self.resolve(capability, device_id, who, constraints,
+                           preferred_device, allow_fallback)
+        return res, self.explain_resolution(res, constraints, request_id)
 
     def _missing(self, capability: str, device_id: str, who: str,
                  allow_fallback: bool, depth: int, constraints: dict,
@@ -609,10 +699,7 @@ class CapabilityResolver:
         constraints: dict = {}
         raw_constraints = proposal.get("constraints", {})
         if isinstance(raw_constraints, dict):
-            for k in ("platform", "min_version", "risk_max",
-                      "online_only"):
-                if k in raw_constraints:
-                    constraints[k] = raw_constraints[k]
+            constraints = normalize_constraints(raw_constraints)
         preferred = proposal.get("preferred_device", "")
         if not isinstance(preferred, str):
             preferred = ""

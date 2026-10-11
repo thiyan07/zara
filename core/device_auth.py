@@ -59,6 +59,13 @@ class DeviceAuthStore:
             if device_id is None:
                 raise ValueError("invalid or expired pairing code")
             cred = self._creds[device_id]
+            if cred.revoked:
+                raise ValueError("device revoked")
+            # Task 9: the pairing window (PAIRING_TTL_S, set at enroll) is
+            # enforced — a stale code mints no key. Missing/malformed
+            # expiry fails closed (re-enroll is the recovery path).
+            if not cred.expires_at or cred.expires_at < utcnow().isoformat():
+                raise ValueError("pairing code expired")
             if cred.paired:
                 raise ValueError("pairing code already used")
             key = f"zara-dev-{secrets.token_urlsafe(24)}"
@@ -83,6 +90,11 @@ class DeviceAuthStore:
             if cred is None:
                 return False
             cred.revoked = True
+            # A revoked device must not mint a key from a pairing code
+            # issued before revocation: drop its pending entries so
+            # claim() cannot succeed without a fresh post-revoke enroll.
+            self._pending = {k: v for k, v in self._pending.items()
+                             if v != device_id}
             return True
 
     def rotate(self, device_id: str, old_key: str,

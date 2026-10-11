@@ -5,14 +5,18 @@ import uuid
 from typing import Optional
 from .models import Mission, MissionState, MissionStep, TERMINAL_MISSIONS, utcnow
 
-# Allowed transitions; terminal states are immutable.
+# Allowed transitions; terminal states are immutable. EXECUTING has an
+# explicit self-edge: one mission may execute several sequential tool
+# steps in a turn ("advance to next step"). It changes nothing else —
+# every tool is still independently routed, authorized, and approved.
 TRANSITIONS: dict[MissionState, set[MissionState]] = {
     MissionState.CREATED: {MissionState.PLANNING, MissionState.CANCELLED},
     MissionState.PLANNING: {MissionState.EXECUTING, MissionState.WAITING_FOR_PERMISSION,
                             MissionState.FAILED, MissionState.CANCELLED},
     MissionState.WAITING_FOR_PERMISSION: {MissionState.EXECUTING, MissionState.CANCELLED,
                                           MissionState.FAILED},
-    MissionState.EXECUTING: {MissionState.WAITING, MissionState.RETRYING,
+    MissionState.EXECUTING: {MissionState.EXECUTING, MissionState.WAITING,
+                             MissionState.RETRYING,
                              MissionState.VERIFYING, MissionState.COMPLETED,
                              MissionState.FAILED, MissionState.WAITING_FOR_PERMISSION,
                              MissionState.CANCELLED},

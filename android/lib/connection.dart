@@ -57,6 +57,18 @@ String newRequestId() {
   return 'req-${DateTime.now().microsecondsSinceEpoch}-$_reqSeq';
 }
 
+/// Idempotency key for execution submits: unique per user action (NOT
+/// derived from tool+inputs, so intentional repeats still run twice).
+/// The same key is reused across transport retries of one action, so
+/// Core collapses them into a single execution. Matches the server's
+/// [A-Za-z0-9_.:-]{1,128} envelope.
+String newIdempotencyKey(String tool) {
+  _reqSeq += 1;
+  final safe = tool.replaceAll(RegExp(r'[^A-Za-z0-9_.:-]'), '-');
+  final t = safe.length <= 40 ? safe : safe.substring(0, 40);
+  return 'z-$t-${DateTime.now().microsecondsSinceEpoch}-$_reqSeq';
+}
+
 /// A unit of offline-tolerant work. Heartbeats coalesce (only the newest
 /// is kept); everything else is FIFO up to [maxSize], then rejected.
 class PendingOp {

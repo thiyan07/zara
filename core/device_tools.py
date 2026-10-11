@@ -30,7 +30,15 @@ GUI_LAB_TARGETS = frozenset({
 
 def _def(name: str, desc: str, schema: dict, caps: list[str], cost: float,
          perm: PermissionLevel, risk: RiskLevel,
-         timeout: float = 20.0) -> ToolDefinition:
+         timeout: float = 90.0) -> ToolDefinition:
+    # Timing invariant: the proxy wait MUST exceed the worst-case device
+    # poll gap (Android ticks every 30 s healthy, 60 s battery-throttled,
+    # plus on-device execution + jitter). 20 s < 30 s expired healthy jobs
+    # before the device ever polled (Rung-3 forensic report); 90 s gives a
+    # healthy device >=2 poll opportunities and a throttled device >=1.
+    # Longer waits hold ~2 threads per in-flight exec; offline devices fail
+    # at this bound (never indefinite). Do NOT lower below 61 s without
+    # also shortening the Android tick — see docs/research/JOB_TIMING_FIX.md.
     return ToolDefinition(name=name, description=desc, input_schema=schema,
                           output_schema={"type": "object"},
                           required_capabilities=caps, permission=perm, risk=risk,
@@ -68,6 +76,17 @@ DEVICE_TOOL_DEFS: list[ToolDefinition] = [
          {"type": "object", "required": ["path"],
           "properties": {"path": {"type": "string"}}},
          ["filesystem.read"], 0.01, PermissionLevel.RESTRICTED, RiskLevel.SAFE),
+    _def("filesystem.write", "Write text file (device scratch dir)",
+         {"type": "object", "required": ["name", "text"],
+          "properties": {"name": {"type": "string"},
+                         "text": {"type": "string"}}},
+         ["filesystem.write"], 0.05,
+         PermissionLevel.CONFIRM, RiskLevel.CONFIRM),
+    _def("filesystem.delete", "Delete device scratch-dir file",
+         {"type": "object", "required": ["name"],
+          "properties": {"name": {"type": "string"}}},
+         ["filesystem.write"], 0.02,
+         PermissionLevel.CONFIRM, RiskLevel.CONFIRM),
     _def("shell.safe_readonly", "Allowlisted read-only commands on device",
          {"type": "object", "required": ["command"],
           "properties": {"command": {"type": "string"}}},

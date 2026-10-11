@@ -20,7 +20,14 @@ class DeviceManager:
 
     def heartbeat(self, device_id: str, battery_pct: float | None = None,
                   charging: bool | None = None, network: str | None = None,
-                  online: bool = True) -> DeviceState:
+                  online: bool = True,
+                  cpu_pct: float | None = None,
+                  mem_pct: float | None = None,
+                  low_power_mode: bool | None = None,
+                  storage_free_mb: int | None = None,
+                  storage_total_mb: int | None = None,
+                  battery_temp_c: float | None = None,
+                  thermal_state: str | None = None) -> DeviceState:
         with self._lock:
             d = self._devices[device_id]
             was_online = d.online
@@ -31,12 +38,93 @@ class DeviceManager:
                 self._emit("battery_changed", device_id, {"battery_pct": battery_pct})
             if charging is not None:
                 d.charging = charging
-            if network is not None and network != d.network:
-                d.network = network
-                self._emit("network_changed", device_id, {"network": network})
+            if network is not None:
+                # Normalize form (case/whitespace/length) without inventing
+                # semantics: governor still matches exact known values.
+                network = str(network).strip().lower()[:32] or "unknown"
+                if network != d.network:
+                    d.network = network
+                    self._emit("network_changed", device_id, {"network": network})
+            telemetry_seen = False
+            # Second-layer clamp (defense in depth for non-HTTP writers):
+            # mirrors HeartbeatPayload bounds so direct heartbeat() callers
+            # get identical guarantees. Out-of-range values are dropped
+            # (field stays at its old value), never stored, never crash.
+            def _pct(v):
+                try:
+                    if isinstance(v, bool):
+                        return None
+                    f = float(v)
+                    if f != f or f in (float("inf"), float("-inf")):
+                        return None
+                    return f if 0.0 <= f <= 100.0 else None
+                except (TypeError, ValueError):
+                    return None
+
+            def _sint(v, cap=10**7):
+                try:
+                    if isinstance(v, bool):
+                        return None
+                    i = int(v)
+                    return i if 0 <= i <= cap else None
+                except (TypeError, ValueError):
+                    return None
+
+            def _temp(v):
+                try:
+                    if isinstance(v, bool):
+                        return None
+                    f = float(v)
+                    if f != f or f in (float("inf"), float("-inf")):
+                        return None
+                    return f if -50.0 <= f <= 100.0 else None
+                except (TypeError, ValueError):
+                    return None
+
+            _thermal = (thermal_state[:16]
+                        if isinstance(thermal_state, str) else None)
+            if _thermal is not None and _thermal not in (
+                    "none", "light", "moderate", "severe", "critical",
+                    "emergency", "shutdown", "unknown"):
+                _thermal = None
+            _free = _sint(storage_free_mb)
+            _total = _sint(storage_total_mb)
+            if _free is not None and _total is not None \
+                    and _free > _total:
+                # Impossible combination: unverifiable, drop both rather
+                # than clamp (never invent a consistent pair).
+                _free = _total = None
+            for _field, _value in (
+                    ("cpu_pct", _pct(cpu_pct)), ("mem_pct", _pct(mem_pct)),
+                    ("low_power_mode", low_power_mode
+                     if isinstance(low_power_mode, bool) else None),
+                    ("storage_free_mb", _free),
+                    ("storage_total_mb", _total),
+                    ("battery_temp_c", _temp(battery_temp_c)),
+                    ("thermal_state", _thermal)):
+                if _value is not None:
+                    setattr(d, _field, _value)
+                    telemetry_seen = True
+            if telemetry_seen:
+                d.last_telemetry_at = utcnow()
             if online != was_online:
                 self._emit("device_online" if online else "device_offline", device_id, {})
             return d
+
+    def telemetry_stale(self, device_id: str,
+                        threshold_s: float = 120.0) -> bool:
+        """True when no telemetry-bearing heartbeat arrived within the
+        threshold (or never). Stale telemetry stays readable but must be
+        treated as unknown by readers — never as live, never as zero."""
+        with self._lock:
+            d = self._devices.get(device_id)
+            if d is None or d.last_telemetry_at is None:
+                return True
+            try:
+                age = (utcnow() - d.last_telemetry_at).total_seconds()
+            except Exception:
+                return True
+            return age > threshold_s
 
     def revoke(self, device_id: str) -> None:
         with self._lock:
@@ -84,6 +172,16 @@ class DeviceManager:
     def get(self, device_id: str) -> DeviceState:
         return self._devices[device_id]
 
+    def snapshot(self, device_id: str) -> DeviceState:
+        """Atomic copy-out for snapshot readers. Deep-copies under the
+        manager lock — never the live registry object — so multi-field
+        readers (views, snapshot builders) cannot observe torn
+        half-heartbeats and iteration cannot race revoke. Writers already
+        serialize on this lock; no new lock introduced. get()/list() are
+        left untouched for backward compatibility."""
+        with self._lock:
+            return self._devices[device_id].model_copy(deep=True)
+
     def list(self) -> list[DeviceState]:
         return list(self._devices.values())
 
@@ -97,8 +195,10 @@ class DeviceManager:
         cands = [d for d in cands if all(c in d.capabilities for c in capabilities)]
         if not cands:
             return None
-        order = {DeviceKind.CLOUD: 0, DeviceKind.LINUX: 1, DeviceKind.ANDROID: 2}
-        cands.sort(key=lambda d: (order.get(d.kind, 9), d.device_id))
+        # Canonical kind-device key (core.scheduler); identical order
+        # (DeviceKind is a str Enum, so mapping is value-identical).
+        from .scheduler import kind_device_key
+        cands.sort(key=lambda d: kind_device_key(d.kind, d.device_id))
         return cands[0]
 
     def _emit(self, type: str, device_id: str, payload: dict) -> None:

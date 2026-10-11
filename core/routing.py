@@ -7,7 +7,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 from .devices import DeviceManager
-from .governor import ResourceGovernor, ResourceSnapshot
+from .governor import (ResourceGovernor, ResourceSnapshot,
+                         canonical_snapshot)
 from .models import DeviceState
 from .policy import PolicyEngine
 from .tools import ToolRegistry
@@ -45,9 +46,11 @@ class Router:
                       if all(c in d.capabilities for c in required)]
         if not candidates:
             return self._route_local(tool, definition, who, required)
-        # Battery-first order: cloud, linux, android.
-        order = {"cloud": 0, "linux": 1, "android": 2}
-        candidates.sort(key=lambda d: (order.get(d.kind.value, 9), d.device_id))
+        # Battery-first order: cloud, linux, android. Key assembly is
+        # canonical (core.scheduler.kind_device_key — identical map).
+        from .scheduler import kind_device_key
+        candidates.sort(key=lambda d: kind_device_key(
+            d.kind.value, d.device_id))
         policy_blocked = False
         hard_refused = False
         constrained = False
@@ -64,11 +67,17 @@ class Router:
                     continue
                 # confirm/high-risk hold: still routable — execution waits
                 # for approval and runs only after a human approves.
-            snap = ResourceSnapshot(
+            snap = canonical_snapshot(
                 battery_pct=dev.battery_pct, charging=dev.charging,
-                network=dev.network, device_kind=dev.kind.value)
+                network=dev.network, device_kind=dev.kind.value,
+                low_power_mode=dev.low_power_mode,
+                cpu_pct=dev.cpu_pct, mem_pct=dev.mem_pct,
+                storage_free_mb=dev.storage_free_mb,
+                battery_temp_c=dev.battery_temp_c,
+                thermal_state=dev.thermal_state)
             gate = self.governor.check(snap, definition.estimated_cost,
-                                       definition.risk.value)
+                                       definition.risk.value,
+                                       demands=definition.resource_demands)
             if gate.action == "defer":
                 constrained = True
                 continue
@@ -110,7 +119,7 @@ class Router:
                 None, "deny",
                 f"policy hold for {tool}: explicit approval required")
         # Confirm/high-risk holds stay routable — execution waits for approval.
-        gate = self.governor.check(ResourceSnapshot(),
+        gate = self.governor.check(canonical_snapshot(),
                                    definition.estimated_cost,
                                    definition.risk.value)
         if gate.action != "proceed":

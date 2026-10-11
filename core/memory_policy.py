@@ -88,10 +88,15 @@ class MemoryService:
         return {"stored": stored is not None, "decision": decision.value,
                 "reason": reason, "id": stored.id if stored else None}
 
-    def confirm_candidate(self, candidate_id: str) -> dict:
+    def confirm_candidate(self, candidate_id: str, ok: bool = True) -> dict:
+        """Consent gate for pending candidates. ok=True stores via the
+        consider-path (store.remember); ok=False drops it from pending.
+        Default True preserves the accept-only call shape."""
         item = self.pending_candidates.pop(candidate_id, None)
         if item is None:
             return {"stored": False, "reason": "unknown candidate"}
+        if not ok:
+            return {"stored": False, "reason": "candidate rejected"}
         stored = self.store.remember(item)
         return {"stored": stored is not None,
                 "id": stored.id if stored else None}

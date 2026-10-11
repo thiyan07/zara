@@ -25,10 +25,25 @@ class DeviceMessage(BaseModel):
 
 
 class HeartbeatPayload(BaseModel):
-    battery_pct: float | None = Field(default=None, ge=0, le=100)
+    battery_pct: float | None = Field(default=None, ge=0, le=100,
+                                      allow_inf_nan=False)
     charging: bool = False
     network: str = "unknown"
     online: bool = True
+    # Resource telemetry (all optional → old clients unaffected; unknown
+    # keys ignored by pydantic default). None = unknown/unreported, never
+    # zero-as-healthy. Validated bounds; allow_inf_nan=False rejects
+    # NaN/Infinity (NaN comparisons would otherwise fail-open).
+    cpu_pct: float | None = Field(default=None, ge=0, le=100,
+                                  allow_inf_nan=False)
+    mem_pct: float | None = Field(default=None, ge=0, le=100,
+                                  allow_inf_nan=False)
+    low_power_mode: bool | None = None
+    storage_free_mb: int | None = Field(default=None, ge=0, le=10**7)
+    storage_total_mb: int | None = Field(default=None, ge=0, le=10**7)
+    battery_temp_c: float | None = Field(default=None, ge=-50, le=100,
+                                         allow_inf_nan=False)
+    thermal_state: str | None = Field(default=None, max_length=16)
 
 
 class CapabilityUpdate(BaseModel):

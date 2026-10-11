@@ -14,11 +14,26 @@ SECRET_LEAK = [re.compile(p, re.I) for p in
                 r"sk-proj-[A-Za-z0-9_\-]{8,}", r"gsk_[A-Za-z0-9]{10,}",
                 r"\bsk-[A-Za-z0-9]{20,}", r"xox[bpas]-[A-Za-z0-9\-]+")]
 
+# Natural phrasing ("my api-key is X", "password = Y"): redact the VALUE
+# only, keep the surrounding words. Tight by design — requires the marker
+# plus an explicit is/:/= introducer so ordinary words ("token expired",
+# "password reset steps") are untouched. History safety slightly favors
+# over-redaction of genuinely introduced values.
+SECRET_VALUE_LEAK = [(re.compile(p, re.I), r"\1\2\3[REDACTED]")
+                      for p in
+                      (r"(\bapi[ _-]?key|\bpassword|\bpasswd|\bprivate[ _-]?key|"
+                       r"\bcredential|\bsecret)(\s+)(is\s+|:|=)\s*"
+                       r"([^\s,;\"']+)",
+                       r"(\btoken)(\s*)(is\s+|:|=)\s*"
+                       r"([A-Za-z0-9_\-\.]{6,})")]
+
 
 def redact(text: str) -> str:
     out = str(text)
     for p in SECRET_LEAK:
         out = p.sub("[REDACTED]", out)
+    for p, repl in SECRET_VALUE_LEAK:
+        out = p.sub(repl, out)
     return out[:2000]
 
 

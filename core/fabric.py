@@ -286,6 +286,15 @@ class FabricDeviceView:
     charging: bool = False
     network: str = "unknown"
     last_seen: str = ""
+    # Telemetry observation (nullable; None = unknown). Never authority.
+    cpu_pct: Optional[float] = None
+    mem_pct: Optional[float] = None
+    low_power_mode: Optional[bool] = None
+    storage_free_mb: Optional[int] = None
+    storage_total_mb: Optional[int] = None
+    battery_temp_c: Optional[float] = None
+    thermal_state: Optional[str] = None
+    last_telemetry_at: str = ""
 
     def as_dict(self) -> dict:
         return {"device_id": self.device_id, "device_type": self.device_type,
@@ -294,7 +303,14 @@ class FabricDeviceView:
                 "presence": self.presence,
                 "capabilities": list(self.capabilities),
                 "battery_pct": self.battery_pct, "charging": self.charging,
-                "network": self.network, "last_seen": self.last_seen}
+                "network": self.network, "last_seen": self.last_seen,
+                "cpu_pct": self.cpu_pct, "mem_pct": self.mem_pct,
+                "low_power_mode": self.low_power_mode,
+                "storage_free_mb": self.storage_free_mb,
+                "storage_total_mb": self.storage_total_mb,
+                "battery_temp_c": self.battery_temp_c,
+                "thermal_state": self.thermal_state,
+                "last_telemetry_at": self.last_telemetry_at}
 
 
 @dataclass
@@ -904,7 +920,7 @@ class FabricRegistry:
     def device_view(self, device_id: str) -> FabricDeviceView:
         meta = self._meta.get(device_id, {})
         try:
-            d = self.devices.get(device_id)
+            d = self.devices.snapshot(device_id)
             caps = sorted({r.name for r in self.capabilities_for(device_id)})
             return FabricDeviceView(
                 device_id=device_id,
@@ -916,6 +932,16 @@ class FabricRegistry:
                 presence=self.presence_of(device_id),
                 capabilities=caps, battery_pct=d.battery_pct,
                 charging=d.charging, network=d.network,
+                cpu_pct=d.cpu_pct, mem_pct=d.mem_pct,
+                low_power_mode=d.low_power_mode,
+                storage_free_mb=d.storage_free_mb,
+                storage_total_mb=d.storage_total_mb,
+                battery_temp_c=d.battery_temp_c,
+                thermal_state=d.thermal_state,
+                last_telemetry_at=d.last_telemetry_at.isoformat()
+                if getattr(d, "last_telemetry_at", None) is not None
+                and hasattr(d.last_telemetry_at, "isoformat")
+                else "",
                 last_seen=d.last_seen.isoformat()
                 if hasattr(d.last_seen, "isoformat") else str(d.last_seen))
         except Exception:  # noqa: BLE001 — known to fabric, not manager
@@ -940,14 +966,56 @@ class FabricRegistry:
 
     # ----- authorization + routing -----
 
-    def _snapshot_for(self, device_id: str):
-        from .governor import ResourceSnapshot
+    def _demands_for(self, tool_name: str):
+        """Resource demands for a tool name, or None when unresolvable.
+
+        Capability ids share the tool namespace for device tools; unknown
+        names yield None (= legacy behavior, no demand gate). Never raises.
+        """
         try:
-            d = self.devices.get(device_id)
-            return ResourceSnapshot(
+            return self.registry.get(tool_name).resource_demands
+        except Exception:  # noqa: BLE001 — unknown tool, legacy path
+            return None
+
+    def _snapshot_for(self, device_id: str):
+        # Compatibility wrapper: delegates to the canonical provider.
+        return self.resource_snapshot(device_id)
+
+    def resource_snapshot(self, device_id: str):
+        """CANONICAL ResourceSnapshot read. The single funnel every
+        consumer (authorize, execute, transfer, routing, app exec paths)
+        must use instead of hand-building snapshots. Built from one
+        atomic DeviceState copy; unknown/missing devices yield the bare
+        default (fail-open to unknown, never crash). Snapshot ≠
+        authorization: governors/consumers still decide from it.
+
+        Stale telemetry (no telemetry-bearing heartbeat within the
+        threshold) is nulled at build: stale reads as unknown, never as
+        live. Battery/charging/network keep legacy presence-adjacent
+        behavior (presence owns their freshness); the seven telemetry
+        fields do not.
+        """
+        from .governor import ResourceSnapshot, canonical_snapshot
+        try:
+            d = self.devices.snapshot(device_id)
+            try:
+                stale = self.devices.telemetry_stale(device_id)
+            except Exception:  # noqa: BLE001 — fail open to live values
+                stale = False
+            if stale:
+                lp = cpu = mem = sfree = stotal = btemp = therm = None
+            else:
+                lp, cpu, mem = d.low_power_mode, d.cpu_pct, d.mem_pct
+                sfree, stotal = d.storage_free_mb, d.storage_total_mb
+                btemp, therm = d.battery_temp_c, d.thermal_state
+            return canonical_snapshot(
                 battery_pct=d.battery_pct, charging=d.charging,
                 network=d.network,
-                device_kind=_kind_of(self.device_view(device_id).device_type))
+                device_kind=_kind_of(self.device_view(device_id).device_type),
+                low_power_mode=lp,
+                cpu_pct=cpu, mem_pct=mem,
+                storage_free_mb=sfree, storage_total_mb=stotal,
+                battery_temp_c=btemp, thermal_state=therm)
         except Exception:  # noqa: BLE001
             from .governor import ResourceSnapshot
             return ResourceSnapshot()
@@ -1005,9 +1073,32 @@ class FabricRegistry:
                     else "policy hold: approval required", "checks": checks,
                     "approval_required": pol.requires_approval,
                     "hard_deny": pol.hard_deny}
+        snap = self._snapshot_for(device_id)
         gate = self.governor.check(
-            self._snapshot_for(device_id),
-            _RISK_COST.get(rec.risk.value, 0.3), rec.risk.value)
+            snap,
+            _RISK_COST.get(rec.risk.value, 0.3), rec.risk.value,
+            demands=self._demands_for(rec.name))
+        checks["governor"] = gate.action
+        # Shadow comparison (read-only, never alters the verdict): when
+        # enabled, evaluate the v2 policy boundary on the same snapshot
+        # and audit divergences only. Exceptions are swallowed.
+        try:
+            from .governor import governor_shadow_enabled, evaluate_policy
+            if governor_shadow_enabled():
+                pv = evaluate_policy(
+                    snap, self._demands_for(rec.name),
+                    estimated_cost=_RISK_COST.get(rec.risk.value, 0.3),
+                    risk=rec.risk.value)
+                legacy = "deferred" if gate.action == "defer" else \
+                    "proceed" if gate.action == "proceed" else "reroute"
+                v2 = {"eligible": "proceed", "deferred": "deferred",
+                      "rejected": "deny"}.get(pv.state, pv.state)
+                if legacy != v2:
+                    self._audit("shadow_divergence", device_id,
+                                f"{rec.name} legacy={legacy} v2={v2} "
+                                f"{pv.reason_code}"[:200])
+        except Exception:  # noqa: BLE001 — shadow never breaks authorize
+            pass
         checks["governor"] = gate.action
         if gate.action == "defer":
             return {"authorized": False,
@@ -1109,9 +1200,11 @@ class FabricRegistry:
 
     @staticmethod
     def _rank(view: FabricDeviceView) -> tuple:
+        # Battery lookup stays (test-pinned source shape); key assembly
+        # is canonical (core.scheduler). Tiebreak stays with the caller.
         batt = view.battery_pct if view.battery_pct is not None else -1.0
-        return (_KIND_ORDER.get(view.device_type, 9),
-                0 if view.presence == "online" else 1, -batt)
+        from .scheduler import fabric_rank_key
+        return fabric_rank_key(view.device_type, view.presence, batt)
 
     # ----- temporary grants -----
 
@@ -1240,7 +1333,8 @@ class FabricRegistry:
         from .governor import ResourceSnapshot
         gate = self.governor.check(
             self._snapshot_for(device_id), definition.estimated_cost,
-            definition.risk.value)
+            definition.risk.value,
+            demands=definition.resource_demands)
         if gate.action == "defer":
             return {"stage": "deferred", "reason": gate.reason}
         try:

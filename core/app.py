@@ -1,9 +1,13 @@
 """FastAPI gateway: REST + WebSocket. Device-token gate (Stage 2: per-device auth)."""
 from __future__ import annotations
 import os
+import queue
+import threading
+import time
 from typing import Optional
 from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field, field_validator
 
 from .audit import AuditLog
 from .builtin_tools import BUILTINS
@@ -11,11 +15,15 @@ from .context import ContextManager
 from .conversation import ConversationLoop
 from .device_auth import DeviceAuthStore
 from .device_tools import register_device_proxies
+from .talk_stream import format_event
 from .devices import DeviceManager
 from .events import EventBus
 from .execution import ExecutionEngine, PolicyDenied
-from .governor import ResourceGovernor, ResourceSnapshot
-from .jobs import JobQueue
+from .governor import (ResourceGovernor, ResourceSnapshot,
+                         evaluate_policy, governor_shadow_enabled,
+                         governor_v2_enabled)
+from .jobs import JOB_ERROR_MAX_CHARS, JOB_RESULT_MAX_BYTES, JobQueue
+from .llm import LLMError, LLMErrorKind
 from .memory import MemoryStore, PersistentMemoryStore
 from .memory_policy import MemoryService
 from .missions import MissionEngine, MissionState
@@ -48,6 +56,28 @@ class ExecIn(BaseModel):
     inputs: dict = {}
     device_id: str = "cloud"
     mission_id: Optional[str] = None
+
+
+class ExecutionSubmitIn(BaseModel):
+    tool: str
+    inputs: dict = {}
+    device_id: str = "cloud"
+    mission_id: Optional[str] = None
+    who: str = "user"
+    idempotency_key: str = ""
+
+
+class ExecutionResolveIn(BaseModel):
+    capability: str
+    inputs: dict = {}
+    device_id: str = ""
+    constraints: Optional[dict] = None
+    preferred_device: str = ""
+    allow_fallback: bool = True
+    who: str = "user"
+    mission_id: Optional[str] = None
+    idempotency_key: str = ""
+    explain: bool = False
 
 
 # ---- Stage 14: Device Fabric request models (module level: FastAPI
@@ -178,7 +208,23 @@ class JobResultIn(BaseModel):
     job_id: str
     ok: bool
     result: dict = {}
-    error: str = ""
+    error: str = Field(default="", max_length=JOB_ERROR_MAX_CHARS)
+
+    @field_validator("result")
+    @classmethod
+    def _bound_result(cls, v: dict) -> dict:
+        # Task 9 (T3): mirror JobQueue.complete's ingest bound at the HTTP
+        # boundary (422, fail-closed). Served verbatim on status polls, so
+        # oversize payloads are rejected, never stored, never truncated.
+        import json as _json
+        try:
+            size = len(_json.dumps(v))
+        except Exception:  # noqa: BLE001 — unserializable is invalid
+            raise ValueError("result not serializable")
+        if size > JOB_RESULT_MAX_BYTES:
+            raise ValueError(
+                f"result exceeds {JOB_RESULT_MAX_BYTES} bytes")
+        return v
 
 
 class NotifAckIn(BaseModel):
@@ -199,6 +245,10 @@ class TalkIn(BaseModel):
     session_id: str = ""
     device_id: str = "cloud"
     who: str = "user"
+
+
+class TalkCancelIn(BaseModel):
+    turn_id: str
 
 
 class ResumeIn(BaseModel):
@@ -232,6 +282,11 @@ class MemoryCorrectIn(BaseModel):
     old_query: str
     new_text: str
 
+
+class MemoryConfirmIn(BaseModel):
+    candidate_id: str
+    ok: bool = True
+
 def _make_embedder():
     from .memory import EmbeddingProvider, LocalEmbeddingProvider
     if os.environ.get("ZARA_EMBEDDINGS", "hash").strip().lower() == "local":
@@ -264,7 +319,8 @@ def build_stack(memory_db: str = "", audit_db: str = ":memory:",
     events_log: list[dict] = []
     bus.subscribe("*", lambda ev: events_log.append(ev.model_dump()))
     engine = ExecutionEngine(registry, policy,
-                             on_event=lambda t, p: bus.publish(t, source="execution", payload=p))
+                             on_event=lambda t, p: bus.publish(t, source="execution", payload=p),
+                             jobs=jobs)
     missions = MissionEngine(on_event=lambda t, p: bus.publish(t, source="missions", payload=p))
     if mission_db:
         from .missions import PersistentMissionEngine as _PME
@@ -284,7 +340,8 @@ def build_stack(memory_db: str = "", audit_db: str = ":memory:",
     gov = ResourceGovernor()
     model = provider_from_env()
     router = Router(devices, registry, policy, gov)
-    sessions = SessionStore()
+    sessions = SessionStore(
+        db_path=os.environ.get("ZARA_CHAT_DB", ""))
     tracer = Tracer()
     loop = ConversationLoop(provider=model, ctx=ctx, memory=memory_service,
                             registry=registry, policy=policy, engine=engine,
@@ -347,6 +404,72 @@ def build_stack(memory_db: str = "", audit_db: str = ":memory:",
     # (orchestrates authorize/route; owns no authority itself).
     from .resolver import CapabilityResolver
     resolver = CapabilityResolver(fabric)
+    # Resolver→async binding + approval re-confirmation (Part A/B):
+    # re-derive trust/presence/policy/capability freshness at approve
+    # time and pre-dispatch for HIGH_RISK tools. Fail-closed: any check
+    # failing denies the execution; success never grants by itself.
+    def _engine_revalidate(rec):
+        try:
+            from .fabric import EXECUTABLE_TRUST
+            # Device legs apply only to device-dispatched tools
+            # (supported_devices ["linux","android"], never ["any"]).
+            # Local tools (conversation/session/talk flows, device "cloud",
+            # "", "local-core", …) skip them; policy + tool-exists below
+            # still apply. Any other unknown device with a device tool
+            # fails closed at trust (no arbitrary-device submit).
+            try:
+                _dev_tool = registry.get(rec.tool)
+                _needs_device = "any" not in list(
+                    _dev_tool.supported_devices or [])
+            except Exception:
+                _needs_device = True
+            if _needs_device:
+                trust = fabric.trust_of(rec.device_id)
+                if trust not in EXECUTABLE_TRUST:
+                    return (False, f"device trust {trust} not executable")
+                presence = fabric.presence_of(rec.device_id)
+                if presence in ("offline", "unknown", "stale"):
+                    return (False, f"device presence {presence}")
+                cap = rec.capability or rec.tool
+                verdict = fabric.authorize_capability(cap, rec.device_id)
+                if not verdict.get("authorized", False):
+                    return (False,
+                            f"capability unauthorized: "
+                            f"{verdict.get('reason', '?')}"[:200])
+                # Descriptor staleness: a re-registered-without-describe
+                # snapshot must not authorize fresh dispatches.
+                try:
+                    required = list(registry.get(rec.tool).required_capabilities
+                                    or [])
+                except Exception:
+                    required = []
+                try:
+                    descs = {c.name: c for c in fabric.capabilities_for(
+                        rec.device_id)}
+                except Exception:
+                    descs = {}
+                for need in required:
+                    d = descs.get(need)
+                    if d is not None and getattr(d, "stale", False):
+                        return (False,
+                                f"capability snapshot stale: {need}")
+            try:
+                definition = registry.get(rec.tool)
+                risk = definition.risk
+            except KeyError:
+                return (False, "tool withdrawn from registry")
+            decision = policy.decide(
+                "user", capability=f"tool:{rec.tool}",
+                device_id=rec.device_id, resource=rec.tool, risk=risk,
+                context={"command": str(rec.inputs)})
+            if decision.hard_deny or (not decision.allow
+                                      and not decision.requires_approval):
+                return (False,
+                        f"policy now denies: {decision.reason}"[:200])
+            return (True, "revalidated")
+        except Exception as e:
+            return (False, f"revalidate error: {e}"[:200])
+    engine.set_revalidate(_engine_revalidate)
     # Stage 18: natural-language intent service (proposal only; the
     # resolver + policy/governor/execution stay authoritative). Hosted
     # parsing is enabled only when a real provider is configured —
@@ -401,7 +524,6 @@ def create_app(stack=None) -> FastAPI:
         allowed, retry_after = s["limits"][bucket].check(
             f"{bucket}:{client}")
         if not allowed:
-            from fastapi.responses import JSONResponse
             return JSONResponse(status_code=429,
                                 content={"detail": "rate limited",
                                          "retry_after_s": round(retry_after, 1)})
@@ -434,7 +556,9 @@ def create_app(stack=None) -> FastAPI:
         checks["provider"] = s["model"].name
         return {"ready": all(v is True or isinstance(v, str)
                              for v in checks.values()),
-                "checks": checks}
+                "checks": checks,
+                "governor_v2": governor_v2_enabled(),
+                "governor_shadow": governor_shadow_enabled()}
 
     @app.post("/v1/chat")
     def chat(body: ChatIn, _=Depends(auth)):
@@ -443,7 +567,12 @@ def create_app(stack=None) -> FastAPI:
         hits = s["memory"].recall(body.text, top_k=3)
         bundle = s["ctx"].bundle(memories=[h[0] for h in hits])
         prompt = s["ctx"].build_prompt(bundle, body.text)
-        resp = s["model"].complete(prompt)
+        try:
+            resp = s["model"].complete(prompt)
+        except LLMError as e:
+            # Propose-only path fails safe (never a 500 with raw internals).
+            raise HTTPException(status_code=502,
+                                detail=f"provider {e.kind.value}: unavailable")
         s["ctx"].add_turn("assistant", resp.text)
         s["bus"].publish("user_message", source="api",
                          payload={"text": body.text[:500]})
@@ -457,12 +586,15 @@ def create_app(stack=None) -> FastAPI:
             dev = s["devices"].get(body.device_id)
         except KeyError:
             dev = None
-        snap = ResourceSnapshot(
-            battery_pct=getattr(dev, "battery_pct", None),
-            charging=getattr(dev, "charging", False),
-            network=getattr(dev, "network", "unknown"),
-            device_kind=getattr(getattr(dev, "kind", "cloud"), "value", "cloud"))
-        gate = s["gov"].check(snap, tool.estimated_cost, tool.risk.value)
+        # Canonical provider: one snapshot source for every exec path.
+        # Unknown devices yield the bare default (fail-open to unknown).
+        try:
+            _did = dev.device_id
+        except AttributeError:
+            _did = body.device_id
+        snap = s["fabric"].resource_snapshot(_did)
+        gate = s["gov"].check(snap, tool.estimated_cost, tool.risk.value,
+                               demands=tool.resource_demands)
         if gate.action == "defer":
             return {"status": "deferred", "reason": gate.reason}
         try:
@@ -472,14 +604,204 @@ def create_app(stack=None) -> FastAPI:
             # Hard-deny must be a truthful 403, never an unhandled 500.
             s["audit"].record("api", "exec_deny", body.tool, str(e)[:300])
             raise HTTPException(status_code=403, detail=str(e)[:300])
+        except ValueError as e:
+            # Task 9: input-envelope rejection (oversize/unserializable
+            # inputs are refused before any record exists) is a 422, never
+            # a 500 and never a retained record.
+            s["audit"].record("api", "exec_reject", body.tool, str(e)[:300])
+            raise HTTPException(status_code=422, detail=str(e)[:300])
         s["audit"].record("api", "exec", body.tool, rec.state.value)
         return {"id": rec.id, "status": rec.state.value, "result": rec.result,
                 "error": rec.error, "verified": rec.verified}
 
     @app.post("/v1/exec/{exec_id}/approve")
     def approve_exec(exec_id: str, _=Depends(auth)):
-        rec = s["engine"].approve(exec_id)
+        try:
+            rec = s["engine"].approve(exec_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="unknown execution")
+        except ValueError as e:
+            raise HTTPException(status_code=409, detail=str(e)[:300])
         return {"id": rec.id, "status": rec.state.value, "result": rec.result}
+
+    def _execution_view(rec, jobs) -> dict:
+        """Status envelope for async polling: record fields safe to expose
+        (auth/grant internals never leave Core) plus a read-time job join.
+        Result content is untrusted device data, never authority."""
+        job = jobs.get_by_execution(rec.id)
+        # Binding summary echoed for resolver-driven callers. The approval
+        # fingerprint itself is integrity material and never exposed.
+        binding = dict(rec.binding or {})
+        summary = {k: binding.get(k) for k in (
+            "resolution_status", "fallback_used", "substituted")
+            if k in binding}
+        return {"id": rec.id, "tool": rec.tool, "device_id": rec.device_id,
+                "mission_id": rec.mission_id, "status": rec.state.value,
+                "capability": rec.capability, "binding": summary,
+                "job_id": job.id if job is not None else None,
+                "job_state": job.state if job is not None else None,
+                "result": rec.result, "error": rec.error,
+                "verified": rec.verified,
+                "approval_required": rec.state.value == "waiting_for_permission",
+                "cancel_requested": rec.cancel_requested, "attempt": rec.attempt,
+                "requested_at": rec.requested_at.isoformat(),
+                "started_at": rec.started_at.isoformat()
+                if rec.started_at else None,
+                "ended_at": rec.ended_at.isoformat() if rec.ended_at else None}
+
+    @app.post("/v1/executions", status_code=201)
+    def create_execution(body: ExecutionSubmitIn, _=Depends(auth)):
+        """Async submit: same gates as /v1/exec, but RUNNING records execute
+        on a daemon thread and the id returns immediately (201 running,
+        202 parked-for-approval). Poll GET for completion."""
+        try:
+            tool = s["registry"].get(body.tool)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="unknown tool")
+        try:
+            dev = s["devices"].get(body.device_id)
+        except KeyError:
+            dev = None
+        # Canonical provider: one snapshot source for every exec path.
+        # Unknown devices yield the bare default (fail-open to unknown).
+        try:
+            _did = dev.device_id
+        except AttributeError:
+            _did = body.device_id
+        snap = s["fabric"].resource_snapshot(_did)
+        gate = s["gov"].check(snap, tool.estimated_cost, tool.risk.value,
+                               demands=tool.resource_demands)
+        if gate.action == "defer":
+            return {"status": "deferred", "reason": gate.reason}
+        try:
+            rec = s["engine"].submit_async_idem(
+                body.tool, body.inputs, body.device_id, who=body.who,
+                mission_id=body.mission_id,
+                idempotency_key=body.idempotency_key)
+        except PolicyDenied as e:
+            s["audit"].record("api", "exec_deny", body.tool, str(e)[:300])
+            raise HTTPException(status_code=403, detail=str(e)[:300])
+        except ValueError as e:
+            # Task 9: input-envelope rejection before any record exists.
+            s["audit"].record("api", "exec_reject", body.tool, str(e)[:300])
+            raise HTTPException(status_code=422, detail=str(e)[:300])
+        s["audit"].record("api", "exec_submit", body.tool, rec.state.value)
+        view = _execution_view(rec, s["jobs"])
+        return JSONResponse(
+            content=view,
+            status_code=202
+            if rec.state.value == "waiting_for_permission" else 201)
+
+    @app.get("/v1/executions/{exec_id}")
+    def get_execution(exec_id: str, _=Depends(auth)):
+        try:
+            rec = s["engine"].get(exec_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="unknown execution")
+        return _execution_view(rec, s["jobs"])
+
+    @app.post("/v1/executions/{exec_id}/approve")
+    def approve_execution(exec_id: str, _=Depends(auth)):
+        """Non-blocking twin of /v1/exec/{id}/approve for the async flow:
+        grants then runs on a daemon thread; poll GET for completion."""
+        try:
+            rec = s["engine"].approve_async(exec_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="unknown execution")
+        except ValueError as e:
+            raise HTTPException(status_code=409, detail=str(e)[:300])
+        s["audit"].record("api", "exec_approve", rec.tool, rec.state.value)
+        return _execution_view(rec, s["jobs"])
+
+    @app.post("/v1/executions/{exec_id}/cancel")
+    def cancel_execution(exec_id: str, _=Depends(auth)):
+        try:
+            rec = s["engine"].get(exec_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="unknown execution")
+        if rec.state.value in ("succeeded", "failed", "timed_out",
+                               "denied", "cancelled"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"already terminal: {rec.state.value}")
+        rec = s["engine"].cancel(exec_id)
+        s["audit"].record("api", "exec_cancel", rec.tool, rec.state.value)
+        return _execution_view(rec, s["jobs"])
+
+    @app.post("/v1/executions/resolve", status_code=201)
+    def create_resolved_execution(body: ExecutionResolveIn,
+                                  _=Depends(auth)):
+        """Canonical external path: resolve a capability deterministically,
+        bind the resolution into the execution, enter async lifecycle.
+
+        Flow: resolver.resolve → authorized concrete target → submit_async
+        with capability+binding → 201/202 view + resolution echo. Denied /
+        offline / unknown targets return 403/409 with reason and create NO
+        execution. The binding is advisory record, never authority: policy
+        re-decides at submit, and approve/dispatch re-validate.
+        No silent substitution: the execution stays on the resolved device
+        unless the resolver itself performed an explicit fallback (echoed).
+        """
+        resolution = s["resolver"].resolve(
+            body.capability, body.device_id or "", who=body.who,
+            constraints=body.constraints,
+            preferred_device=body.preferred_device,
+            allow_fallback=body.allow_fallback)
+        if resolution.status not in ("resolved", "requires_approval"):
+            raise HTTPException(
+                status_code=409 if resolution.status in (
+                    "offline", "governor_blocked") else 403,
+                detail=f"{resolution.status}: {resolution.reason}"[:300])
+        target_device = resolution.device_id
+        if not target_device:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{resolution.status}: {resolution.reason}"[:300])
+        try:
+            s["registry"].get(body.capability)
+        except KeyError:
+            raise HTTPException(
+                status_code=409,
+                detail=f"capability {body.capability} has no executable "
+                "tool implementation")
+        binding = {"resolution_status": resolution.status,
+                   "fallback_used": resolution.fallback_used,
+                   "substituted": resolution.substituted,
+                   "reason": resolution.reason[:300]}
+        try:
+            rec = s["engine"].submit_async_idem(
+                body.capability, body.inputs, target_device, who=body.who,
+                mission_id=body.mission_id, capability=body.capability,
+                binding=binding, idempotency_key=body.idempotency_key)
+        except PolicyDenied as e:
+            s["audit"].record("api", "exec_deny", body.capability,
+                               str(e)[:300])
+            raise HTTPException(status_code=403, detail=str(e)[:300])
+        except ValueError as e:
+            # Task 9: input-envelope rejection before any record exists.
+            s["audit"].record("api", "exec_reject", body.capability,
+                               str(e)[:300])
+            raise HTTPException(status_code=422, detail=str(e)[:300])
+        s["audit"].record("api", "exec_resolve_submit", body.capability,
+                           f"{target_device} {rec.state.value}")
+        view = _execution_view(rec, s["jobs"])
+        view["resolution"] = {"status": resolution.status,
+                              "device_id": target_device,
+                              "fallback_used": resolution.fallback_used,
+                              "substituted": resolution.substituted}
+        if body.explain:
+            # Opt-in diagnostic only: bounded non-authoritative record
+            # built from the already-computed resolution (no re-resolve).
+            # Never alters the verdict, the execution, or any gate.
+            try:
+                view["explanation"] = s["resolver"].explain_resolution(
+                    resolution, body.constraints)
+            except Exception:  # noqa: BLE001 — diagnostics never break it
+                pass
+        return JSONResponse(
+            content=view,
+            status_code=202
+            if rec.state.value == "waiting_for_permission" else 201)
 
     @app.get("/v1/tools")
     def list_tools(_=Depends(auth)):
@@ -908,12 +1230,17 @@ def create_app(stack=None) -> FastAPI:
 
     @app.post("/v1/memory")
     def remember(item: MemoryItem, _=Depends(auth)):
-        stored = s["memory"].remember(item)
+        try:
+            stored = s["memory"].remember(item)
+        except ValueError as e:
+            # Secret/credential refusal (never store) is a 422, not a 500.
+            raise HTTPException(status_code=422, detail=str(e)[:300])
         return {"stored": stored is not None, "id": stored.id if stored else None}
 
     @app.get("/v1/memory/search")
     def search_memory(q: str, top_k: int = 5, _=Depends(auth)):
-        return [{"text": m.text, "category": m.category, "score": sc}
+        return [{"id": m.id, "text": m.text, "category": m.category,
+                 "score": sc}
                 for m, sc in s["memory"].recall(q, top_k)]
 
     @app.get("/v1/events")
@@ -934,23 +1261,160 @@ def create_app(stack=None) -> FastAPI:
     def talk(body: TalkIn, _=Depends(auth)):
         """Full NL loop: context+memory -> LLM proposal -> core -> device ->
         verified result -> NL response. LLM never executes directly."""
-        result = s["loop"].handle_text(body.text, session_id=body.session_id,
-                                       device_id=body.device_id, who=body.who)
+        # Turn registered first so a concurrent POST /v1/talk/cancel can
+        # abort it mid-flight; finished in finally (unknown ids stay put).
+        tid, _ = s["loop"].turns.create()
+        try:
+            result = s["loop"].handle_text(body.text, session_id=body.session_id,
+                                           device_id=body.device_id, who=body.who,
+                                           turn_id=tid)
+        finally:
+            s["loop"].turns.finish(tid)
         return {"reply": result.reply, "status": result.status,
-                "session_id": body.session_id,
+                "session_id": result.session_id or body.session_id,
                 "mission_id": result.mission_id,
                 "execution_id": result.execution_id,
                 "device_id": result.device_id, "tool": result.tool,
-                "trace_id": result.trace_id}
+                "trace_id": result.trace_id, "turn_id": result.turn_id or tid}
+
+    @app.post("/v1/talk/cancel")
+    def talk_cancel(body: TalkCancelIn, _=Depends(auth)):
+        """Abort an in-flight turn: sets its event; the loop stops before
+        the next model call or tool execution. Unknown ids are a safe
+        no-op (false); already-finished turns report false."""
+        return {"cancelled": s["loop"].turns.cancel(body.turn_id)}
+
+    # ---- Live provider check (guarded diagnostic, Night 10) ----
+    _diag_check = {"running": False, "event": None}
+    _diag_lock = threading.Lock()
+
+    @app.post("/v1/diagnostics/provider-check")
+    def diag_provider_check(_=Depends(auth)):
+        """One-tap live provider check. Explicit user action only — never
+        automatic, never polled. Runs a single bounded non-streaming model
+        call with a fixed innocuous prompt and NO tools: it cannot create
+        missions, executions, memories, or device commands. Concurrent
+        callers get 409 busy. Errors map to safe categories (no URLs,
+        keys, or raw payloads). Mock providers (echo/scripted) get 422:
+        configuration existing is not health."""
+        import time as _time
+        with _diag_lock:
+            if _diag_check["running"]:
+                raise HTTPException(status_code=409,
+                                    detail="provider check already running")
+            _diag_check["running"] = True
+            ev = threading.Event()
+            _diag_check["event"] = ev
+        try:
+            provider = s["model"]
+            name = getattr(provider, "name", "unknown")
+            if name in ("echo", "scripted", "mock"):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"not a live provider: {name}")
+            t0 = _time.time()
+            try:
+                out = provider.reason(
+                    "You are a connectivity probe. Reply with exactly: "
+                    "pinecone",
+                    "Reply with exactly: pinecone", [], cancel=ev,
+                    timeout=25.0)
+            except LLMError as e:
+                raise HTTPException(
+                    status_code=504 if e.kind == LLMErrorKind.TIMEOUT
+                    else 502,
+                    detail=f"provider {e.kind.value}: safe failure, "
+                    "nothing executed")
+            elapsed = round(_time.time() - t0, 2)
+            if not out.text:
+                raise HTTPException(status_code=502,
+                                    detail="provider empty: no content")
+            return {"ok": True, "provider": name,
+                    "model": getattr(provider, "model", ""),
+                    "elapsed_s": elapsed}
+        finally:
+            with _diag_lock:
+                _diag_check["running"] = False
+                _diag_check["event"] = None
+
+    @app.post("/v1/diagnostics/provider-check/cancel")
+    def diag_provider_check_cancel(_=Depends(auth)):
+        """Abort an in-flight provider check (releases promptly)."""
+        with _diag_lock:
+            ev = _diag_check.get("event")
+            if ev is None:
+                return {"cancelled": False}
+            ev.set()
+            return {"cancelled": True}
+
+    @app.post("/v1/talk/stream")
+    def talk_stream(body: TalkIn, _=Depends(auth)):
+        """Streaming twin of /v1/talk: Server-Sent Events carrying turn,
+        delta (real model text chunks), tool, approval, error, and done
+        events (see core/talk_stream.py for the contract). Tool execution
+        still flows exclusively through router + engine + approvals; the
+        stream only narrates. Cancel by disconnecting (best-effort) or by
+        POST /v1/talk/cancel with the turn_id from the first event."""
+        q: queue.Queue = queue.Queue()
+        tid, _ = s["loop"].turns.create()
+        started = time.time()
+        stop = object()
+
+        def run() -> None:
+            def emit(name: str, data: dict) -> None:
+                try:
+                    q.put(format_event(name, data))
+                except Exception:  # noqa: BLE001 - emitter never breaks turn
+                    pass
+            try:
+                s["loop"].handle_text(
+                    body.text, session_id=body.session_id,
+                    device_id=body.device_id, who=body.who, turn_id=tid,
+                    emit=emit)
+            except Exception as e:  # noqa: BLE001 - terminal error event
+                try:
+                    q.put(format_event("error", {"message": str(e)[:300]}))
+                except Exception:  # noqa: BLE001
+                    pass
+            finally:
+                s["loop"].turns.finish(tid)
+                q.put(stop)
+
+        threading.Thread(target=run, daemon=True).start()
+
+        def gen():
+            # Hard Stop: never hold a stream past the turn budget + margin.
+            while time.time() - started < 150.0:
+                try:
+                    item = q.get(timeout=1.0)
+                except Exception:  # noqa: BLE001 - idle heartbeat
+                    yield ": ping\n\n"
+                    continue
+                if item is stop:
+                    return
+                try:
+                    yield item
+                except Exception:  # noqa: BLE001 - client went away
+                    s["loop"].turns.cancel(tid)
+                    return
+
+        return StreamingResponse(gen(), media_type="text/event-stream")
 
     @app.post("/v1/talk/resume")
     def talk_resume(body: ResumeIn, _=Depends(auth)):
         """Continue a turn held for approval after human approval."""
-        result = s["loop"].resume_after_approval(body.execution_id,
-                                                 body.session_id)
+        tid, _ = s["loop"].turns.create()
+        try:
+            result = s["loop"].resume_after_approval(body.execution_id,
+                                                     body.session_id,
+                                                     turn_id=tid)
+        finally:
+            s["loop"].turns.finish(tid)
         return {"reply": result.reply, "status": result.status,
+                "session_id": result.session_id or body.session_id,
                 "mission_id": result.mission_id,
-                "execution_id": result.execution_id}
+                "execution_id": result.execution_id,
+                "turn_id": result.turn_id or tid}
 
     @app.post("/v1/sessions")
     def create_session(device_id: str = "cloud", _=Depends(auth)):
@@ -964,9 +1428,51 @@ def create_app(stack=None) -> FastAPI:
         except KeyError:
             raise HTTPException(status_code=404, detail="unknown session")
 
+    @app.get("/v1/sessions")
+    def list_sessions(limit: int = 20, _=Depends(auth)):
+        """Recent conversations, newest first (bounded, redacted)."""
+        return s["sessions"].list_recent(limit=min(max(limit, 1), 100))
+
+    @app.delete("/v1/sessions/{session_id}")
+    def delete_session(session_id: str, _=Depends(auth)):
+        if not s["sessions"].delete(session_id):
+            raise HTTPException(status_code=404, detail="unknown session")
+        return {"deleted": session_id}
+
     @app.post("/v1/memory/correct")
     def memory_correct(body: MemoryCorrectIn, _=Depends(auth)):
         return s["memory_service"].correct(body.old_query, body.new_text)
+
+    @app.delete("/v1/memory/{memory_id}")
+    def memory_forget(memory_id: str, _=Depends(auth)):
+        """Delete one memory (consent/retention). Unknown ids -> 404."""
+        if not s["memory"].forget(memory_id):
+            raise HTTPException(status_code=404, detail="unknown memory")
+        return {"forgotten": memory_id}
+
+    @app.post("/v1/memory/candidates/confirm")
+    def memory_candidate_confirm(body: MemoryConfirmIn, _=Depends(auth)):
+        """Accept (store) or reject (drop) a held memory candidate."""
+        return s["memory_service"].confirm_candidate(body.candidate_id,
+                                                     ok=body.ok)
+
+    @app.get("/v1/memory/candidates")
+    def memory_candidates(_=Depends(auth)):
+        """Held memory candidates awaiting explicit confirmation. Text is
+        redacted; confirm or reject via POST .../candidates/confirm."""
+        from .tracing import redact as _redact
+        out = []
+        for cid, item in s["memory_service"].pending_candidates.items():
+            out.append({"candidate_id": cid,
+                        "text": _redact(item.text)[:300],
+                        "category": item.category,
+                        "source": item.source})
+        return out
+
+    @app.post("/v1/memory/purge")
+    def memory_purge(_=Depends(auth)):
+        """Delete expired memories (expires_at past). Returns count."""
+        return {"purged": s["memory"].purge_expired()}
 
     @app.get("/v1/trace/{trace_id}")
     def get_trace(trace_id: str, _=Depends(auth)):
@@ -1103,9 +1609,16 @@ def create_app(stack=None) -> FastAPI:
     @app.post("/v1/agent/heartbeat")
     def agent_heartbeat(body: HeartbeatPayload, device_id: str = Depends(agent_auth)):
         try:
-            d = s["devices"].heartbeat(device_id, battery_pct=body.battery_pct,
-                                       charging=body.charging,
-                                       network=body.network, online=body.online)
+            d = s["devices"].heartbeat(
+                device_id, battery_pct=body.battery_pct,
+                charging=body.charging,
+                network=body.network, online=body.online,
+                cpu_pct=body.cpu_pct, mem_pct=body.mem_pct,
+                low_power_mode=body.low_power_mode,
+                storage_free_mb=body.storage_free_mb,
+                storage_total_mb=body.storage_total_mb,
+                battery_temp_c=body.battery_temp_c,
+                thermal_state=body.thermal_state)
         except KeyError:
             raise HTTPException(status_code=404, detail="device not registered")
         if (body.battery_pct is not None and body.battery_pct < 15
@@ -1139,6 +1652,17 @@ def create_app(stack=None) -> FastAPI:
         job = s["jobs"].poll(device_id)
         if job is None:
             return {"job": None}
+        # Linearize revoke vs claim: revoke may land between agent_auth
+        # verify and poll. A revoked device must not receive a payload —
+        # cancel the just-claimed job (claimed→cancelled wakes the proxy
+        # waiter) and fail closed. Result-time verify remains the backstop.
+        if s["device_auth"].is_revoked(device_id):
+            try:
+                s["jobs"].cancel(job.id)
+            except Exception:  # noqa: BLE001 — revocation already done
+                pass
+            raise HTTPException(status_code=403,
+                                detail="invalid/revoked device identity")
         if s["jobs"].is_cancelled(job.id):
             return {"job": None}
         return {"job": {"job_id": job.id, "tool": job.tool,
@@ -1149,9 +1673,18 @@ def create_app(stack=None) -> FastAPI:
     @app.post("/v1/agent/jobs/result")
     def agent_result(body: JobResultIn, device_id: str = Depends(agent_auth)):
         try:
-            job = s["jobs"].complete(body.job_id, body.ok, body.result, body.error)
+            job = s["jobs"].get(body.job_id)
         except KeyError:
             raise HTTPException(status_code=404, detail="unknown job")
+        # Device binding: a device may only complete its own jobs. Without
+        # this, any authenticated device could forge another device's
+        # completion (fail-closed 403 + audit, mirroring approvals).
+        if job.device_id != device_id:
+            s["audit"].record("device", "job_result_scope_denied", body.job_id,
+                              f"{device_id} != {job.device_id}", ok=False)
+            raise HTTPException(status_code=403,
+                                detail="job not targeted at this device")
+        job = s["jobs"].complete(body.job_id, body.ok, body.result, body.error)
         s["bus"].publish("execution_finished", source="device",
                          device_id=device_id,
                          payload={"job_id": body.job_id, "ok": body.ok,
@@ -1163,6 +1696,17 @@ def create_app(stack=None) -> FastAPI:
     @app.post("/v1/agent/jobs/{job_id}/cancel")
     def agent_cancel(job_id: str, _=Depends(auth)):
         return {"cancelled": s["jobs"].cancel(job_id)}
+
+    @app.get("/v1/agent/jobs/{job_id}/state")
+    def agent_job_state(job_id: str, device_id: str = Depends(agent_auth)):
+        """Owner-only job state read so a device holding a job can notice
+        server-side cancellation (long tools, revocation sweeps). Unknown
+        ids, other devices' jobs, and pruned jobs all read as 404 with the
+        same detail — no cross-device probing."""
+        state = s["jobs"].job_state_for(device_id, job_id)
+        if state is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        return {"job_id": job_id, "state": state}
 
     @app.post("/v1/agent/events/sync")
     def agent_sync(body: dict, device_id: str = Depends(agent_auth)):
@@ -1183,6 +1727,14 @@ def create_app(stack=None) -> FastAPI:
     @app.post("/v1/agent/revoke")
     def agent_revoke(device_id: str, _=Depends(auth)):
         s["device_auth"].revoke(device_id)
+        # Linearize revocation: cancel queued jobs FIRST, before presence /
+        # tombstone / transfer steps, so no poll/result slips between steps
+        # and observes mixed state. Pending-only; claimed jobs stay
+        # device-owned (result endpoint still auth-gates them).
+        try:
+            n_queued = s["jobs"].cancel_device_jobs(device_id)
+        except Exception:  # noqa: BLE001 — revoke itself already done
+            n_queued = 0
         try:
             s["devices"].mark_offline(device_id)
         except KeyError:
@@ -1198,8 +1750,9 @@ def create_app(stack=None) -> FastAPI:
             s["xfer"].revoke_device(device_id)
         except Exception:  # noqa: BLE001 — revoke itself already done
             pass
-        s["audit"].record("operator", "device_revoke", device_id, "")
-        return {"revoked": device_id}
+        s["audit"].record("operator", "device_revoke", device_id,
+                           f"queued_jobs_cancelled={n_queued}")
+        return {"revoked": device_id, "queued_jobs_cancelled": n_queued}
 
     # ---- Stage 10: device voice turn (same bounds as operator turn,
     # device-scoped auth; the operator endpoint is unchanged).
@@ -1436,6 +1989,11 @@ def create_app(stack=None) -> FastAPI:
             s["audit"].record(body.who, "dispatch_deny", body.tool,
                               str(e)[:300], ok=False)
             return {"status": "deny", "reason": str(e)[:300]}
+        except ValueError as e:
+            # Task 9: input-envelope rejection before any record exists.
+            s["audit"].record(body.who, "dispatch_reject", body.tool,
+                              str(e)[:300], ok=False)
+            raise HTTPException(status_code=422, detail=str(e)[:300])
         s["audit"].record(body.who, "dispatch_route", body.tool,
                           f"{decision.device_id} {rec.state.value}")
         return {"id": rec.id, "status": rec.state.value,

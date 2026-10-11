@@ -112,7 +112,11 @@ def test_provider_cancellation():
 def test_scripted_stream_fallback():
     chunks = list(ScriptedProvider([], default_text="hi").stream_reason(
         "s", "u", []))
-    assert "".join(chunks) == "hi"
+    # Base fallback yields the complete parsed outcome (action preserved);
+    # text is assembled from outcome payloads, never re-parsed downstream.
+    assert len(chunks) == 1
+    assert chunks[0].text == "hi"
+    assert "".join(c.text for c in chunks) == "hi"
 
 
 def test_openai_stream_malformed_chunk(monkeypatch):
@@ -130,6 +134,118 @@ def test_openai_stream_malformed_chunk(monkeypatch):
     p = OpenAICompatibleProvider("http://x", model="m")
     with pytest.raises(LLMError):
         list(p.stream_reason("s", "u", []))
+
+
+def _sse_resp(chunks):
+    class Resp:
+        def __enter__(self): return self
+
+        def __exit__(self, *a): return False
+
+        def __iter__(self):
+            yield from chunks
+
+    return Resp()
+
+
+def _chunk(content):
+    import json as _j
+    return ("data: " + _j.dumps(
+        {"choices": [{"delta": {"content": content}}]}) + "\n").encode()
+
+
+def test_openai_stream_split_multibyte_and_split_lines(monkeypatch):
+    """Live failure: TCP segments split multibyte chars AND data lines.
+    Must assemble exactly, never decode-crash, never invent content."""
+    import urllib.request
+    raw = (_chunk('{"type":"response","text":"caf') +
+           _chunk('é ✓ done"}'))
+    # Split every chunk at odd byte offsets (guaranteed multibyte splits).
+    parts = []
+    for c in (raw[i:i + 7] for i in range(0, len(raw), 7)):
+        parts.append(c)
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda *a, **k: _sse_resp(parts))
+    p = OpenAICompatibleProvider("http://x", model="m")
+    out = list(p.stream_reason("s", "u", []))
+    assert "".join(out) == '{"type":"response","text":"café ✓ done"}'
+
+
+def test_openai_stream_trailer_reset_after_content(monkeypatch):
+    """Live failure: endpoint resets the connection after the final chunk
+    instead of [DONE]. Complete content still parses; the reset alone
+    must not become a false success or a crash."""
+    import urllib.request
+    import urllib.error
+
+    class Reset(urllib.error.URLError):
+        pass
+
+    chunks = [_chunk('{"type":"response","text":"hi"}')]
+
+    class Resp:
+        def __enter__(self): return self
+
+        def __exit__(self, *a): return False
+
+        def __iter__(self):
+            yield from chunks
+            raise OSError("connection reset by peer")
+
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda *a, **k: Resp())
+    p = OpenAICompatibleProvider("http://x", model="m")
+    out = list(p.stream_reason("s", "u", []))
+    assert "".join(out) == '{"type":"response","text":"hi"}'
+
+
+def test_openai_stream_empty_choices_chunk_skipped(monkeypatch):
+    """Live failure (NVIDIA): usage/control chunks arrive as
+    {"choices": []}. They carry no content and must be skipped, never
+    crash the stream with IndexError."""
+    import urllib.request
+    import json as _j
+
+    def data(payload):
+        return ("data: " + _j.dumps(payload) + "\n").encode()
+
+    chunks = [data({"choices": [{"delta": {"content": "hi"}}]}),
+              data({"choices": [], "usage": {"tokens": 5}}),
+              data({"choices": [{"delta": {"content": " there"}}]}),
+              b"data: [DONE]\n"]
+
+    class Resp:
+        def __enter__(self): return self
+
+        def __exit__(self, *a): return False
+
+        def __iter__(self):
+            yield from chunks
+
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda *a, **k: Resp())
+    p = OpenAICompatibleProvider("http://x", model="m")
+    assert list(p.stream_reason("s", "u", [])) == ["hi", " there"]
+
+
+def test_openai_stream_reset_before_content_still_fails(monkeypatch):
+    import urllib.request
+
+    class Resp:
+        def __enter__(self): return self
+
+        def __exit__(self, *a): return False
+
+        def __iter__(self):
+            raise OSError("connection reset by peer")
+            yield b""  # pragma: no cover - unreachable
+
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda *a, **k: Resp())
+    p = OpenAICompatibleProvider("http://x", model="m")
+    with pytest.raises(LLMError) as ei:
+        list(p.stream_reason("s", "u", []))
+    assert ei.value.kind == LLMErrorKind.NETWORK
 
 
 # ---------- tool loop ----------

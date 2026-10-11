@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -48,6 +48,28 @@ class MissionState(str, Enum):
 
 TERMINAL_MISSIONS = {MissionState.COMPLETED, MissionState.FAILED, MissionState.CANCELLED}
 
+class ResourceTier(str, Enum):
+    LOW = "low"          # default; no special demand
+    MODERATE = "moderate"
+    HIGH = "high"
+
+
+class ResourceDemands(BaseModel):
+    """Bounded descriptive demand vector for a tool/capability.
+
+    Description ONLY: expected resource requirements shaped as 4×3-tier
+    enums (81 combinations). Never scheduler weights — tools must not
+    price their own priority. Router/governor/policy own all decisions
+    and read these tiers with their own thresholds (none wired yet).
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    cpu: ResourceTier = ResourceTier.LOW
+    memory: ResourceTier = ResourceTier.LOW
+    network: ResourceTier = ResourceTier.LOW
+    battery: ResourceTier = ResourceTier.LOW  # energy / radio / wake cost
+
+
 class ToolDefinition(BaseModel):
     name: str = Field(pattern=r"^[a-z][a-z0-9_.:\-]{1,63}$")
     description: str
@@ -69,6 +91,10 @@ class ToolDefinition(BaseModel):
     # to mirror a handler's own documented contract (e.g. a patch tool
     # whose handler enforces its own larger cap). Never authority.
     max_input_bytes: int = Field(default=4096, gt=0, le=1048576)
+    # Expected resource demand (description only, never scheduler weights).
+    # Defaults to all-LOW = "no special demand"; existing tools need no
+    # migration. Unknown dimensions/values rejected by the closed model.
+    resource_demands: ResourceDemands = Field(default_factory=ResourceDemands)
 
 class PolicyDecision(BaseModel):
     allow: bool
@@ -78,6 +104,23 @@ class PolicyDecision(BaseModel):
     scope: str = ""
     expires_at: Optional[datetime] = None
     reason: str = ""
+
+
+class ResolveConstraints(BaseModel):
+    """Closed constraint model for capability resolution.
+
+    Only these four dimensions exist. Unknown keys are rejected here
+    (extra="forbid"); unknown/invalid VALUES are tolerated at evaluation
+    as no-ops or fail-closed excludes (see resolver._constraints_match),
+    never as matches. Constraints FILTER authorized candidates only —
+    they can never authorize, approve, grant trust, or select targets.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    platform: str = Field(default="", max_length=64)
+    min_version: str = Field(default="", max_length=64)
+    risk_max: str = Field(default="", max_length=16)
+    online_only: bool = False
 
 class ExecutionRecord(BaseModel):
     id: str
@@ -96,6 +139,16 @@ class ExecutionRecord(BaseModel):
     attempt: int = 0
     max_retries: int = 1
     cancel_requested: bool = False
+    # Resolver→async binding (Part A): which resolved capability this
+    # execution is bound to. Advisory record, never authority — gates
+    # re-decide from these values at approve/dispatch.
+    capability: Optional[str] = None
+    binding: dict = Field(default_factory=dict)
+    # Approval binding (Part B): fingerprint + timestamps. The fingerprint
+    # is integrity material (never exposed in status views).
+    approval_fingerprint: Optional[str] = None
+    parked_at: Optional[datetime] = None
+    approved_at: Optional[datetime] = None
 
 class Event(BaseModel):
     id: str = ""
@@ -118,6 +171,18 @@ class DeviceState(BaseModel):
     charging: bool = False
     network: str = "unknown"
     last_seen: datetime = Field(default_factory=utcnow)
+    # Resource telemetry (observation only, never authority). All nullable:
+    # None = unknown/unreported, never zero-as-healthy. Server-stamped
+    # last_telemetry_at marks the last heartbeat that carried any
+    # non-None telemetry field (presence still derives from last_seen).
+    cpu_pct: Optional[float] = None
+    mem_pct: Optional[float] = None
+    low_power_mode: Optional[bool] = None
+    storage_free_mb: Optional[int] = None
+    storage_total_mb: Optional[int] = None
+    battery_temp_c: Optional[float] = None
+    thermal_state: Optional[str] = None
+    last_telemetry_at: Optional[datetime] = None
 
 class MissionStep(BaseModel):
     tool: str

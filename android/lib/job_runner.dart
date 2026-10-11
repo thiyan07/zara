@@ -201,7 +201,9 @@ class AndroidJobRunner {
           }
           return JobResult(ok: true, result: Map<String, dynamic>.from(snap));
         case 'gui.tap':
-          final pkg = job.inputs['package'];
+          // Core schema key is `target_package` (device_tools.py); accept
+          // legacy `package` too. Allowlist enforced either way.
+          final pkg = job.inputs['target_package'] ?? job.inputs['package'];
           final rawId = job.inputs['node_id'];
           if (pkg is! String || !a11yTapTargets.contains(pkg)) {
             return const JobResult(

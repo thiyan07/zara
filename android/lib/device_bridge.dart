@@ -28,6 +28,20 @@ class DeviceBridge {
     }
   }
 
+  /// Resource telemetry snapshot (observation only, never authority).
+  /// Returns raw native map; missing keys mean unavailable (never zero).
+  /// Never throws — channel failure yields {} (heartbeat omits it).
+  Future<Map<String, dynamic>> telemetry() async {
+    try {
+      final m = await _ch.invokeMapMethod<String, dynamic>('getDeviceTelem');
+      return Map<String, dynamic>.from(m ?? {});
+    } on PlatformException {
+      return {};
+    } catch (_) {
+      return {};
+    }
+  }
+
   Future<Map<String, dynamic>> permissions() async {
     try {
       final m = await _ch.invokeMapMethod<String, dynamic>('getPermissions');

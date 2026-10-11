@@ -1,0 +1,18 @@
+{
+ "by_category": {
+  "demand-threshold": 31,
+  "resolver": 6,
+  "telemetry-plumbing": 2
+ },
+ "by_source": {
+  "measured": 2,
+  "replayed": 6,
+  "synthetic": 31
+ },
+ "bytes": 34067,
+ "command": "PYTHONHASHSEED=42 python -m pytest tests/test_calibration.py -q",
+ "mismatches": [],
+ "records": 39,
+ "schema": "zara.evidence/v1",
+ "seed": 42
+}

@@ -62,6 +62,7 @@ class DeviceBridge(
                 when (call.method) {
                     "getBattery" -> result.success(battery())
                     "getNetwork" -> result.success(network())
+                    "getDeviceTelem" -> result.success(deviceTelem())
                     "getPermissions" -> result.success(permissions())
                     "getVoiceSupport" -> result.success(voiceSupport())
                     "audioCapture" -> audioCapture(
@@ -679,6 +680,93 @@ class DeviceBridge(
         } catch (e: Exception) {
             mapOf("supported" to false, "error" to (e.message ?: "unknown"))
         }
+    }
+
+    /**
+     * Resource telemetry (observation only, never authority). All values
+     * from standard public Android APIs — no root, no shell, no procfs,
+     * no privileged APIs. Unavailable signals are omitted (null on the
+     * Dart side), never zero-as-healthy. Never throws.
+     */
+    private fun deviceTelem(): Map<String, Any?> {
+        val out = mutableMapOf<String, Any?>()
+        try {
+            // CPU count (logical cores; static capacity signal, not usage).
+            try {
+                out["cpu_count"] = Runtime.getRuntime().availableProcessors()
+            } catch (_: Exception) {
+            }
+            // RAM via ActivityManager.MemoryInfo.
+            try {
+                val am = context.getSystemService(Context.ACTIVITY_SERVICE)
+                    as android.app.ActivityManager
+                val mi = android.app.ActivityManager.MemoryInfo()
+                am.getMemoryInfo(mi)
+                out["mem_avail_mb"] = (mi.availMem / 1048576L).toInt()
+                if (Build.VERSION.SDK_INT >=
+                    Build.VERSION_CODES.JELLY_BEAN) {
+                    out["mem_total_mb"] = (mi.totalMem / 1048576L).toInt()
+                }
+                out["low_memory"] = mi.lowMemory
+            } catch (_: Exception) {
+            }
+            // Internal storage via StatFs (no directory scan).
+            try {
+                if (Build.VERSION.SDK_INT >=
+                    Build.VERSION_CODES.JELLY_BEAN_MR2) {
+                    val stat = android.os.StatFs(
+                        android.os.Environment.getDataDirectory().path)
+                    out["storage_free_mb"] =
+                        (stat.availableBytes / 1048576L).toInt()
+                    out["storage_total_mb"] =
+                        (stat.totalBytes / 1048576L).toInt()
+                }
+            } catch (_: Exception) {
+            }
+            // Battery temperature + power-save (same sources as battery()).
+            try {
+                val filter = context.registerReceiver(
+                    null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                val tenth = filter?.getIntExtra(
+                    BatteryManager.EXTRA_TEMPERATURE, -1) ?: -1
+                if (tenth >= 0) out["battery_temp_c"] = tenth / 10.0
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                    val pm = context.getSystemService(Context.POWER_SERVICE)
+                        as android.os.PowerManager
+                    out["power_save"] = pm.isPowerSaveMode
+                }
+            } catch (_: Exception) {
+            }
+            // Thermal status (API 29+ only; older releases omit it).
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    val pm = context.getSystemService(Context.POWER_SERVICE)
+                        as android.os.PowerManager
+                    out["thermal_state"] = when (
+                        pm.currentThermalStatus) {
+                        android.os.PowerManager.THERMAL_STATUS_NONE -> "none"
+                        android.os.PowerManager.THERMAL_STATUS_LIGHT -> "light"
+                        android.os.PowerManager.THERMAL_STATUS_MODERATE ->
+                            "moderate"
+                        android.os.PowerManager.THERMAL_STATUS_SEVERE -> "severe"
+                        android.os.PowerManager.THERMAL_STATUS_CRITICAL ->
+                            "critical"
+                        android.os.PowerManager.THERMAL_STATUS_EMERGENCY ->
+                            "emergency"
+                        android.os.PowerManager.THERMAL_STATUS_SHUTDOWN ->
+                            "shutdown"
+                        else -> "unknown"
+                    }
+                }
+            } catch (_: Exception) {
+            }
+            // CPU usage: no reliable public API (no procfs by policy) —
+            // deliberately omitted. Core must treat cpu_pct as unknown.
+            // GPU: no telemetry stack — deliberately omitted.
+        } catch (e: Exception) {
+            out["error"] = (e.message ?: "telem failed").take(200)
+        }
+        return out
     }
 
     private fun permissions(): Map<String, Any?> {

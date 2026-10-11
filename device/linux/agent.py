@@ -14,12 +14,14 @@ import threading
 import time
 import urllib.request
 import urllib.error
+from typing import Callable, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))
 
 from device.linux.tools_linux import (  # noqa: E402
-    LINUX_TOOLS, LINUX_CAPABILITIES, system_battery, system_network)
+    LINUX_TOOLS, LINUX_CAPABILITIES, system_battery, system_network,
+    system_telemetry)
 from core.protocol import HeartbeatPayload  # noqa: E402
 
 KEY_FILE_MODE = 0o600
@@ -31,7 +33,9 @@ OFFLINE_QUEUE_CAP = 200
 
 class DeviceAgent:
     def __init__(self, core_url: str, device_id: str,
-                 key_file: str = "") -> None:
+                 key_file: str = "",
+                 cancel_checker: Optional[Callable[[str], bool]] = None,
+                 ) -> None:
         self.core_url = core_url.rstrip("/")
         self.device_id = device_id
         self.key_file = key_file or os.path.expanduser(
@@ -41,6 +45,13 @@ class DeviceAgent:
         self._offline_queue: list[dict] = []
         self._tools = {d.name: h for d, h in LINUX_TOOLS}
         self.software_version = "zara-linux-agent 2.0.0"
+        # Pluggable cancellation probe. Default (None) performs an HTTP
+        # GET against the recommended endpoint
+        #   GET /v1/agent/jobs/{job_id}/state  (device-authed, owner-only)
+        # returning {"state": "<state>"}; stubbed in tests so the agent
+        # works without network. Any probe error fails closed to
+        # "not cancelled" (backoff/reconnect path unchanged).
+        self._cancel_checker = cancel_checker
 
     # ---------- identity ----------
 
@@ -108,10 +119,18 @@ class DeviceAgent:
         try:
             bat = system_battery({}, {})
             net = system_network({}, {})
+            telem = system_telemetry({}, {})
             hb = HeartbeatPayload(
                 battery_pct=bat.get("battery_pct"),
                 charging=bat.get("charging", False),
-                network=net.get("network", "unknown")).model_dump()
+                network=net.get("network", "unknown"),
+                cpu_pct=telem.get("cpu_pct"),
+                mem_pct=telem.get("mem_pct"),
+                low_power_mode=telem.get("low_power_mode"),
+                storage_free_mb=telem.get("storage_free_mb"),
+                storage_total_mb=telem.get("storage_total_mb"),
+                battery_temp_c=telem.get("battery_temp_c"),
+                thermal_state=telem.get("thermal_state")).model_dump()
         except Exception:  # noqa: BLE001 — probes must never kill the agent
             hb = HeartbeatPayload().model_dump()
         try:
@@ -130,11 +149,49 @@ class DeviceAgent:
             return None
         return out.get("job")
 
+    def is_job_cancelled(self, job_id: str) -> bool:
+        """Pluggable pre/post-execution cancellation probe.
+
+        Stub path (tests / offline): delegate to the injected callable.
+        Default path: GET /v1/agent/jobs/{job_id}/state (device-authed,
+        owner-only, served by JobQueue.job_state_for). Any transport or
+        parse error returns False — cancellation must be positively
+        observed, never inferred from a failed probe.
+        """
+        if self._cancel_checker is not None:
+            try:
+                return bool(self._cancel_checker(job_id))
+            except Exception:  # noqa: BLE001 — probe failure ≠ cancelled
+                return False
+        try:
+            req = urllib.request.Request(
+                f"{self.core_url}/v1/agent/jobs/{job_id}/state",
+                headers=self._headers())
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = json.load(r)
+            return data.get("state") == "cancelled"
+        except Exception:  # noqa: BLE001 — OSError/HTTPError/ValueError
+            return False
+
     def run_one_job(self) -> bool:
         job = self.poll_job()
         if not job:
             return False
         job_id, tool, inputs = job["job_id"], job["tool"], job.get("inputs", {})
+        # Semantics: the server is the source of truth for cancellation.
+        # complete() on a cancelled job is a no-op returning the recorded
+        # cancelled outcome, so we STILL report ok=False
+        # error="cancelled by operator" instead of going silent — the
+        # report is idempotent and keeps server terminal state consistent
+        # (cancelled stays cancelled; never resurrected to done/failed).
+        if self.is_job_cancelled(job_id):
+            try:
+                self._post("/v1/agent/jobs/result",
+                           {"job_id": job_id, "ok": False,
+                            "error": "cancelled by operator"})
+            except (OSError, RuntimeError):
+                pass
+            return True
         handler = self._tools.get(tool)
         if handler is None:
             self._post("/v1/agent/jobs/result",
@@ -145,13 +202,28 @@ class DeviceAgent:
             result = handler(dict(inputs), {"device_id": self.device_id})
             if not isinstance(result, dict):
                 raise ValueError("tool must return a dict")
-            self._post("/v1/agent/jobs/result",
-                       {"job_id": job_id, "ok": True, "result": result})
-        except Exception as e:  # noqa: BLE001 — report, don't crash
-            try:
+            # Post-execution re-check: a long-running tool may have been
+            # cancelled mid-run. Downgrade the would-be success to a
+            # cancelled report so the device never resurrects a
+            # server-cancelled job to done. complete() is no-op-safe, so
+            # this report preserves the cancelled terminal state.
+            if self.is_job_cancelled(job_id):
                 self._post("/v1/agent/jobs/result",
                            {"job_id": job_id, "ok": False,
-                            "error": f"{type(e).__name__}: {e}"[:500]})
+                            "error": "cancelled by operator"})
+            else:
+                self._post("/v1/agent/jobs/result",
+                           {"job_id": job_id, "ok": True, "result": result})
+        except Exception as e:  # noqa: BLE001 — report, don't crash
+            try:
+                if self.is_job_cancelled(job_id):
+                    self._post("/v1/agent/jobs/result",
+                               {"job_id": job_id, "ok": False,
+                                "error": "cancelled by operator"})
+                else:
+                    self._post("/v1/agent/jobs/result",
+                               {"job_id": job_id, "ok": False,
+                                "error": f"{type(e).__name__}: {e}"[:500]})
             except (OSError, RuntimeError):
                 pass
         return True

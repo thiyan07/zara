@@ -12,6 +12,21 @@ SECRET_MARKERS = [re.compile(p, re.I) for p in
                    r"private[ _-]?key", r"credential")]
 SECRET_CATEGORY = "secret"
 
+def _as_aware(dt):
+    """Coerce datetime/ISO-string to aware datetime for expiry comparison."""
+    from datetime import timezone as _tz
+    from datetime import datetime as _dt
+    if isinstance(dt, str):
+        dt = _dt.fromisoformat(dt)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_tz.utc)
+    return dt
+
+def _coerce_now(now):
+    if now is None:
+        return utcnow()
+    return _as_aware(now)
+
 def _tokens(text: str) -> list[str]:
     return re.findall(r"[a-z0-9]{2,}", text.lower())
 
@@ -97,6 +112,25 @@ class MemoryStore:
     def forget(self, item_id: str) -> bool:
         with self._lock:
             return self._items.pop(item_id, None) is not None
+
+    def purge_expired(self, now=None) -> int:
+        """Delete rows with expires_at < now. Returns count removed.
+
+        Boundary: expires_at == now or None is kept. Superseded
+        provenance rows (metadata.superseded_by) are never purged.
+        Idempotent: second call with same clock returns 0.
+        """
+        ref = _coerce_now(now)
+        with self._lock:
+            expired = [
+                k for k, it in self._items.items()
+                if it.expires_at is not None
+                and not (it.metadata or {}).get("superseded_by")
+                and _as_aware(it.expires_at) < ref
+            ]
+            for k in expired:
+                self._items.pop(k, None)
+        return len(expired)
 
     def recall(self, query: str, top_k: int = 5,
                category: str | None = None) -> list[tuple[MemoryItem, float]]:
@@ -194,3 +228,26 @@ class PersistentMemoryStore(MemoryStore):
         with self._lock, self._db:
             self._db.execute("DELETE FROM memory WHERE id=?", (item_id,))
         return gone
+
+    def purge_expired(self, now=None) -> int:
+        """Delete rows with expires_at < now from SQLite + dict sweep.
+
+        Same boundary/provenance rules as MemoryStore.purge_expired:
+        only strictly-expired, non-superseded rows go. Idempotent.
+        """
+        ref = _coerce_now(now)
+        with self._lock:
+            expired = [
+                k for k, it in self._items.items()
+                if it.expires_at is not None
+                and not (it.metadata or {}).get("superseded_by")
+                and _as_aware(it.expires_at) < ref
+            ]
+        if expired:
+            with self._lock, self._db:
+                self._db.execute(
+                    f"DELETE FROM memory WHERE id IN "
+                    f"({','.join('?' * len(expired))})", expired)
+                for k in expired:
+                    self._items.pop(k, None)
+        return len(expired)

@@ -1,0 +1,27 @@
+{
+ "by_category": {
+  "telemetry-plumbing": 150
+ },
+ "by_cell": {
+  "android/idle": 30,
+  "android/light": 30,
+  "linux/idle": 30,
+  "linux/light": 30,
+  "linux/moderate": 30
+ },
+ "by_source": {
+  "measured": 150
+ },
+ "bytes": 209110,
+ "command": "python3 scripts/calibration_campaign.py + scripts/calibration_android.py; python3 scripts/assemble_calibration.py",
+ "mismatches": [],
+ "records": 150,
+ "schema": "zara.evidence/v1",
+ "seed": 8,
+ "validation": {
+  "duplicate": 0,
+  "invalid": 0,
+  "stale_ts": 0,
+  "valid": 150
+ }
+}
