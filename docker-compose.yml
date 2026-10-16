@@ -8,6 +8,12 @@ services:
       ZARA_MEMORY_DB: /data/memory.db
       ZARA_MISSION_DB: /data/missions.db
       ZARA_AUDIT_DB: /data/audit.db
+      ZARA_FABRIC_DB: /data/fabric.db
+      ZARA_SESSION_DB: /data/sessions.db
+      ZARA_CHAT_DB: /data/chat.db
+      ZARA_DELEGATION_DB: /data/delegation.db
+      ZARA_SCHEDULER_DB: /data/scheduler.db
+      ZARA_TRANSFER_DIR: /data/transfers
     volumes:
       - zara-data:/data
       - ./backups:/srv/zara/backups

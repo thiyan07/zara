@@ -1,4 +1,8 @@
-# Test Report (Stage 4 final)
+# Test Report (Stage 4 final — historical snapshot, not current totals)
+
+> Scope: Stage 4 only (frozen at that milestone). For later stages see
+> STAGE5_TEST_REPORT.md, STAGE6_EMULATOR_TEST_REPORT.md, ANDROID_TEST_REPORT.md,
+> and the per-area suites under tests/ + android/test/.
 
 - Python: **90 passed** (62 Stages 1–3 intact + 28 Stage 4), stable repeats.
   `python -m pytest tests/ -q`

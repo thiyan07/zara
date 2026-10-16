@@ -28,6 +28,35 @@ class NotRegisteredException extends CoreException {
   const NotRegisteredException(super.status, super.body);
 }
 
+/// Maps raw transport failures to structured [CoreException]s (status -1,
+/// kind-prefixed message with method + path only — never bodies, headers,
+/// query strings, or secrets). The original exception text is embedded so
+/// existing substring-based UI branching (offline/auth buckets) keeps
+/// matching. CoreExceptions (status errors, cancellations) pass through
+/// untouched: mapping never masks a server verdict and never reports
+/// success. Pure for testing.
+CoreException mapTransportError(Object e, String method, String path,
+    [Duration timeout = const Duration(seconds: 15)]) {
+  if (e is CoreException) return e;
+  final what = '$method $path';
+  if (e is SocketException) {
+    return CoreException(
+        -1, 'unreachable $what (Core down or tunnel broken): $e');
+  }
+  if (e is HttpException) {
+    return CoreException(
+        -1, 'connection dropped $what (Core restarting?): $e');
+  }
+  if (e is TimeoutException) {
+    return CoreException(
+        -1, 'timed out after ${timeout.inSeconds}s $what: $e');
+  }
+  if (e is FormatException) {
+    return CoreException(-1, 'bad response $what: $e');
+  }
+  return CoreException(-1, 'request failed $what: $e');
+}
+
 class CancelScope {
   bool _cancelled = false;
   void cancel() => _cancelled = true;
@@ -99,6 +128,8 @@ class CoreClient {
       }
       if (resp.statusCode >= 400) _raise(path, resp.statusCode, text);
       return jsonDecode(text) as Map<String, dynamic>;
+    } catch (e) {
+      throw mapTransportError(e, 'POST', path, timeout);
     } finally {
       client.close();
     }
@@ -169,6 +200,51 @@ class CoreClient {
   Future<Map<String, dynamic>> describeCapabilities(
       List<Map<String, dynamic>> records, {CancelScope? cancel}) async {
     return _post('/v1/agent/capabilities/describe', {'records': records},
+        cancel: cancel);
+  }
+
+  /// Fleet discovery (operator token): paired/eligible devices with
+  /// trust/presence/capabilities from fabric views. 401/403 =
+  /// operator-token AuthException (set it on the Tasks tab); never
+  /// device-credential errors. Pure shape: a list of view maps.
+  Future<List<Map<String, dynamic>>> fleetDevices(
+      {CancelScope? cancel}) async {
+    final client = HttpClient();
+    try {
+      final req =
+          await client.getUrl(Uri.parse('$baseUrl/v1/fabric/devices'));
+      executionHeaders().forEach(req.headers.set);
+      final resp = await req.close().timeout(timeout);
+      final text = await resp.transform(utf8.decoder).join();
+      if (resp.statusCode >= 400) {
+        _raise('/v1/fabric/devices', resp.statusCode, text, 'GET');
+      }
+      final raw = jsonDecode(text) as List<dynamic>;
+      return [for (final e in raw) Map<String, dynamic>.from(e as Map)];
+    } catch (e) {
+      throw mapTransportError(e, 'GET', '/v1/fabric/devices', timeout);
+    } finally {
+      client.close();
+    }
+  }
+
+  /// Operator-side enroll: mint a one-time pairing code for [deviceId]
+  /// (shown once, 10-minute TTL, single use). The new device claims it
+  /// from its own Chat tab; discovery never authorizes control by itself.
+  Future<Map<String, dynamic>> enrollDevice(String deviceId,
+      {String kind = 'linux', CancelScope? cancel}) async {
+    return _execPost('/v1/agent/enroll',
+        {'device_id': deviceId, 'kind': kind}, cancel: cancel);
+  }
+
+  /// Operator-side revoke: auth tombstone + pending-job sweep + offline
+  /// mark + transfer cancel. Returns {revoked, queued_jobs_cancelled}.
+  /// The revoked device's next poll/heartbeat is 403; claimed jobs stay
+  /// device-owned until their result lands (rejected) or times out.
+  Future<Map<String, dynamic>> revokeDevice(String deviceId,
+      {CancelScope? cancel}) async {
+    return _execPost(
+        '/v1/agent/revoke?device_id=${Uri.encodeComponent(deviceId)}', {},
         cancel: cancel);
   }
 
@@ -300,6 +376,8 @@ class CoreClient {
       if (resp.statusCode >= 400) _raise(path, resp.statusCode, text, method);
       if (text.trim().isEmpty) return <String, dynamic>{};
       return jsonDecode(text);
+    } catch (e) {
+      throw mapTransportError(e, method, path, timeout);
     } finally {
       client.close();
     }
@@ -392,6 +470,8 @@ class CoreClient {
         _raise('/v1/ready', resp.statusCode, text, 'GET');
       }
       return jsonDecode(text) as Map<String, dynamic>;
+    } catch (e) {
+      throw mapTransportError(e, 'GET', '/v1/ready', timeout);
     } finally {
       client.close();
     }
@@ -460,9 +540,10 @@ class CoreClient {
         _raise('/v1/talk/stream', resp.statusCode, text);
       }
       return TalkStreamHandle._attach(client, resp);
-    } catch (_) {
+    } catch (e) {
       client.close();
-      rethrow;
+      throw mapTransportError(e, 'POST', '/v1/talk/stream',
+          openTimeout ?? timeout);
     }
   }
 
@@ -510,6 +591,8 @@ class CoreClient {
       final text = await resp.transform(utf8.decoder).join();
       if (resp.statusCode >= 400) _raise(path, resp.statusCode, text);
       return jsonDecode(text) as Map<String, dynamic>;
+    } catch (e) {
+      throw mapTransportError(e, 'GET', path, timeout);
     } finally {
       client.close();
     }
@@ -564,6 +647,8 @@ class CoreClient {
       }
       if (resp.statusCode >= 400) _raise(path, resp.statusCode, text);
       return jsonDecode(text) as Map<String, dynamic>;
+    } catch (e) {
+      throw mapTransportError(e, 'POST', path, timeout);
     } finally {
       client.close();
     }
@@ -585,6 +670,8 @@ class CoreClient {
       }
       if (resp.statusCode >= 400) _raise(path, resp.statusCode, text, 'GET');
       return jsonDecode(text) as Map<String, dynamic>;
+    } catch (e) {
+      throw mapTransportError(e, 'GET', path, timeout);
     } finally {
       client.close();
     }
@@ -733,12 +820,18 @@ class TalkStreamHandle {
             if (!_events.isClosed) _events.add(e);
           }
         } catch (e) {
-          if (!_events.isClosed) _events.addError(e);
+          if (!_events.isClosed) {
+            _events.addError(mapTransportError(
+                e, 'STREAM', '/v1/talk/stream'));
+          }
           unawaited(close());
         }
       },
       onError: (Object e) {
-        if (!_events.isClosed) _events.addError(e);
+        if (!_events.isClosed) {
+          _events.addError(
+              mapTransportError(e, 'STREAM', '/v1/talk/stream'));
+        }
         unawaited(close());
       },
       onDone: () {

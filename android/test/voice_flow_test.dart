@@ -151,4 +151,57 @@ void main() {
     expect(f.plays, isEmpty); // stale audio dropped after interrupt
     expect(f.serverInterrupts, equals(1));
   });
+
+  group('platform-leg bounds (Vivo audioPlay wedge)', () {
+    test('wedged capture surfaces VoiceFlowException, never hangs', () async {
+      final c = VoiceFlowController(
+        capture: () => Completer<Uint8List?>().future, // never replies
+        turn: (_) async => <String, dynamic>{},
+        fetchTts: (_) async => Uint8List(0),
+        play: (_) async {},
+        stopCapture: () async {},
+        stopPlayback: () async {},
+        serverInterrupt: () async {},
+        captureTimeout: const Duration(milliseconds: 50),
+      );
+      await expectLater(c.runTurn(),
+          throwsA(isA<VoiceFlowException>().having((e) => '$e', 'msg',
+              contains('capture timed out'))));
+      expect(c.busy, isFalse); // turn released, UI can continue
+    });
+
+    test('wedged playback surfaces VoiceFlowException, never hangs',
+        () async {
+      final c = VoiceFlowController(
+        capture: () async => Uint8List.fromList([1]),
+        turn: (_) async => <String, dynamic>{},
+        fetchTts: (_) async => Uint8List.fromList([2]),
+        play: (_) => Completer<void>().future, // never replies
+        stopCapture: () async {},
+        stopPlayback: () async {},
+        serverInterrupt: () async {},
+        playTimeout: const Duration(milliseconds: 50),
+      );
+      await expectLater(c.speak('hi'),
+          throwsA(isA<VoiceFlowException>().having((e) => '$e', 'msg',
+              contains('playback timed out'))));
+    });
+
+    test('wedged stopPlayback does not block speak past 10 s', () async {
+      var played = false;
+      final c = VoiceFlowController(
+        capture: () async => Uint8List.fromList([1]),
+        turn: (_) async => <String, dynamic>{},
+        fetchTts: (_) async => Uint8List.fromList([2]),
+        play: (_) async {
+          played = true;
+        },
+        stopCapture: () async {},
+        stopPlayback: () => Completer<void>().future, // wedged stop
+        serverInterrupt: () async {},
+      );
+      await c.speak('hi').timeout(const Duration(seconds: 15));
+      expect(played, isTrue);
+    });
+  });
 }

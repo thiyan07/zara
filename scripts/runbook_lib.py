@@ -125,4 +125,5 @@ def db_env_for_dir(db_dir: str) -> dict[str, str]:
         "ZARA_FABRIC_DB": os.path.join(db_dir, "fabric.db"),
         "ZARA_SESSION_DB": os.path.join(db_dir, "session.db"),
         "ZARA_CHAT_DB": os.path.join(db_dir, "chat.db"),
+        "ZARA_DELEGATION_DB": os.path.join(db_dir, "delegation.db"),
     }

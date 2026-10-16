@@ -106,3 +106,54 @@ def test_buy_page_submit_refused(local_page):
             bt.browser_submit({}, {})
     finally:
         srv.shutdown()
+
+
+# ---------- screenshot encoding contract (no silent truncation) ----------
+
+def test_screenshot_small_png_roundtrips_exact():
+    import base64
+    data = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+    out = bt._encode_screenshot(data, "http://x/")
+    assert out["url"] == "http://x/"
+    assert out["bytes"] == len(data)
+    assert base64.b64decode(out["png_base64"]) == data
+
+
+def test_screenshot_rejects_non_png():
+    with pytest.raises(ValueError):
+        bt._encode_screenshot(b"not an image", "http://x/")
+    with pytest.raises(ValueError):
+        bt._encode_screenshot(b"", "http://x/")
+    with pytest.raises(ValueError):
+        bt._encode_screenshot("not-bytes", "http://x/")
+
+
+def test_screenshot_raw_over_limit_errors_with_guidance():
+    big = b"\x89PNG\r\n\x1a\n" + b"\x00" * bt.SCREENSHOT_MAX_RAW_BYTES
+    with pytest.raises(ValueError) as e:
+        bt._encode_screenshot(big, "http://x/")
+    assert "browser.extract" in str(e.value)
+
+
+def test_screenshot_encoded_over_limit_errors():
+    # Just under the raw cap but over the base64 transport cap.
+    n = (bt.SCREENSHOT_MAX_B64_CHARS * 3) // 4 + 100
+    n = min(n, bt.SCREENSHOT_MAX_RAW_BYTES - 100)
+    data = b"\x89PNG\r\n\x1a\n" + b"\x00" * n
+    import base64
+    assert len(base64.b64encode(data).decode()) > \
+        bt.SCREENSHOT_MAX_B64_CHARS
+    with pytest.raises(ValueError) as e:
+        bt._encode_screenshot(data, "http://x/")
+    assert "transport cap" in str(e.value)
+
+
+def test_screenshot_exact_boundary_accepts():
+    import base64
+    # Largest raw payload whose encoding still fits the transport cap.
+    n = (bt.SCREENSHOT_MAX_B64_CHARS * 3) // 4 - 8
+    data = b"\x89PNG\r\n\x1a\n" + b"\x00" * n
+    assert len(base64.b64encode(data).decode()) <= \
+        bt.SCREENSHOT_MAX_B64_CHARS
+    out = bt._encode_screenshot(data, "http://x/")
+    assert out["bytes"] == len(data)

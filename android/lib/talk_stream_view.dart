@@ -46,6 +46,11 @@ class TalkBackend {
   final CoreClient client;
   const TalkBackend(this.client);
 
+  // Requester-local by design: deviceId here is the AUTHENTICATED
+  // requester identity (who is talking), never an execution target.
+  // /v1/talk does not pin execution devices; cross-device control goes
+  // through Tasks (fleet target selector + resolver pinning). Never pass
+  // a selected fleet target as this deviceId.
   Future<TalkStreamHandle> openStream(
           {required String text,
           required String deviceId,

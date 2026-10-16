@@ -7,6 +7,7 @@ Failures and denials are reported back truthfully — never fabricated.
 """
 from __future__ import annotations
 import json
+import re
 import threading
 import time
 import uuid
@@ -130,6 +131,44 @@ def _tokens(text: str) -> set[str]:
     return set(re.findall(r"[a-z]{3,}", text.lower()))
 
 
+# Promissory-response guard (battery recharge-time defect): a `response`
+# action that promises future work ("I will calculate and tell you",
+# "let me check and report back") with no verified result behind it ends
+# the turn with a vow nothing fulfills — the user waits forever. These
+# patterns are deliberately narrow: first-person future action verbs and
+# "let me <action-verb>". "Let me know ..." (a question to the user) and
+# past-tense summaries never match. Pure for testing.
+_PROMISE_RES = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\bi\s+will\s+(calculate|compute|check|look|find\s+out|get\s+back|"
+        r"tell\s+you|let\s+you\s+know|monitor|investigate|work\s+that\s+out|"
+        r"figure\s+that\s+out|run\s+that|verify|confirm\s+that)\b",
+        r"\bi['\u2019]ll\s+(calculate|compute|check|look\s+into|find\s+out|"
+        r"get\s+back\s+to\s+you|tell\s+you|let\s+you\s+know|monitor|"
+        r"investigate|verify|confirm\s+that)\b",
+        r"\blet\s+me\s+(check|look|calculate|compute|find\s+out|verify|"
+        r"investigate|run\s+that|confirm\s+that)\b",
+    )
+)
+
+
+def looks_promissory(text: str) -> bool:
+    """True when [text] promises future assistant action. Pure for testing."""
+    if not text:
+        return False
+    return any(p.search(text) is not None for p in _PROMISE_RES)
+
+
+# Honest fallback when a redirected reply is STILL promissory: terminal,
+# no vow, nothing pending, actionable. Never invents data.
+PROMISE_FALLBACK_REPLY = (
+    "I can't follow through on what I just suggested — I have no way to "
+    "do more work after this reply. Nothing was started and nothing is "
+    "pending. Please ask for a single check I can run and report right now."
+)
+
+
 class ConversationLoop:
     def __init__(self, *, provider: ModelProvider, ctx: ContextManager,
                  memory: MemoryService, registry: ToolRegistry,
@@ -209,6 +248,7 @@ class ConversationLoop:
         deadline = time.time() + self.config.max_time_s
         seen_calls: set[str] = set()
         tool_calls = 0
+        promise_redirected = False  # promissory-response guard: one redirect
         try:
             reply_text = ""
             status = "responded"
@@ -228,6 +268,29 @@ class ConversationLoop:
                 action = outcome.action
                 if action is None or action.type == "response":
                     reply_text = (action.text if action else "") or outcome.text
+                    # Promissory-response guard: a reply that vows future
+                    # work with zero verified results behind it (tool_calls
+                    # == 0) would strand the user — nothing runs after the
+                    # turn ends. Redirect ONCE to a complete reply; if the
+                    # very next reply still vows, use the honest fallback.
+                    # Bounded: at most one extra reasoning step, still
+                    # inside the turn budget. Real tool-backed summaries
+                    # never match (verified work done) and pass through.
+                    if (not promise_redirected and tool_calls == 0
+                            and looks_promissory(reply_text)):
+                        promise_redirected = True
+                        text = ("SYSTEM: your draft reply promises future "
+                                "action (calculate/check and report later), "
+                                "which you cannot perform — this turn ends "
+                                "with your next reply and nothing runs "
+                                "afterward. Rewrite it as a complete reply "
+                                "now: use only verified tool results already "
+                                "in context, or state the limitation plainly "
+                                "and what the user can provide. Do not "
+                                "promise anything.")
+                        continue
+                    if promise_redirected and looks_promissory(reply_text):
+                        reply_text = PROMISE_FALLBACK_REPLY
                     break
                 if action.type == "clarification":
                     reply_text = action.question
@@ -330,6 +393,19 @@ class ConversationLoop:
                 return _abort()
             self._finish_mission(mission.id, "error", str(e))
             reply = self._provider_error_reply(e)
+            if e.kind == LLMErrorKind.TIMEOUT and tool_calls > 0:
+                # Truthful timeout: the static mapping claims "nothing was
+                # executed", which is false once a tool ran and verified
+                # (observed live: system.battery verified, then the turn
+                # budget died on the summary step). Name the completed
+                # work, point at its record, and invite a narrower retry —
+                # never claim nothing ran, never promise cross-turn recall.
+                short = exec_id[:8] if exec_id else "unknown"
+                reply = (f"I ran out of time after `{tool_name or 'a tool'}` "
+                         f"already executed and verified (execution {short} "
+                         f"— its result is on the Tasks tab). I couldn't "
+                         f"compose the final answer in time; nothing else "
+                         f"ran. Please try again with a narrower question.")
             self.sessions.append(session.id, "assistant", reply)
             span.finish(status="error", error=str(e)[:200])
             self.turns.finish(turn_id)
@@ -337,10 +413,13 @@ class ConversationLoop:
                 emit("error", {"message": reply[:300]})
                 emit("done", {"reply": reply, "status": "error",
                               "turn_id": turn_id, "mission_id": mission.id,
-                              "execution_id": "", "session_id": session.id})
+                              "execution_id": exec_id,
+                              "session_id": session.id})
             return TurnResult(reply=reply, status="error",
                               mission_id=mission.id, trace_id=span.trace_id,
-                              turn_id=turn_id, session_id=session.id)
+                              turn_id=turn_id, session_id=session.id,
+                              execution_id=exec_id, device_id=dev_id,
+                              tool=tool_name)
 
     def resume_after_approval(self, execution_id: str,
                               session_id: str = "",

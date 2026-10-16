@@ -468,4 +468,110 @@ void main() {
       expect(keys.add(key), isFalse); // second tap drops
     });
   });
+
+  group('cross-device targeting wire shape (loopback stub)', () {
+    test('direct submit pins the remote device id', () async {
+      final stub = _Stub()
+        ..reply = {
+          'id': 'ex-9',
+          'tool': 'system.battery',
+          'device_id': 'laptop-1',
+          'status': 'running',
+        };
+      final server = await _serve(stub);
+      try {
+        final out = await _client(server).submitExecution(
+            tool: 'system.battery', inputs: {}, deviceId: 'laptop-1');
+        expect(stub.body['device_id'], 'laptop-1');
+        // Authoritative executor comes from the response, not the request.
+        expect(out['device_id'], 'laptop-1');
+      } finally {
+        await server.close(force: true);
+      }
+    });
+
+    test('resolve pins deviceId (no silent fallback fields invented)',
+        () async {
+      final stub = _Stub()
+        ..reply = {
+          'id': 'ex-10',
+          'tool': 'system.battery',
+          'device_id': 'laptop-1',
+          'status': 'running',
+          'resolution': {
+            'status': 'resolved',
+            'device_id': 'laptop-1',
+            'fallback_used': false,
+            'substituted': false,
+          },
+        };
+      final server = await _serve(stub);
+      try {
+        final out = await _client(server).resolveExecution(
+            capability: 'system.battery', inputs: {}, deviceId: 'laptop-1');
+        expect(stub.body['device_id'], 'laptop-1');
+        expect(stub.body['capability'], 'system.battery');
+        final res = out['resolution'] as Map<String, dynamic>;
+        expect(res['substituted'], isFalse);
+      } finally {
+        await server.close(force: true);
+      }
+    });
+
+    test('fleet list parses device views', () async {
+      final stub = _Stub()
+        ..reply = {
+          'items': [
+            {
+              'device_id': 'laptop-1',
+              'trust': 'trusted',
+              'presence': 'online',
+              'capabilities': ['system.battery'],
+            }
+          ],
+        };
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      server.listen((req) async {
+        stub.method = req.method;
+        stub.path = req.uri.path;
+        await utf8.decoder.bind(req).join();
+        req.response.statusCode = 200;
+        req.response.headers.contentType = ContentType.json;
+        // GET /v1/fabric/devices returns a bare JSON list.
+        req.response.write(jsonEncode((stub.reply['items'] as List)));
+        await req.response.close();
+      });
+      try {
+        final list = await _client(server).fleetDevices();
+        expect(stub.method, 'GET');
+        expect(stub.path, '/v1/fabric/devices');
+        expect(list.length, 1);
+        expect(list.first['device_id'], 'laptop-1');
+      } finally {
+        await server.close(force: true);
+      }
+    });
+
+    test('requester identity stays self while target pins remote', () async {
+      // The requested execution target (body device_id) must never
+      // overwrite the authenticated requester (X-Device-Id headers).
+      final stub = _Stub()
+        ..reply = {
+          'id': 'ex-11',
+          'tool': 'system.battery',
+          'device_id': 'laptop-1',
+          'status': 'running',
+        };
+      final server = await _serve(stub);
+      try {
+        await _client(server).submitExecution(
+            tool: 'system.battery', inputs: {}, deviceId: 'laptop-1');
+        expect(stub.body['device_id'], 'laptop-1');
+        expect(stub.headers['x-device-id'], 'android-phone');
+        expect(stub.headers['x-device-key'], 'k1');
+      } finally {
+        await server.close(force: true);
+      }
+    });
+  });
 }

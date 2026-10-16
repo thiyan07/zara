@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'app_state.dart';
@@ -33,6 +34,188 @@ void main() => runApp(const ZaraApp());
 /// (approved/denied/expired/cancelled): the approval card is stale and
 /// should be dismissed locally, not retried. Pure for testing.
 bool isStaleApproval(Object e) => e.toString().contains('409');
+
+/// Maps a pairing-claim failure to an operator-actionable message. Pure
+/// for testing. Server truth (core/device_auth.py): codes are single-use,
+/// 10-minute TTL, refused when revoked or already consumed. A 403 whose
+/// body says "invalid or expired" is genuinely ambiguous server-side
+/// (unknown hash), so the message names both causes instead of guessing.
+String describeClaimError(Object e) {
+  final s = e.toString();
+  if (s.contains('404')) {
+    return 'Core has no such pairing — wrong code, or Core restarted. '
+        'Ask the operator for a fresh code.';
+  }
+  if (s.contains('403')) {
+    // Order matters: the ambiguous server text "invalid or expired
+    // pairing code" contains "expired" but NOT "pairing code expired",
+    // so the exact TTL phrase must win before the generic contains().
+    if (s.contains('pairing code expired')) {
+      return 'Pairing code expired (10-minute TTL). '
+          'Ask the operator for a fresh code.';
+    }
+    if (s.contains('revoked')) {
+      return 'This device was revoked. '
+          'Ask the operator to enroll it again for a fresh code.';
+    }
+    if (s.contains('already used')) {
+      return 'Code already used — each code works once. '
+          'Ask the operator for a fresh code.';
+    }
+    return 'Claim refused — unknown or expired code (codes last '
+        '10 minutes and work once). Ask the operator for a fresh code.';
+  }
+  if (s.contains('401')) {
+    return 'Operator auth rejected — check the backend address, then retry.';
+  }
+  return 'Could not reach Core ($s). Check the backend address and retry.';
+}
+
+/// One-line fleet presence/trust badge for the Paired-devices list.
+/// Unknown shapes render as unknown — never as online. Pure for testing.
+String describeFleetDevice(Map<String, dynamic> d) {
+  final id = '${d['device_id'] ?? '?'}';
+  final trust = '${d['trust'] ?? 'unknown'}';
+  final presence = '${d['presence'] ?? 'unknown'}';
+  final caps = d['capabilities'];
+  final n = caps is List ? caps.length : 0;
+  return '$id — trust:$trust presence:$presence caps:$n';
+}
+
+/// One Tasks-target option derived from a fleet view. `id == ''` is the
+/// This-device default. Disabled options carry the concise reason.
+/// Pure for testing.
+class TaskTargetOption {
+  final String id;
+  final String label;
+  final bool enabled;
+  final String reason;
+  const TaskTargetOption(
+      {required this.id,
+      required this.label,
+      required this.enabled,
+      this.reason = ''});
+}
+
+/// Builds the Tasks "Run on" options from fleet discovery. The This-device
+/// default is always first and always enabled (current self-targeting
+/// behavior preserved). Remote eligibility is a client-side pre-check
+/// ONLY — Core re-validates trust/presence/capability authoritatively at
+/// submit and approve time, and this function never grants anything:
+/// - trust must be trusted/temporarily_trusted (revoked/others disabled)
+/// - presence must be online/degraded (offline/stale/unknown disabled;
+///   degraded stays eligible: throttled-but-alive, Core gates load)
+/// - the device must advertise the task tool, except util.echo which is a
+///   local Core tool with no fabric route (self-only).
+/// Unknown shapes and duplicates disable safely, never enable blindly.
+/// Pure for testing.
+List<TaskTargetOption> fleetTargetOptions({
+  required List<Map<String, dynamic>> fleet,
+  required String selfId,
+  required String tool,
+}) {
+  final out = [
+    const TaskTargetOption(
+        id: '', label: 'This device (default)', enabled: true),
+  ];
+  final seen = <String>{selfId};
+  for (final d in fleet) {
+    final id = '${d['device_id'] ?? ''}';
+    if (id.isEmpty || !seen.add(id) || id == selfId) continue;
+    final trust = '${d['trust'] ?? 'unknown'}';
+    final presence = '${d['presence'] ?? 'unknown'}';
+    final caps = d['capabilities'];
+    final capList =
+        caps is List ? [for (final c in caps) '$c'] : <String>[];
+    String? blocked;
+    if (tool == 'util.echo') {
+      // Local Core tool with no fabric route: pinning it at a device
+      // would park an unclaimable job. Self-only, stated plainly.
+      blocked = 'local tool — runs on Core (self-only)';
+    } else if (trust == 'revoked') {
+      blocked = 'revoked — re-enroll to repair';
+    } else if (trust != 'trusted' && trust != 'temporarily_trusted') {
+      blocked = 'not trusted ($trust)';
+    } else if (presence == 'offline') {
+      blocked = 'offline';
+    } else if (presence == 'stale' || presence == 'unknown') {
+      blocked = 'stale — waiting for heartbeat';
+    } else if (!capList.contains(tool)) {
+      blocked = 'lacks $tool';
+    }
+    out.add(TaskTargetOption(
+      id: id,
+      label: '$id — $trust/$presence (${capList.length} caps)',
+      enabled: blocked == null,
+      reason: blocked ?? '',
+    ));
+  }
+  return out;
+}
+
+/// Merges a fresh server execution view into the stored task row.
+/// The client-side `requested_device` annotation survives refreshes and
+/// cancels: server maps overwrite everything else authoritatively, but
+/// never carry the request (so a merge must not drop it, and must never
+/// promote it into `device_id`). Pure for testing.
+Map<String, dynamic> mergeTaskRow(
+    Map<String, dynamic> stored, Map<String, dynamic> fresh) {
+  final requested = stored['requested_device'];
+  final merged = Map<String, dynamic>.from(fresh);
+  if (requested != null) merged['requested_device'] = requested;
+  return merged;
+}
+
+/// Lines for a task card separating the REQUESTED target (client-side
+/// annotation at submit time) from the AUTHORITATIVE executing device
+/// (`device_id` in server results) plus substitution/verified status.
+/// Never presents the requested device as the executing one: when the
+/// server has not confirmed an executor, only the target line appears.
+/// Pure for testing.
+List<String> describeTaskDevices(Map<String, dynamic> raw) {
+  final requested = '${raw['requested_device'] ?? ''}';
+  final actual = '${raw['device_id'] ?? ''}';
+  final binding = raw['binding'];
+  final resolution = raw['resolution'];
+  final substituted = (binding is Map && binding['substituted'] == true) ||
+      (resolution is Map && resolution['substituted'] == true);
+  final verified = raw['verified'] == true;
+  final lines = <String>[];
+  if (requested.isNotEmpty) lines.add('target: $requested');
+  if (actual.isNotEmpty) {
+    lines.add('runs on: $actual${verified ? ' (verified)' : ''}');
+  }
+  if (substituted && requested.isNotEmpty && actual.isNotEmpty) {
+    lines.add('substituted: Core routed to $actual instead of $requested');
+  }
+  return lines;
+}
+
+/// 404 from Core on decide = execution unknown server-side (cancelled then
+/// wiped by a Core restart, expired, or never existed): the card is stale
+/// and must be dismissed with an explanation — never presented as pending,
+/// never reported as success. Auth failures (401/403) are NOT stale: they
+/// stay explicit and fail closed. Pure for testing.
+bool isUnknownExecutionApproval(Object e) => e.toString().contains('404');
+
+/// Post-approval poll-nudge guard. Pure for testing: a successful approve
+/// triggers one immediate best-effort `_pollJobs` instead of waiting for
+/// the next 30/60s tick — but only when the device can actually reach
+/// Core right now (online + network, same guard as `_tick`). Denials,
+/// failed decisions, and offline/degraded states never nudge (denials
+/// dispatch nothing; offline/degraded polling belongs to the loop, which
+/// owns backoff). Callers must swallow nudge errors: a failed poll must
+/// never turn a successful approval into a reported failure.
+bool shouldNudgePollAfterApproval({
+  required bool approve,
+  required bool succeeded,
+  required String lifecycleState,
+  required bool networkOnline,
+}) =>
+    approve &&
+    succeeded &&
+    networkOnline &&
+    lifecycleState == DeviceLifecycleState.online;
 
 /// Parse the Tasks free-text inputs box. Blank = {} (safe tools take no
 /// inputs). Must decode to a JSON OBJECT; syntax errors and non-objects
@@ -165,6 +348,19 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
   bool get a11yReady => a11y['ready'] == true;
   AssistantStatus assistant = const AssistantStatus();
   String lastError = '';
+  // Stale-approval notice (reconciliation/404 dismissals). Display-only:
+  // never a success claim, never masking lastError (auth/transport).
+  String approvalNotice = '';
+  // Background-resume opt-in (default off). Loaded from the native
+  // marker at boot; the toggle writes it back through the bridge.
+  // Foreground-service evaluation (2026-10): NOT justified. A persistent
+  // FGS would need a permanent notification, battery exemption, and would
+  // still be killed by battery optimization / background-start limits on
+  // the user's Vivo + stock Android; it cannot provide unattended low-
+  // latency agent operation. WorkManager is likewise deferrable-only
+  // (quotas, no continuity). So recovery = opt-in tap-to-resume prompt
+  // only; no FGS, no WorkManager chain, no mic at boot.
+  bool _resumeOptIn = false;
   int _failures = 0;
   String secureBackend = 'keystore';
   String voiceDiag = 'idle';
@@ -193,8 +389,35 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
   // free-text JSON validated by parseTaskInputs. Approval flow is untouched:
   // waiting_for_permission rows point at the Approval section, which still
   // resolves device-scoped through Core (never local execution).
-  static const taskTools = ['system.battery', 'system.network', 'util.echo'];
+  static const taskTools = [
+    'system.battery',
+    'system.network',
+    'system.wifi.state',
+    'system.bluetooth.state',
+    'system.mobile_data.state',
+    'system.airplane_mode.state',
+    'system.wifi.set',
+    'system.bluetooth.set',
+    'system.airplane_mode.set',
+    'util.echo'
+  ];
   String _taskTool = 'system.battery';
+  // Cross-device target for task submits: '' = This device (default,
+  // preserves self-targeting). A fleet device id pins the submit through
+  // the existing resolver device-pinning fields; Core re-validates
+  // trust/presence/capability authoritatively and the row shows the
+  // authoritative executor separately (see describeTaskDevices).
+  String _taskTarget = '';
+  // Primary navigation (Chat/Tasks/History/Settings). Conditional tab
+  // content: only the active tab is in the tree. Talk panel state is
+  // preserved across switches by its GlobalKey; form controllers live on
+  // this state object, so drafts survive tab switches.
+  int _tab = 0;
+
+  /// Pending approval count for the Chat destination badge.
+  int get _pendingApprovalCount => notifCenter.pending
+      .where((x) => x.channel == 'zara_approvals')
+      .length;
   final _taskInputsCtrl = TextEditingController(text: '{}');
   final _taskTokenCtrl = TextEditingController(); // operator token, memory only
   // History -> conversation resume: the talk panel keeps its state across
@@ -240,6 +463,18 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
       a11yInspect: () => bridge.a11yInspect(),
       a11yInspectWithParams: (params) => bridge.a11yInspectWithParams(params),
       a11yTap: (pkg, nodeId) => bridge.a11yTap(pkg, nodeId),
+      wifiState: () => bridge.wifiState(),
+      bluetoothState: () => bridge.bluetoothState(),
+      hotspotState: () => bridge.hotspotState(),
+      mobileDataState: () => bridge.mobileDataState(),
+      airplaneModeState: () => bridge.airplaneModeState(),
+      openSettings: (screen) => bridge.openSettings(screen),
+      openApp: (pkg) => bridge.openApp(pkg),
+      setWifi: (enabled) => bridge.setWifi(enabled),
+      setBluetooth: (enabled) => bridge.setBluetooth(enabled),
+      setHotspot: (enabled) => bridge.setHotspot(enabled),
+      setMobileData: (enabled) => bridge.setMobileData(enabled),
+      setAirplaneMode: (enabled) => bridge.setAirplaneMode(enabled),
     );
     lifecycle.onChange = (_) => _render();
     voiceFlow = VoiceFlowController(
@@ -263,6 +498,12 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
     );
     // Wake opt-in release reuses the existing stop path (all three legs).
     wakeOptIn.onRelease = () => voiceFlow.interrupt();
+    // Detector start check: probe the app-private model dir first so
+    // the error names exactly what is missing; without an on-device
+    // engine every path still refuses honestly. Runs only on explicit
+    // user action (Settings toggle), never at boot, never background.
+    wakeOptIn.onStartListening = () async =>
+        describeWakeModelError(await bridge.wakeModelStatus());
     _boot();
   }
 
@@ -272,6 +513,15 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
 
   Future<void> _boot() async {
     await bridge.createNotificationChannels();
+    try {
+      _resumeOptIn = await bridge.resumeOptIn();
+    } catch (_) {/* default stays off */}
+    try {
+      // Restore the persisted wake preference WITHOUT starting anything:
+      // listening never auto-starts at boot (explicit foreground action
+      // only). Absent/unreadable reads as OFF.
+      wakeOptIn.loadPersisted(await bridge.wakeOptIn());
+    } catch (_) {/* default stays off */}
     await _refresh();
     secureBackend = secureStore.backend;
     // ignore: avoid_print
@@ -371,7 +621,12 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
         print('zara:describe failed: $e');
       }
       _regAttempts = 0;
-      lifecycle.move(DeviceLifecycleState.online);
+      // Physical-device fix: re-register runs on retry loops while the
+      // state machine is already online (re-pair, reg retry). Re-asserting
+      // the current state is a no-op, never an illegal transition; any
+      // *different* illegal target still throws (see
+      // stage9_lifecycle_test.dart).
+      lifecycle.moveIfChanged(DeviceLifecycleState.online);
       setState(() {
         conn = CoreLinkState.online;
         lastError = '';
@@ -379,12 +634,17 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
       });
       _startLoop();
     } on AuthException catch (e) {
+      // Same halt as the tick path: revoked keys must not keep any timer
+      // alive. Re-pair (_connect -> _register) restarts the loop.
+      _loop?.cancel();
       _regRetry?.cancel();
+      await wakeOptIn.forceStandby();
       await secureStore.clearDeviceCredentials();
       lifecycle.handleHttp(403, hasIdentity: true);
       setState(() {
         conn = CoreLinkState.error;
         lastError = 'revoked: $e';
+        _tab = 0; // recovery action (pairing) lives on Chat
       });
     } catch (e) {
       // Register-while-unreachable (Stage 11 fix): without a retry the
@@ -392,7 +652,11 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
       // Timer-driven bounded backoff; cancelled on pause/dispose.
       _regAttempts += 1;
       _regRetry?.cancel();
-      _regRetry = Timer(registerRetryDelay(_regAttempts), () {
+      // Jittered bounded backoff: equal-jitter over the attempt delay so
+      // post-outage reconnects spread out instead of hammering Core.
+      final wait = applyJitter(
+          registerRetryDelay(_regAttempts), Random().nextDouble());
+      _regRetry = Timer(wait, () {
         // Only retry if nobody moved the lifecycle meanwhile
         // (logout/revoke/pairing wins over the timer).
         if (mounted &&
@@ -460,7 +724,9 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
       if (battery.pct != null &&
           battery.pct! < AndroidBatteryLevel.criticalBelow &&
           !battery.charging) {
-        lifecycle.move(DeviceLifecycleState.degraded);
+        // Same guard: repeated low-battery heartbeats must not throw
+        // degraded -> degraded on every poll.
+        lifecycle.moveIfChanged(DeviceLifecycleState.degraded);
         setState(() => conn = CoreLinkState.degraded);
       } else if (lifecycle.state == DeviceLifecycleState.degraded &&
           (battery.pct == null ||
@@ -476,9 +742,18 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
         }
       });
     } on AuthException {
+      // Revoked/invalid credentials: wipe, halt all retry timers, and park
+      // on pairing. The loop restarts only via a successful re-pair
+      // (_register -> _startLoop); nothing retries against dead keys.
+      _loop?.cancel();
+      _regRetry?.cancel();
+      await wakeOptIn.forceStandby();
       await secureStore.clearDeviceCredentials();
       lifecycle.handleHttp(403, hasIdentity: true);
-      setState(() => conn = CoreLinkState.error);
+      setState(() {
+        conn = CoreLinkState.error;
+        _tab = 0; // revoked: pair again on Chat
+      });
     } on NotRegisteredException {
       // Backend restarted: re-register once, never loop.
       try {
@@ -520,6 +795,20 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
         }
       } catch (_) {/* skip malformed, keep polling */}
     }
+    // Reconcile against the authoritative server list (this successful
+    // fetch only — failures keep every card, fail-closed). Approval cards
+    // the server no longer lists are stale (cancelled/decided/expired, or
+    // wiped by a Core restart): dismiss locally with an explanation.
+    // Genuine pending approvals are always server-listed, so they stay.
+    final dismissed = notifCenter.reconcileApprovals(
+        list.map((e) => '${e['id'] ?? ''}').toSet());
+    if (dismissed.isNotEmpty) {
+      approvalNotice =
+          'stale approval${dismissed.length == 1 ? '' : 's'} removed — '
+          'Core no longer lists ${dismissed.map((n) => n.executionId.isEmpty ? n.id : n.executionId).join(', ')} '
+          'as pending (cancelled, decided, expired, or Core restarted); nothing was executed';
+      changed = true;
+    }
     if (changed && mounted) setState(() {});
   }
 
@@ -531,10 +820,12 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
         // e.g. revoked/logged-out: fall through to the pairing path anyway
       }
     }
-    setState(() => lastError = '');
+    setState(() {
+      lastError = '';
+      approvalNotice = '';
+    });
     try {
-      await client.claim(codeCtrl.text.trim(), 'android-phone');
-      await secureStore.saveDeviceCredentials(
+      await client.claim(codeCtrl.text.trim(), 'android-phone');      await secureStore.saveDeviceCredentials(
         deviceId: client.deviceId ?? 'android-phone',
         deviceKey: client.deviceKey ?? '',
       );
@@ -544,13 +835,103 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
       await _register();
     } on CoreException catch (e) {
       lifecycle.move(DeviceLifecycleState.error);
-      setState(() => lastError = '$e');
+      setState(() {
+        lastError = describeClaimError(e);
+        _tab = 0; // pairing lives on Chat
+      });
+    }
+  }
+
+  /// Fleet discovery (Settings → Paired devices). Operator token required
+  /// (same memory-only field as Tasks); 401/403 means the token is
+  /// missing or wrong — never a device-credential problem.
+  List<Map<String, dynamic>> _fleet = [];
+  String _fleetError = '';
+  bool _fleetLoading = false;
+  String _enrollCode = '';
+  final _enrollIdCtrl = TextEditingController(text: 'laptop-2');
+
+  void _syncOperatorToken() {
+    final token = _taskTokenCtrl.text.trim();
+    client.operatorToken = token.isEmpty ? null : token;
+  }
+
+  Future<void> _refreshFleet() async {
+    _syncOperatorToken();
+    setState(() {
+      _fleetLoading = true;
+      _fleetError = '';
+    });
+    try {
+      final list = await client.fleetDevices();
+      if (mounted) {
+        setState(() {
+          _fleet = list;
+          _fleetLoading = false;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _fleetLoading = false;
+          _fleetError = e is AuthException
+              ? 'Operator token missing or rejected — set it on the Tasks tab.'
+              : 'Fleet list failed: $e';
+        });
+      }
+    }
+  }
+
+  Future<void> _enrollFleetDevice() async {
+    _syncOperatorToken();
+    final id = _enrollIdCtrl.text.trim();
+    if (id.isEmpty) {
+      setState(() => _fleetError = 'Enter a device id to enroll first.');
+      return;
+    }
+    setState(() {
+      _fleetError = '';
+      _enrollCode = '';
+    });
+    try {
+      final out = await client.enrollDevice(id);
+      if (mounted) {
+        setState(() => _enrollCode =
+            '${out['pairing_code'] ?? ''} (single use, 10 minutes)');
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _fleetError = e is AuthException
+            ? 'Operator token missing or rejected — set it on the Tasks tab.'
+            : 'Enroll failed: $e');
+      }
+    }
+  }
+
+  Future<void> _revokeFleetDevice(String id) async {
+    _syncOperatorToken();
+    setState(() => _fleetError = '');
+    try {
+      final out = await client.revokeDevice(id);
+      if (mounted) {
+        setState(() => _fleetError =
+            'Revoked $id (queued jobs cancelled: '
+            '${out['queued_jobs_cancelled'] ?? 0}). List refreshed.');
+        await _refreshFleet();
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _fleetError = e is AuthException
+            ? 'Operator token missing or rejected — set it on the Tasks tab.'
+            : 'Revoke failed: $e');
+      }
     }
   }
 
   Future<void> _logout() async {
     _loop?.cancel();
     _regRetry?.cancel();
+    await wakeOptIn.forceStandby();
     try {
       await client.disconnect();
     } catch (_) {}
@@ -558,7 +939,10 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
     client.deviceId = null;
     client.deviceKey = null;
     lifecycle.logout();
-    setState(() => conn = CoreLinkState.disconnected);
+    setState(() {
+      approvalNotice = '';
+      conn = CoreLinkState.disconnected;
+    });
   }
 
   /// Voice turn glue (physical validation): bounded capture -> Core turn
@@ -587,8 +971,8 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
       setState(() => voiceDiag =
           'heard: "$voiceTranscript" (peak $peakStr dBFS) — reply spoken via TTS');
       // ignore: avoid_print
-      print('zara:voice-turn transcript="$voiceTranscript" '
-          'reply="$voiceReply" status=${res.status}');
+      print('zara:voice-turn transcript="${redactSecretsForDisplay(voiceTranscript)}" '
+          'reply="${redactSecretsForDisplay(voiceReply)}" status=${res.status}');
     } on VoiceFlowException catch (e) {
       setState(() => voiceDiag = '$e');
     } on AudioBridgeException catch (e) {
@@ -598,6 +982,11 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
         voiceDiag = 'core: $e';
         lastError = '$e';
       });
+    } catch (e) {
+      // Transport failures (unreachable/dropped/timed-out) and any other
+      // unexpected error must complete the diagnostic explicitly — the UI
+      // must never wedge on "recording…" and never imply success.
+      setState(() => voiceDiag = 'voice failed: $e');
     } finally {
       if (mounted) setState(() => voiceBusy = false);
     }
@@ -622,14 +1011,19 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
           lastError = '$e';
         });
       }
+    } catch (e) {
+      if (mounted) setState(() => voiceDiag = 'playback failed: $e');
     } finally {
       if (mounted) setState(() => voiceBusy = false);
     }
   }
 
   Future<void> _stopVoice() async {
-    await voiceFlow.interrupt();
+    // Responsive first: the button always clears immediately, even if a
+    // wedged platform leg makes interrupt() hang (interrupt legs are all
+    // best-effort with their own bounds).
     if (mounted) setState(() => voiceDiag = 'stopped');
+    await voiceFlow.interrupt();
   }
 
   /// Shared mic-permission flow (permission panel button + wake opt-in
@@ -677,7 +1071,7 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
         voiceDiag = 'transcript sent to chat';
       });
       // ignore: avoid_print
-      print('zara:voice-to-chat reply="$voiceChatReply"');
+      print('zara:voice-to-chat reply="${redactSecretsForDisplay(voiceChatReply)}"');
     } on CoreException catch (e) {
       if (mounted) {
         setState(() {
@@ -874,18 +1268,24 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
       setState(() => _taskFormError = '$e');
       return;
     }
-    // Per tool+inputs duplicate guard: a second tap with the identical
-    // payload while the first is still in flight is dropped explicitly
-    // (never a second execution). Distinct payloads proceed.
-    final inflightKey = taskSubmitKey(_taskTool, inputs);
-    if (!_taskInflightKeys.add(inflightKey)) {
-      setState(() => _taskError =
-          'already submitting $_taskTool with these inputs — wait for the first request');
-      return;
-    }
     final token = _taskTokenCtrl.text.trim();
     client.operatorToken = token.isEmpty ? null : token;
-    final deviceId = client.deviceId ?? 'android-phone';
+    final selfId = client.deviceId ?? 'android-phone';
+    // Requested target: This-device default preserves self-targeting.
+    // A fleet id pins through the resolver's device-pinning fields;
+    // Core re-validates authoritatively (approval/policy/risk unchanged).
+    final target = _taskTarget.isEmpty ? selfId : _taskTarget;
+    // Per tool+inputs+target duplicate guard: a second tap with the
+    // identical payload while the first is still in flight is dropped
+    // explicitly (never a second execution). Same tool+inputs to a
+    // DIFFERENT device is a distinct key and proceeds. Core 409 remains
+    // the server-side backstop for races that cross processes.
+    final inflightKey = '$target:${taskSubmitKey(_taskTool, inputs)}';
+    if (!_taskInflightKeys.add(inflightKey)) {
+      setState(() => _taskError =
+          'already submitting $_taskTool to $target with these inputs — wait for the first request');
+      return;
+    }
     final useResolve =
         taskShouldResolve(tool: _taskTool, resolveEnabled: _taskUseResolve);
     // One key per user action: transport retries and the offline drain
@@ -894,7 +1294,7 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
     final payload = buildExecutionSubmitBody(
         tool: _taskTool,
         inputs: inputs,
-        deviceId: deviceId,
+        deviceId: target,
         idempotencyKey: idemKey);
     if (!network.online) {
       // Offline queue stores the direct-submit envelope (resolve needs a
@@ -910,20 +1310,60 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
     setState(() => _taskBusy = true);
     try {
       await _flushTaskQueue();
+      if (target != selfId) {
+        // Recheck the remote target immediately before submission: the
+        // fleet snapshot may be stale (device went offline, was revoked,
+        // lost trust, or dropped the capability since the list loaded).
+        // A dedicated throwing fetch (not _refreshFleet, which reports
+        // into state): refresh failure aborts loudly — never submit
+        // blind, never silently fall back to another device.
+        try {
+          final fresh = await client.fleetDevices();
+          if (!mounted) return;
+          setState(() {
+            _fleet = fresh;
+            _fleetError = '';
+          });
+        } catch (e) {
+          if (mounted) {
+            setState(() {
+              _fleetError = 'fleet recheck failed: $e';
+              _taskError =
+                  'target $target not rechecked (fleet refresh failed) — nothing submitted';
+            });
+          }
+          return;
+        }
+        final options = fleetTargetOptions(
+            fleet: _fleet, selfId: selfId, tool: _taskTool);
+        final match = options.where((o) => o.id == target).toList();
+        if (match.isEmpty || !match.first.enabled) {
+          if (mounted) {
+            setState(() => _taskError = match.isEmpty
+                ? 'target $target left the fleet — nothing submitted (refresh the list)'
+                : 'target $target unavailable: ${match.first.reason} — nothing submitted');
+          }
+          return;
+        }
+      }
       final out = useResolve
           ? await client.resolveExecution(
               capability: _taskTool,
               inputs: inputs,
-              deviceId: deviceId,
+              deviceId: target,
               idempotencyKey: idemKey)
           : await client.submitExecution(
               tool: _taskTool,
               inputs: inputs,
-              deviceId: deviceId,
+              deviceId: target,
               idempotencyKey: idemKey);
       if (!mounted) return;
       setState(() {
         if (out.containsKey('id')) {
+          // Client-side annotation only: the REQUESTED target, kept next
+          // to (never merged into) the authoritative device_id that later
+          // refreshes overwrite from server results.
+          out['requested_device'] = target;
           _tasks.insert(0, out);
           if (_tasks.length > 20) _tasks.removeLast();
         } else {
@@ -976,7 +1416,7 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
         _taskRefreshFailures.remove(id);
         final i = _tasks.indexWhere((t) => '${t['id']}' == id);
         if (i >= 0) {
-          _tasks[i] = out;
+          _tasks[i] = mergeTaskRow(_tasks[i], out);
         } else {
           _tasks.insert(0, out);
         }
@@ -1010,7 +1450,7 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
       setState(() {
         final i = _tasks.indexWhere((t) => '${t['id']}' == id);
         if (i >= 0) {
-          _tasks[i] = out;
+          _tasks[i] = mergeTaskRow(_tasks[i], out);
         } else {
           _tasks.insert(0, out);
         }
@@ -1036,12 +1476,42 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
       try {
         await client.ackNotification(n.id);
       } catch (_) {}
+      // Approval just granted a dispatch: poll jobs immediately instead of
+      // waiting for the next 30/60s tick. Guarded by
+      // shouldNudgePollAfterApproval (online + network) and best-effort —
+      // a poll failure must never mask the approval outcome.
+      if (shouldNudgePollAfterApproval(
+          approve: approve,
+          succeeded: true,
+          lifecycleState: lifecycle.state,
+          networkOnline: network.online)) {
+        try {
+          await _pollJobs(CancelScope());
+        } catch (_) {}
+      }
     } on CoreException catch (e) {
       // 409 = Core already decided (approved/denied/expired elsewhere):
       // the card is stale, so dismiss it locally instead of nagging.
-      // Anything else keeps the card for retry.
+      // 404 = Core never knew it (cancelled + restarted, expired, or
+      // missing): dismiss with an explanation — never keep it presented
+      // as pending, never report success. Anything else (401/403 auth,
+      // transport) keeps the card for retry with an explicit error.
       if (isStaleApproval(e)) {
         notifCenter.ack(n.id);
+        approvalNotice =
+            'stale approval removed — ${n.executionId.isEmpty ? n.id : n.executionId} '
+            'was already decided elsewhere; nothing further to do';
+        try {
+          await client.ackNotification(n.id);
+        } catch (_) {}
+        if (mounted) setState(() {});
+        return;
+      }
+      if (isUnknownExecutionApproval(e)) {
+        notifCenter.ack(n.id);
+        approvalNotice =
+            'stale approval removed — ${n.executionId.isEmpty ? n.id : n.executionId} '
+            'is unknown on Core (cancelled, expired, or Core restarted); nothing was executed';
         try {
           await client.ackNotification(n.id);
         } catch (_) {}
@@ -1100,7 +1570,15 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
     final busy =
         _refreshing.contains(id) || _cancelling.contains(id);
     final shortId = id.length <= 12 ? id : '${id.substring(0, 12)}…';
-    return Card(
+    // Accessibility: the card exposes one summary label (tool + status +
+    // requested/executor) so screen readers and UI automation identify
+    // the row without coordinate taps; buttons carry stable keys.
+    return Semantics(
+      container: true,
+      label: 'Task $tool, status $status, target '
+          '${describeTaskDevices(raw).join('; ')}',
+      child: Card(
+      key: ValueKey('task-card-$id'),
       child: Padding(
         padding: const EdgeInsets.all(8),
         child: Column(
@@ -1109,6 +1587,11 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
             Text('$tool · $shortId',
                 style: Theme.of(context).textTheme.titleSmall),
             Text('status: $status (job: $jobState)'),
+            // Requested target vs authoritative executor: the executor
+            // comes only from server results (device_id); the request is
+            // a client annotation. Never conflated (see
+            // describeTaskDevices).
+            for (final line in describeTaskDevices(raw)) Text(line),
             if (approval)
               const Text('Approval required — see Approval section above',
                   style: TextStyle(color: Colors.orange)),
@@ -1124,11 +1607,13 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
               spacing: 8,
               children: [
                 OutlinedButton(
+                    key: ValueKey('task-refresh-$id'),
                     onPressed:
                         busy ? null : () => _refreshTask(id),
                     child: const Text('Refresh')),
                 if (!terminal)
                   OutlinedButton(
+                      key: ValueKey('task-cancel-$id'),
                       onPressed:
                           busy ? null : () => _cancelTask(id),
                       child: const Text('Cancel')),
@@ -1136,6 +1621,7 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
             ),
           ],
         ),
+      ),
       ),
     );
   }
@@ -1147,6 +1633,10 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
     if (state == AppLifecycleState.paused) {
       _loop?.cancel();
       _regRetry?.cancel();
+      // Foreground-only wake detection: backgrounding stops the listener
+      // (generation bump drops late events); re-enable explicitly after
+      // resume. Never auto-restarts.
+      unawaited(wakeOptIn.forceStandby());
     } else if (state == AppLifecycleState.resumed &&
         shouldResumeLoop(lifecycle.state)) {
       // Degraded included: backgrounding while degraded must not kill the
@@ -1168,6 +1658,7 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
     grantCtrl.dispose();
     _taskInputsCtrl.dispose();
     _taskTokenCtrl.dispose();
+    _enrollIdCtrl.dispose();
     super.dispose();
   }
 
@@ -1196,17 +1687,13 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
         body: ListView(
           padding: const EdgeInsets.all(16),
           children: [
+            if (_tab == 0) ...[
             Text('Status: ${s.statusLine()}',
                 style: Theme.of(context).textTheme.titleMedium),
             const SizedBox(height: 4),
             Text(network.describe()),
             Text('Battery: ${battery.pct?.toStringAsFixed(0) ?? '?'}% '
                 '(charging: ${battery.charging}, level: ${battery.level()})'),
-            Text('Voice: ${voice.state} — wake phrase "$wakePhrase"'),
-            Text('Assistant: ${assistant.describe()}'),
-            Text('Mic permission: ${perms['microphone'] ?? '?'} | '
-                'Notifications: ${perms['notifications'] ?? '?'}'),
-            Text('Keys: $secureBackend'),
             if (lastError.isNotEmpty)
               Text('Error: $lastError',
                   style: const TextStyle(color: Colors.red)),
@@ -1223,6 +1710,10 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
                   onPressed: _connect, child: const Text('Connect “Hey Zara” device')),
               const SizedBox(height: 8),
             ],
+            // Stale-approval explanation lives outside the pending block:
+            // after reconciliation dismisses every card there is nothing
+            // pending, but the user must still see where the card went.
+            if (approvalNotice.isNotEmpty) Text(approvalNotice),
             if (notifCenter.hasPendingApprovals) ...[
               Text('Approval required',
                   style: Theme.of(context).textTheme.titleMedium),
@@ -1238,10 +1729,14 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
                             mainAxisSize: MainAxisSize.min,
                             children: [
                               TextButton(
+                                  key: ValueKey(
+                                      'approval-approve-${n.executionId}'),
                                   onPressed: () =>
                                       _decide(n, n.executionId, true),
                                   child: const Text('Approve')),
                               TextButton(
+                                  key: ValueKey(
+                                      'approval-deny-${n.executionId}'),
                                   onPressed: () =>
                                       _decide(n, n.executionId, false),
                                   child: const Text('Deny')),
@@ -1258,6 +1753,18 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
                   title: Text(n.title),
                   subtitle: Text(n.body)),
             const SizedBox(height: 8),
+            ], // end Chat tab (status/pairing/approvals)
+            if (_tab == 3) ...[
+            Text('This device',
+                style: Theme.of(context).textTheme.titleMedium),
+            Text('Voice: ${voice.state} — wake phrase "$wakePhrase"'),
+            Text('Assistant: ${assistant.describe()}'),
+            Text('Mic permission: ${perms['microphone'] ?? '?'} | '
+                'Notifications: ${perms['notifications'] ?? '?'}'),
+            Text('Keys: $secureBackend'),
+            const SizedBox(height: 12),
+            Text('Permissions',
+                style: Theme.of(context).textTheme.titleMedium),
             Wrap(
               spacing: 8,
               runSpacing: 8,
@@ -1289,8 +1796,95 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
                     onPressed: _logout, child: const Text('Sign out')),
               ],
             ),
+            CheckboxListTile(
+              value: _resumeOptIn,
+              controlAffinity: ListTileControlAffinity.leading,
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Resume prompt after reboot (opt-in)'),
+              subtitle: const Text(
+                  'Android cannot keep the agent polling in the background. '
+                  'When on, a reboot posts one "tap to resume" notification; '
+                  'tapping it reopens Zara, which restores credentials and '
+                  'reconnects normally. No background listening, no mic.'),
+              onChanged: (v) async {
+                if (v == null) return;
+                await bridge.setResumeOptIn(v);
+                if (mounted) setState(() => _resumeOptIn = v);
+              },
+            ),
             const SizedBox(height: 12),
-            Text('Voice diagnostic (physical)',
+            Text('Paired devices',
+                style: Theme.of(context).textTheme.titleMedium),
+            Text('Fleet discovery via operator token (Tasks tab). '
+                'Revoking here tombstones credentials, sweeps queued jobs, '
+                'and marks the device offline immediately.'),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                OutlinedButton(
+                    onPressed: _fleetLoading ? null : _refreshFleet,
+                    child: Text(
+                        _fleetLoading ? 'Refreshing…' : 'Refresh list')),
+              ],
+            ),
+            if (_fleetError.isNotEmpty) Text(_fleetError),
+            for (final d in _fleet)
+              ListTile(
+                dense: true,
+                title: Text(describeFleetDevice(d)),
+                subtitle: Text(
+                    'trust:${d['trust'] ?? '?'} '
+                    'presence:${d['presence'] ?? '?'} '
+                    'seen:${d['last_seen'] ?? '?'}'),
+                // Run-here preselects the Tasks target and navigates;
+                // it never executes (submit + approval still required,
+                // target rechecked then). Hidden for revoked rows.
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if ('${d['trust'] ?? ''}' != 'revoked')
+                      OutlinedButton(
+                        key: ValueKey(
+                            'fleet-run-here-${d['device_id'] ?? ''}'),
+                        onPressed: () => setState(() {
+                          _taskTarget = '${d['device_id'] ?? ''}';
+                          _tab = 1;
+                        }),
+                        child: const Text('Run here'),
+                      ),
+                    const SizedBox(width: 8),
+                    OutlinedButton(
+                      key: ValueKey(
+                          'fleet-revoke-${d['device_id'] ?? ''}'),
+                      onPressed: () =>
+                          _revokeFleetDevice('${d['device_id'] ?? ''}'),
+                      child: const Text('Revoke'),
+                    ),
+                  ],
+                ),
+              ),
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _enrollIdCtrl,
+                    decoration: const InputDecoration(
+                      labelText: 'New device id to enroll',
+                      hintText: 'e.g. laptop-2',
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                OutlinedButton(
+                    onPressed: _enrollFleetDevice,
+                    child: const Text('Enroll')),
+              ],
+            ),
+            if (_enrollCode.isNotEmpty)
+              SelectableText('Pairing code: $_enrollCode'),
+            const SizedBox(height: 12),
+            Text('Voice diagnostic (advanced)',
                 style: Theme.of(context).textTheme.titleMedium),
             Text(voiceDiag, style: Theme.of(context).textTheme.bodyMedium),
             if (voiceCapture.isNotEmpty) Text(voiceCapture),
@@ -1328,17 +1922,20 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
             const SizedBox(height: 12),
             Text('Wake-word opt-in (foundation)',
                 style: Theme.of(context).textTheme.titleMedium),
-            const Text('Explicit opt-in only (off by default, this session '
-                'only). Needs mic permission plus a healthy battery; the '
-                'wake engine flag below decides what is claimed.'),
+            const Text('Explicit opt-in only (off by default; preference '
+                'persists but listening never auto-starts — enable it in '
+                'the foreground after each restart). Needs mic permission '
+                'plus a healthy battery; the wake engine flag below decides '
+                'what is claimed.'),
             const SizedBox(height: 4),
             WakeOptInPanel(
               state: wakeOptIn,
               onRequestMic: _requestMic,
               onRefresh: _refresh,
+              onPersist: (v) => bridge.setWakeOptIn(v),
             ),
             const SizedBox(height: 12),
-            Text('Transfer diagnostic (physical)',
+            Text('Transfer diagnostic (advanced)',
                 style: Theme.of(context).textTheme.titleMedium),
             Text(xferDiag, style: Theme.of(context).textTheme.bodyMedium),
             if (xferDetail.isNotEmpty) Text(xferDetail),
@@ -1371,11 +1968,12 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
                     child: const Text('Stop')),
               ],
             ),
-            const SizedBox(height: 12),
+            ], // end Settings tab part 1 (device/permissions/voice/wake/transfer)
+            if (_tab == 1) ...[
             Text('Tasks (Core executions)',
                 style: Theme.of(context).textTheme.titleMedium),
-            const Text('Async tools via Core. Approvals still resolve in '
-                'the Approval section above (device-scoped, never local).'),
+            const Text('Async tools via Core. Approvals appear on the Chat tab '
+                '(device-scoped, never local).'),
             const SizedBox(height: 8),
             DropdownButtonFormField<String>(
               initialValue: _taskTool,
@@ -1414,8 +2012,9 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
               title: const Text('Route via capability (resolve)'),
               subtitle: const Text(
                   'system.* submits go through POST /v1/executions/resolve '
-                  '(Core decides the device); util.echo always uses direct '
-                  'submit (local tool, no capability route).'),
+                  '(pinned to the Run-on target when set, else Core picks); '
+                  'util.echo always uses direct submit (local tool, no '
+                  'capability route).'),
               onChanged: (v) {
                 if (v != null) setState(() => _taskUseResolve = v);
               },
@@ -1425,17 +2024,68 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
               runSpacing: 8,
               children: [
                 FilledButton(
+                    key: const ValueKey('task-submit'),
                     onPressed: _taskBusy ? null : _submitTask,
                     child: const Text('Submit task')),
                 if (_taskQueue.length > 0)
                   Text('Queued offline: ${_taskQueue.length}'),
               ],
             ),
+            Builder(builder: (context) {
+              // Fleet options recomputed per build so presence/trust/cap
+              // changes (and tool switches) re-gate immediately. A stale
+              // selection (device left the fleet) falls back to This
+              // device for DISPLAY; submit revalidates and aborts loudly.
+              final options = fleetTargetOptions(
+                  fleet: _fleet,
+                  selfId: client.deviceId ?? 'android-phone',
+                  tool: _taskTool);
+              final value = options.any((o) => o.id == _taskTarget)
+                  ? _taskTarget
+                  : '';
+              return DropdownButtonFormField<String>(
+                // initialValue + key (not `value`, deprecated): external
+                // preselection (fleet "Run here") rebuilds the field.
+                key: ValueKey('task-target-$_taskTarget'),
+                initialValue: value,
+                decoration: const InputDecoration(
+                    labelText: 'Run on (fleet)',
+                    helperText:
+                        'This device default. Refresh devices for the latest presence/trust.'),
+                items: [
+                  for (final o in options)
+                    DropdownMenuItem(
+                        value: o.id,
+                        enabled: o.enabled,
+                        child: Text(o.enabled
+                            ? o.label
+                            : '${o.label} — ${o.reason}')),
+                ],
+                onChanged: (v) {
+                  if (v != null) setState(() => _taskTarget = v);
+                },
+              );
+            }),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                OutlinedButton(
+                    onPressed: _fleetLoading ? null : _refreshFleet,
+                    child: Text(_fleetLoading
+                        ? 'Refreshing devices…'
+                        : 'Refresh devices')),
+              ],
+            ),
+            if (_fleetError.isNotEmpty) Text(_fleetError),
             if (_taskError.isNotEmpty)
               Text('Tasks: $_taskError',
                   style: const TextStyle(color: Colors.red)),
+            if (_tasks.isEmpty)
+              const Text('No tasks yet — submit one above to track it here.'),
             for (final t in _tasks) _taskCard(context, t),
-            const SizedBox(height: 12),
+            ], // end Tasks tab
+            if (_tab == 0) ...[
             Text('Conversation (talk stream)',
                 style: Theme.of(context).textTheme.titleMedium),
             const Text('Streaming replies via POST /v1/talk/stream (SSE); '
@@ -1463,10 +2113,12 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
             ),
             ),
             const SizedBox(height: 12),
+            ], // end Chat tab (conversation)
+            if (_tab == 2) ...[
             Text('Memory review',
                 style: Theme.of(context).textTheme.titleMedium),
             const Text('Search + forget + purge via the operator memory '
-                'contracts (operator token from Tasks section). Pending '
+                'contracts (operator token on the Tasks tab). Pending '
                 'candidates load on manual Refresh; Accept/Reject confirms '
                 'then reloads the list.'),
             const SizedBox(height: 8),
@@ -1475,17 +2127,19 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
             Text('History',
                 style: Theme.of(context).textTheme.titleMedium),
             const Text('Past conversations via the operator session '
-                'contracts (operator token from Tasks section). Read-only '
+                'contracts (operator token on the Tasks tab). Read-only '
                 'browsing plus explicit delete; opening history never sends '
                 'new prompts. Continue resumes a session in the Conversation '
-                'section above (same session id, transcript read-only).'),
+                'Chat tab (same session id, transcript read-only).'),
             const SizedBox(height: 8),
             HistoryPanel(
                 client: client,
                 tokenCtrl: _taskTokenCtrl,
                 onResume: _resumeTalk),
             const SizedBox(height: 12),
-            Text('Diagnostics',
+            ], // end History tab (memory + past conversations)
+            if (_tab == 3) ...[
+            Text('Diagnostics (advanced)',
                 style: Theme.of(context).textTheme.titleMedium),
             const Text('Connection + provider (display only) + last error + '
                 'governor flags + the explicit one-tap live provider check '
@@ -1517,6 +2171,40 @@ class _ZaraAppState extends State<ZaraApp> with WidgetsBindingObserver {
                 title: Text(c.name),
                 subtitle: Text(c.note),
               ),
+            ], // end Settings tab part 2 (diagnostics/provider/capabilities)
+          ],
+        ),
+        bottomNavigationBar: NavigationBar(
+          selectedIndex: _tab,
+          onDestinationSelected: (i) {
+            if (mounted) setState(() => _tab = i);
+          },
+          destinations: [
+            NavigationDestination(
+              icon: _pendingApprovalCount > 0
+                  ? Badge(
+                      label: Text('$_pendingApprovalCount'),
+                      child: const Icon(Icons.chat_bubble_outline),
+                    )
+                  : const Icon(Icons.chat_bubble_outline),
+              selectedIcon: const Icon(Icons.chat_bubble),
+              label: 'Chat',
+            ),
+            const NavigationDestination(
+              icon: Icon(Icons.task_outlined),
+              selectedIcon: Icon(Icons.task),
+              label: 'Tasks',
+            ),
+            const NavigationDestination(
+              icon: Icon(Icons.history_outlined),
+              selectedIcon: Icon(Icons.history),
+              label: 'History',
+            ),
+            const NavigationDestination(
+              icon: Icon(Icons.settings_outlined),
+              selectedIcon: Icon(Icons.settings),
+              label: 'Settings',
+            ),
           ],
         ),
       ),

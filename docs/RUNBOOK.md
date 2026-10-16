@@ -149,12 +149,13 @@ python device/linux/agent.py --core http://127.0.0.1:$P --device-id laptop-1 \
   --key-file /tmp/opencode/laptop-1.key
 ```
 
-Android agent (`android/README.md` is a Flutter stub; flows verified per
+Android agent (Flutter app under `android/`; flows per
 `docs/ANDROID_STATUS.md`, build steps per `docs/ANDROID_TEST_REPORT.md`):
 
 ```bash
 cd android && flutter test && flutter analyze
 flutter build apk --debug
+# substitute your serial from `adb devices` for emulator-XXXX below
 adb -s emulator-XXXX install -r build/app/outputs/flutter-apk/app-debug.apk
 # point the app at http://<host>:$P (emulator: 10.0.2.2:$P), then enroll→claim→register in-app
 ```
@@ -218,3 +219,53 @@ passed. `df`: /tmp 114M used before and after (noise-level); test DB dir
 removed. New files only: `scripts/zara_local.sh`,
 `scripts/runbook_lib.py`, `docs/RUNBOOK.md`, `tests/test_runbook.py` —
 nothing committed.
+
+## 7. Approval/polling race fixes + live laptop verification (2026-10-11)
+
+Races fixed in `core/execution.py` (`_granting` admission set, locked
+compare-and-set grant, serialized idempotent submit), `core/device_tools.py`
+(post-enqueue cancel check), `core/jobs.py` (`complete_once()` atomic
+first-delivery flag), `core/app.py` (required-capability revalidation for
+direct submits; single bus/audit emission), `android/lib/main.dart`
+(post-approval immediate poll nudge, guarded + best-effort).
+Regression suite: `tests/test_grant_race.py` (12 tests, Barrier-based —
+G1/G3/G4/G6b fail on pre-fix code, pass on fixed code).
+
+Live laptop run (isolated port 18202, `--env-file .env` for the real
+provider; agent = real `device/linux/agent.py` as `laptop-1`, 5s poll):
+
+```
+bash scripts/zara_local.sh start --port 18202 --env-file .env
+# enroll (operator) -> pairing code -> claim once -> run agent
+curl -H "Authorization: Bearer $ASSISTANT_TOKEN" -X POST 127.0.0.1:18202/v1/agent/enroll \
+  -H 'Content-Type: application/json' -d '{"device_id":"laptop-1","kind":"linux"}'
+python device/linux/agent.py --core http://127.0.0.1:18202 --device-id laptop-1 --claim <code>
+python device/linux/agent.py --core http://127.0.0.1:18202 --device-id laptop-1 &
+# submit CONFIRM task -> 202 parked -> approve -> agent claims -> succeeded+verified
+# duplicate approve -> 409 "not awaiting approval"
+# /v1/talk exact-reply + provider-check prove the genuine hosted path
+bash scripts/zara_local.sh stop --port 18202   # + kill agent by verified PID
+```
+
+Observed: `shell.safe_readonly uname -a` → `succeeded`, verified, genuine
+kernel output in ~4s. Pairing codes destroyed after claim; device key at
+`~/.config/zara/laptop-1.key` (mode 600, outside the repo).
+
+## 8. Manual Android lifecycle (physical device NOT TESTED — no device
+## connected, no UI harness; follow these steps on hardware)
+
+1. `adb devices` shows the phone; Zara app installed (`pm list packages |
+   grep zara`).
+2. Start Core on the laptop LAN IP (not 127.0.0.1): record the port.
+3. In-app: point at `http://<laptop-ip>:$P`, enroll → claim → register;
+   confirm `GET /v1/devices` shows the phone `online`.
+4. Submit a harmless CONFIRM task (e.g. `system.battery` for the phone,
+   or a laptop-dispatched `shell.safe_readonly uname -a`).
+5. Phone shows the approval card; approve exactly that action (do not
+   approve anything else; never approve HIGH_RISK blindly).
+6. Laptop agent claims within one poll interval; Core records terminal
+   state; phone displays the verified result on next poll/refresh.
+7. Re-tap approve and re-send the result: expect 409 / idempotent `{"ok":
+   true}` with no second execution (server guards; see G6b/G6c).
+8. Do not bypass approval, enable denied capabilities, run destructive
+   commands, wipe app data, or disturb port 8080.

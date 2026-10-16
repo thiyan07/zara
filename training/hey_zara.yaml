@@ -1,0 +1,66 @@
+# Baseline training config for the exact phrase "hey zara" (openWakeWord).
+# Adapted from upstream examples/custom_model.yml with the task baseline:
+# 1,000 train / 1,000 val samples, 10,000 steps, false-activation penalty
+# weight 1,500. Personal/non-commercial use only (mixed-license data).
+#
+# Key local adaptations (documented, not silent):
+# - feature_data_files is EMPTY: the 2000-hr ACAV100M features file
+#   (~15 GB, CC-BY-NC-SA-4.0) cannot fit a 19 GB laptop with a 10 GB
+#   floor. Negatives come from generated adversarial clips + audioset
+#   + FMA instead. Expect a higher false-accept rate than stock models;
+#   measure it (see training/validate_heyzara.py) before trusting.
+# - No tflite conversion locally (tensorflow-cpu==2.8.1 caps at
+#   Python <=3.10; this laptop has 3.11/3.14). ONNX output only.
+# - TTS voice: en_US-libritts_r-medium.pt (194 MB, rhasspy release).
+#   Pronunciation verified 2026-10-14: espeak-ng phonemizes "hey zara"
+#   as h eI z A: r @ (clean); Piper clips are healthy speech
+#   (0.71 s, rms ~5500); tiny.en check inconclusive on 0.7 s clips
+#   (all variants heard as "he's our..."), so the natural spelling
+#   stands. "hey sarah"/"hey tara" ship as adversarial negatives.
+
+model_name: "hey_zara"
+target_phrase:
+  - "hey zara"
+custom_negative_phrases:
+  - "hey sarah"
+  - "hey tara"
+  - "hey sierra"
+  - "sahara"
+  - "zebra"
+
+n_samples: 1000
+n_samples_val: 1000
+
+tts_batch_size: 50
+augmentation_batch_size: 16
+
+piper_sample_generator_path: "./piper-sample-generator"
+output_dir: "./hey_zara_model"
+
+rir_paths:
+  - "<train-data>/mit_rirs"
+background_paths:
+  # audioset tar removed: upstream restructured the dataset (old
+  # bal_train09.tar URL 404s). FMA-1hr streaming replaces it; see header.
+  - "<train-data>/fma"
+background_paths_duplication_rate:
+  - 1
+
+false_positive_validation_data_path: "./validation_set_features.npy"
+augmentation_rounds: 1
+
+# ACAV100M features deliberately omitted (disk + license); see header.
+feature_data_files: {}
+
+batch_n_per_class:
+  "adversarial_negative": 64
+  "positive": 64
+
+model_type: "dnn"
+layer_size: 32
+
+steps: 10000
+max_negative_weight: 1500
+target_accuracy: 0.6
+target_recall: 0.25
+target_false_positives_per_hour: 0.2

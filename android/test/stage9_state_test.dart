@@ -63,6 +63,75 @@ void main() {
     expect(a.executionId, equals('exec-1'));
   });
 
+  group('stale-approval reconciliation (physical Vivo restart defect)', () {
+    DeviceNotification approval(String id, [String exec = 'exec-9']) =>
+        DeviceNotification.fromJson({
+          'id': id,
+          'title': 'Approval required: gui.tap',
+          'body': 'target_package=dev.zara.zara_android',
+          'execution_id': exec,
+        });
+
+    test('cancelled + Core restart: absent-from-server card is dismissed',
+        () {
+      final center = NotificationCenter();
+      expect(center.show(approval('notif-a', 'exec-cancelled')), isTrue);
+      expect(center.hasPendingApprovals, isTrue);
+      // Post-restart fetch: server lists nothing pending.
+      final dismissed = center.reconcileApprovals(<String>{});
+      expect(dismissed.map((n) => n.id), equals(['notif-a']));
+      expect(center.hasPendingApprovals, isFalse);
+      expect(center.pending, isEmpty);
+    });
+
+    test('genuine pending approval remains visible and actionable', () {
+      final center = NotificationCenter();
+      expect(center.show(approval('notif-b', 'exec-waiting')), isTrue);
+      // Server still lists it: reconcile keeps it, Approve stays enabled
+      // (executionId non-empty drives the Approve/Deny buttons).
+      expect(center.reconcileApprovals({'notif-b'}), isEmpty);
+      expect(center.hasPendingApprovals, isTrue);
+      expect(center.pending.single.executionId, equals('exec-waiting'));
+    });
+
+    test('repeated reconciliation is idempotent, no duplicate cards', () {
+      final center = NotificationCenter();
+      final n = approval('notif-c');
+      expect(center.show(n), isTrue);
+      expect(center.show(n), isFalse);
+      expect(center.reconcileApprovals(<String>{}), hasLength(1));
+      // Second run: already acked, never returned twice, never re-added.
+      expect(center.reconcileApprovals(<String>{}), isEmpty);
+      expect(center.show(n), isFalse);
+      expect(center.pending, isEmpty);
+    });
+
+    test('late fetch responses never resurrect acked cards', () {
+      final center = NotificationCenter();
+      final n = approval('notif-d');
+      expect(center.show(n), isTrue);
+      center.ack('notif-d'); // decided or reconciled away
+      // Stale server list still containing the id must not re-show it.
+      expect(center.show(n), isFalse);
+      expect(center.pending, isEmpty);
+      expect(center.hasPendingApprovals, isFalse);
+    });
+
+    test('non-approval channels are untouched by reconciliation', () {
+      final center = NotificationCenter();
+      final status = DeviceNotification.fromJson({
+        'id': 'notif-s',
+        'title': 'heartbeat ok',
+        'body': 'online',
+      });
+      expect(center.show(status), isTrue);
+      expect(center.show(approval('notif-e')), isTrue);
+      final dismissed = center.reconcileApprovals(<String>{});
+      expect(dismissed.map((n) => n.id), equals(['notif-e']));
+      expect(center.pending.map((n) => n.id), equals(['notif-s']));
+    });
+  });
+
   test('push tokens validated, rotated, deduped; fallback is poll', () async {
     final t = MockPushTransport();
     final p = PushProvider(t);
@@ -92,6 +161,20 @@ void main() {
         approvalPending: true,
         updatedAt: DateTime.now());
     expect(appr.statusLine(), equals('Approval required'));
+    final authFail = ZaraUiState(
+        connection: 'error',
+        lifecycle: 'error',
+        lastError: 'auth 403',
+        updatedAt: DateTime.now());
+    expect(authFail.statusLine(), contains('Authentication failed'));
+    expect(authFail.statusLine(), contains('fresh code'));
+    // Transport errors stay generic and never borrow the auth wording.
+    final transport = ZaraUiState(
+        connection: 'error',
+        lifecycle: 'error',
+        lastError: 'SocketException: connection refused',
+        updatedAt: DateTime.now());
+    expect(transport.statusLine(), isNot(contains('Authentication failed')));
     final m = appr.toRestoreMap();
     expect(m['device_id'], equals('android-phone'));
     expect(m.keys.any((k) => k.contains('key') || k.contains('token')),

@@ -1,5 +1,13 @@
 # Real-World Validation (what was actually exercised)
 
+> Historical note (2026-10-13): this file predates the voice, Android
+> physical-device, fabric-transfer, and emulator stages. Its "nothing
+> validated" scope below covers only the era it was written in; later
+> evidence lives in VOICE_STATUS.md, VOICE_TEST_REPORT.md,
+> ANDROID_STATUS.md, ANDROID_TEST_REPORT.md, STAGE6_EMULATOR_TEST_REPORT.md,
+> and device provisos in CAPABILITY_INVENTORY.md. Do not quote this file
+> against those reports.
+
 ## PHYSICALLY VALIDATED
 
 Nothing requiring external hardware, hosted models, or cloud. (This file

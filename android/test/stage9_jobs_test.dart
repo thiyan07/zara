@@ -167,8 +167,7 @@ void main() {
     });
   });
 
-  group('Rung-2 a11y lab pilot (device mirror)', () {
-    AndroidJobRunner runnerWithA11y() => AndroidJobRunner(
+  group('Rung-2 a11y lab pilot (device mirror)', () {    AndroidJobRunner runnerWithA11y() => AndroidJobRunner(
           battery: () => {},
           network: () => {},
           a11yInspect: () async => {
@@ -496,6 +495,259 @@ void main() {
       expect(out.ok, isTrue);
       expect(out.result['supported'], isTrue);
       expect(out.result['nodes'].first['class'], equals('LegacyView'));
+    });
+  });
+
+  group('Phase 1 sys-control (read-only states + settings/app open)', () {
+    AndroidJobRunner phase1Runner() => AndroidJobRunner(
+          battery: () =>
+              {'battery_pct': 55, 'charging': true, 'power_save': false},
+          network: () => {'network': 'wifi', 'metered': false},
+          wifiState: () async => {'supported': true, 'state': 'enabled'},
+          bluetoothState: () async => {'supported': true, 'state': 'disabled'},
+          hotspotState: () async => {'supported': false, 'reason': 'no public API'},
+          mobileDataState: () async => {'supported': true, 'state': 'enabled'},
+          airplaneModeState: () async => {'supported': true, 'state': 'disabled'},
+          openSettings: (screen) async =>
+              {'supported': true, 'screen': screen},
+          openApp: (pkg) async => {'package': pkg, 'launched': true},
+        );
+
+    test('state tools pass bridge snapshots through', () async {
+      final r = phase1Runner();
+      for (final t in [
+        'system.wifi.state',
+        'system.bluetooth.state',
+        'system.mobile_data.state',
+        'system.airplane_mode.state',
+      ]) {
+        final out = await r.run(job(t, 'job-$t'));
+        expect(out.ok, isTrue, reason: t);
+        expect(out.result['supported'], isTrue, reason: t);
+      }
+    });
+
+    test('unsupported hotspot surfaces as failure with reason', () async {
+      final r = phase1Runner();
+      final out =
+          await r.run(job('system.hotspot.state', 'job-hotspot'));
+      expect(out.ok, isFalse);
+      expect(out.error, contains('no public API'));
+    });
+
+    test('charging_time never invents a duration', () async {
+      final r = phase1Runner();
+      final out =
+          await r.run(job('system.battery.charging_time', 'job-ct'));
+      expect(out.ok, isTrue);
+      expect(out.result['time_to_full_minutes'], isNull);
+    });
+
+    test('settings tools open exactly the mapped screen', () async {
+      final r = phase1Runner();
+      for (final t in [
+        'system.wifi.settings',
+        'system.bluetooth.settings',
+        'system.hotspot.settings',
+        'system.mobile_data.settings',
+        'system.airplane_mode.settings',
+      ]) {
+        final out = await r.run(job(t, 'job-$t'));
+        expect(out.ok, isTrue, reason: t);
+      }
+    });
+
+    test('app.open allowlisted package launches; others refused', () async {
+      var called = false;
+      final r = AndroidJobRunner(
+        battery: () => {},
+        network: () => {},
+        openApp: (pkg) async {
+          called = true;
+          return {'package': pkg, 'launched': true};
+        },
+      );
+      final ok = await r.run(DeviceJob(
+          jobId: 'job-app-ok',
+          tool: 'system.app.open',
+          inputs: {'package': 'com.android.settings'},
+          timeoutS: 5,
+          executionId: 'e'));
+      expect(ok.ok, isTrue);
+      expect(called, isTrue);
+      called = false;
+      for (final pkg in [
+        'com.android.systemui',
+        'android',
+        'com.evil.pwn',
+        '',
+      ]) {
+        final out = await r.run(DeviceJob(
+            jobId: 'job-app-$pkg',
+            tool: 'system.app.open',
+            inputs: {'package': pkg},
+            timeoutS: 5,
+            executionId: 'e'));
+        expect(out.ok, isFalse, reason: pkg);
+        expect(out.error, contains('allowlist'));
+      }
+      expect(called, isFalse);
+    });
+
+    test('missing gateways report unavailable, never execute', () async {
+      final r = runner(); // no phase-1 probes wired
+      for (final t in [
+        'system.wifi.state',
+        'system.app.open',
+      ]) {
+        final out = await r.run(DeviceJob(
+            jobId: 'job-$t',
+            tool: t,
+            inputs: t == 'system.app.open'
+                ? {'package': 'com.android.settings'}
+                : {},
+            timeoutS: 5,
+            executionId: 'e'));
+        expect(out.ok, isFalse, reason: t);
+        expect(out.error, contains('unavailable'));
+      }
+    });
+  });
+
+  group('Phase 2 sys-control setters (tiered, verified-or-honest)', () {
+    DeviceJob setJob(String tool, dynamic enabled, [String id = 'job-set']) =>
+        DeviceJob(
+            jobId: id,
+            tool: tool,
+            inputs: {'enabled': enabled},
+            timeoutS: 20,
+            executionId: 'exec-set');
+
+    AndroidJobRunner setRunner() => AndroidJobRunner(
+          battery: () => {},
+          network: () => {},
+          setWifi: (v) async => {
+                'supported': true,
+                'applied': false,
+                'requested': v,
+                'method': 'settings-ui',
+                'settings_opened': true,
+                'verify': 'system.wifi.state',
+              },
+          setBluetooth: (v) async => {
+                'supported': true,
+                'applied': false,
+                'requested': v,
+                'method': 'consent-dialog',
+                'consent_requested': true,
+                'verify': 'system.bluetooth.state',
+              },
+          setHotspot: (v) async => {
+                'supported': true,
+                'applied': false,
+                'requested': v,
+                'method': 'settings-ui',
+                'deployment': 't3-priv-companion-or-settings-ui',
+                'verify': 'system.hotspot.state',
+              },
+          setMobileData: (v) async => {
+                'supported': true,
+                'applied': false,
+                'requested': v,
+                'method': 'settings-ui',
+                'verify': 'system.mobile_data.state',
+              },
+          setAirplaneMode: (v) async => {
+                'supported': true,
+                'applied': true,
+                'requested': v,
+                'method': 'direct-adb-grant',
+                'verify': 'system.airplane_mode.state',
+              },
+        );
+
+    test('verified applied:true passes through with method + verify', () async {
+      final r = setRunner();
+      final out =
+          await r.run(setJob('system.airplane_mode.set', true, 'job-ap-on'));
+      expect(out.ok, isTrue);
+      expect(out.result['applied'], isTrue);
+      expect(out.result['method'], equals('direct-adb-grant'));
+      expect(out.result['verify'], equals('system.airplane_mode.state'));
+    });
+
+    test('applied:false tier outcomes are terminal honesty, not retryable',
+        () async {
+      final r = setRunner();
+      for (final t in [
+        'system.wifi.set',
+        'system.bluetooth.set',
+        'system.hotspot.set',
+        'system.mobile_data.set',
+      ]) {
+        final out = await r.run(setJob(t, true, 'job-$t'));
+        expect(out.ok, isTrue, reason: t);
+        expect(out.result['applied'], isFalse, reason: t);
+        expect(out.result['verify'], isNotNull, reason: t);
+      }
+    });
+
+    test('non-boolean enabled refused without touching gateway', () async {
+      var called = false;
+      final r = AndroidJobRunner(
+        battery: () => {},
+        network: () => {},
+        setWifi: (v) async {
+          called = true;
+          return {'applied': true};
+        },
+      );
+      for (final bad in ['on', 1, null, {'enabled': true}]) {
+        final out = await r.run(DeviceJob(
+            jobId: 'job-bad-$bad',
+            tool: 'system.wifi.set',
+            inputs: {'enabled': bad},
+            timeoutS: 5,
+            executionId: 'e'));
+        expect(out.ok, isFalse, reason: '$bad');
+        expect(out.error, contains('enabled'));
+      }
+      expect(called, isFalse);
+    });
+
+    test('missing setter gateway reports unavailable', () async {
+      final r = runner(); // no setters wired
+      final out =
+          await r.run(setJob('system.wifi.set', true, 'job-nosetter'));
+      expect(out.ok, isFalse);
+      expect(out.error, contains('unavailable'));
+    });
+
+    test('native unsupported surfaces as failure with reason', () async {
+      final r = AndroidJobRunner(
+        battery: () => {},
+        network: () => {},
+        setHotspot: (v) async => {
+          'supported': false,
+          'reason': 'no public API',
+        },
+      );
+      final out =
+          await r.run(setJob('system.hotspot.set', true, 'job-hs-unsup'));
+      expect(out.ok, isFalse);
+      expect(out.error, contains('no public API'));
+    });
+
+    test('gateway exceptions surface as runner faults', () async {
+      final r = AndroidJobRunner(
+        battery: () => {},
+        network: () => {},
+        setWifi: (v) async =>
+            throw Exception('SysControlBridgeException(failed): nope'),
+      );
+      final out = await r.run(setJob('system.wifi.set', true, 'job-fault'));
+      expect(out.ok, isFalse);
+      expect(out.error, contains('runner fault'));
     });
   });
 }

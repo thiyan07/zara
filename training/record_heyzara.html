@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Record “Hey Zara” samples (local only)</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+  .privacy { background: #f0f7f0; border: 1px solid #9c9; padding: .75rem; border-radius: 8px; }
+  #prompt { font-size: 1.8rem; margin: 1rem 0; min-height: 2.5rem; }
+  button { font-size: 1rem; padding: .6rem 1.1rem; margin: .25rem; }
+  #recBtn.recording { background: #c33; color: #fff; }
+  li { margin: .4rem 0; }
+  .neg { color: #666; }
+</style>
+</head>
+<body>
+<h1>Record “Hey Zara” samples</h1>
+<div class="privacy"><b>Private by design:</b> recording happens in this page only.
+Takes stay in this tab's memory until <i>you</i> download them. Nothing is
+uploaded anywhere. For training, save the WAVs into a folder on this laptop.</div>
+<p>Status: <b id="status">need microphone permission</b></p>
+<p><button id="micBtn">1. Enable microphone</button></p>
+<p>Next prompt:</p>
+<div id="prompt">—</div>
+<p><button id="recBtn" disabled>2. Record (2 s)</button>
+<span id="count"></span></p>
+<h2>Takes (<span id="n">0</span>)</h2>
+<ol id="takes"></ol>
+<p><button id="dlAll" disabled>Download all as separate WAVs</button></p>
+
+<script>
+"use strict";
+const PROMPTS = [];
+for (let i = 0; i < 10; i++) PROMPTS.push({t: "Hey Zara", neg: false});
+["Hey Sarah", "Hey Tara", "Hey Sierra"].forEach(t => PROMPTS.push({t, neg: true}));
+let idx = 0, ctx = null, stream = null, takes = [];
+
+const $ = id => document.getElementById(id);
+
+function showPrompt() {
+  const p = PROMPTS[idx % PROMPTS.length];
+  $("prompt").textContent = (idx < 10 ? `[${idx + 1}/10] Say: ` : `[negative] Say: `) + p.t;
+  $("prompt").className = p.neg ? "neg" : "";
+  $("count").textContent = `${takes.length} recorded`;
+  $("n").textContent = takes.length;
+  $("dlAll").disabled = takes.length === 0;
+}
+
+$("micBtn").onclick = async () => {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({audio: {
+      channelCount: 1, echoCancellation: true, noiseSuppression: false}});
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    $("status").textContent = "mic ready (" + ctx.sampleRate + " Hz in)";
+    $("recBtn").disabled = false;
+    showPrompt();
+  } catch (e) {
+    $("status").textContent = "mic blocked: " + e.message +
+      " — allow microphone for localhost in the browser site settings";
+  }
+};
+
+function resampleTo16k(float32, inRate) {
+  if (inRate === 16000) return float32;
+  const outLen = Math.floor(float32.length * 16000 / inRate);
+  const out = new Float32Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const pos = i * inRate / 16000, i0 = Math.floor(pos), frac = pos - i0;
+    const a = float32[i0] || 0, b = float32[i0 + 1] || 0;
+    out[i] = a + (b - a) * frac;
+  }
+  return out;
+}
+
+function encodeWav16k(mono) {
+  const n = mono.length, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+  const wstr = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  wstr(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); wstr(8, "WAVE");
+  wstr(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+  v.setUint16(22, 1, true); v.setUint32(24, 16000, true);
+  v.setUint32(28, 32000, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  wstr(36, "data"); v.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) {
+    const s = Math.max(-1, Math.min(1, mono[i]));
+    v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+  }
+  return new Blob([buf], {type: "audio/wav"});
+}
+
+$("recBtn").onclick = async () => {
+  if (!ctx || !stream) return;
+  await ctx.resume();
+  const btn = $("recBtn");
+  btn.disabled = true; btn.classList.add("recording"); btn.textContent = "Recording…";
+  const src = ctx.createMediaStreamSource(stream);
+  const proc = ctx.createScriptProcessor(4096, 1, 1);
+  const chunks = [];
+  proc.onaudioprocess = e => chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+  src.connect(proc); proc.connect(ctx.destination);
+  await new Promise(r => setTimeout(r, 2000));
+  src.disconnect(); proc.disconnect();
+  const flat = new Float32Array(chunks.reduce((a, c) => a + c.length, 0));
+  let off = 0;
+  chunks.forEach(c => { flat.set(c, off); off += c.length; });
+  const mono16k = resampleTo16k(flat, ctx.sampleRate).slice(0, 32000);
+  const blob = encodeWav16k(mono16k);
+  const p = PROMPTS[idx % PROMPTS.length];
+  takes.push({blob, label: p.t, neg: p.neg, i: idx});
+  idx++;
+  addTake(takes.length - 1);
+  btn.disabled = false; btn.classList.remove("recording"); btn.textContent = "2. Record (2 s)";
+  showPrompt();
+};
+
+function addTake(k) {
+  const t = takes[k], li = document.createElement("li");
+  const url = URL.createObjectURL(t.blob);
+  li.innerHTML = `<b>${t.neg ? "[neg] " : ""}${t.label}</b> take ${t.i + 1} ` +
+    `<audio controls src="${url}"></audio> ` +
+    `<button data-k="${k}">download wav</button>`;
+  li.querySelector("button").onclick = ev => {
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = (t.neg ? "neg_" : "hey_zara_") + "take" + t.i + ".wav";
+    a.click();
+  };
+  $("takes").appendChild(li);
+  $("n").textContent = takes.length;
+  $("dlAll").disabled = false;
+}
+
+$("dlAll").onclick = () => {
+  document.querySelectorAll("#takes button").forEach((b, i) =>
+    setTimeout(() => b.click(), i * 400));
+};
+showPrompt();
+</script>
+</body>
+</html>

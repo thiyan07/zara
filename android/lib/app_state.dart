@@ -39,6 +39,12 @@ class ZaraUiState {
       return 'Offline — showing last known state';
     }
     if (connection == 'reconnecting') return 'Reconnecting…';
+    // Authentication failure without an identity to revoke (never paired,
+    // or credentials already wiped): distinct from transport errors and
+    // from revoked-while-paired. Recovery is always re-pair, never retry.
+    if (lastError.startsWith('auth ')) {
+      return 'Authentication failed ($lastError) — pair again with a fresh code';
+    }
     if (voice == 'paused_battery') return 'Voice paused (low battery)';
     if (approvalPending) return 'Approval required';
     if (lifecycle == 'online' || connection == 'online') {

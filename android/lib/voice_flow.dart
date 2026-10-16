@@ -12,6 +12,7 @@
 //     second reply cancels the first (no TTS overlap, never stacked);
 //   * [interrupt] propagates to capture stop + playback stop + the
 //     server-side voice interrupt (existing stop, all three legs).
+import 'dart:async';
 import 'dart:typed_data';
 
 /// A completed Core voice turn (transcript + reply + STT provenance).
@@ -71,6 +72,13 @@ class VoiceFlowController {
   bool busy = false;
   Uint8List? lastCapture;
 
+  /// Dart-side bounds for platform legs that have no timeout of their own
+  /// (a wedged AudioRecord/AudioTrack must wedge the turn, never the UI).
+  /// Defaults cover a 5 s capture and any Kotlin-bounded clip (<= 60 s
+  /// audio + 5 s tail) with margin.
+  final Duration captureTimeout;
+  final Duration playTimeout;
+
   VoiceFlowController({
     required this.capture,
     required this.turn,
@@ -80,6 +88,8 @@ class VoiceFlowController {
     required this.stopPlayback,
     required this.serverInterrupt,
     this.onTranscript,
+    this.captureTimeout = const Duration(seconds: 20),
+    this.playTimeout = const Duration(seconds: 75),
   });
 
   /// Generation guard for playback overlap. Tests assert on this.
@@ -87,12 +97,20 @@ class VoiceFlowController {
 
   /// Full turn: bounded capture -> Core turn -> transcript sink ->
   /// reply routed to TTS playback. Empty capture is an explicit
-  /// [VoiceFlowException], never a silent no-op.
+  /// [VoiceFlowException], never a silent no-op. Platform legs are
+  /// timeout-bounded; a timeout surfaces as [VoiceFlowException], never
+  /// a stuck turn.
   Future<VoiceTurnResult> runTurn() async {
     if (busy) throw const VoiceFlowException('voice turn already running');
     busy = true;
     try {
-      final wav = await capture();
+      late final Uint8List? wav;
+      try {
+        wav = await capture().timeout(captureTimeout);
+      } on TimeoutException {
+        throw VoiceFlowException(
+            'capture timed out after ${captureTimeout.inSeconds}s');
+      }
       lastCapture = wav;
       if (wav == null || wav.isEmpty) {
         throw const VoiceFlowException('capture returned no audio');
@@ -119,12 +137,17 @@ class VoiceFlowController {
   Future<void> speak(String text) async {
     final gen = ++_playGeneration;
     try {
-      await stopPlayback();
+      await stopPlayback().timeout(const Duration(seconds: 10));
     } catch (_) {/* best-effort */}
     if (gen != _playGeneration) return; // superseded while stopping
     final audio = await fetchTts(text);
     if (gen != _playGeneration) return; // newer reply won: drop stale audio
-    await play(audio);
+    try {
+      await play(audio).timeout(playTimeout);
+    } on TimeoutException {
+      throw VoiceFlowException(
+          'playback timed out after ${playTimeout.inSeconds}s');
+    }
   }
 
   /// Interrupt: invalidate in-flight playback, stop capture + speaker,

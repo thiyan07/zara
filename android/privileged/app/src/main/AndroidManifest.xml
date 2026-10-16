@@ -1,0 +1,22 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Narrow lab-only permission: only APKs signed with the SAME lab
+         keystore may call the provider (see README + setup script). -->
+    <permission android:name="dev.zara.permission.SYSCONTROL"
+        android:protectionLevel="signature" />
+    <uses-permission android:name="dev.zara.permission.SYSCONTROL" />
+
+    <!-- Priv-app-only grants. TETHER_PRIVILEGED is effective ONLY when this
+         APK lives in /system/priv-app on a lab image; sideloading it as an
+         ordinary app grants nothing (bridge reports honestly). -->
+    <uses-permission android:name="android.permission.TETHER_PRIVILEGED" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <application android:label="ZaraPrivCompanion">
+        <provider android:name=".SysControlProvider"
+            android:authorities="dev.zara.privcompanion.control"
+            android:exported="true"
+            android:permission="dev.zara.permission.SYSCONTROL" />
+    </application>
+</manifest>

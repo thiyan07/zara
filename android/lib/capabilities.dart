@@ -45,6 +45,30 @@ const List<ZaraCapability> androidCapabilities = [
   // confirm/high_risk + human approval + device hardcoded allowlist.
   ZaraCapability('gui.screen.inspect', true, 'Bounded a11y screen snapshot via opt-in AccessibilityService (Rung-2 pilot, emulator lab only)'),
   ZaraCapability('gui.tap', true, 'Tap one snapshot node in an allowlisted lab package via opt-in AccessibilityService (Rung-2 pilot, emulator lab only)'),
+  // ---- Phase 1: system-control (read-only states + settings/app open) ----
+  // States are ordinary-permission reads; toggles are Settings-intent only
+  // (user confirms in OS UI). Hotspot reports honest unsupported (no public
+  // API); charging_time is a null-estimate guard (no invented durations).
+  ZaraCapability('system.battery.charging_time', true, 'Charging-time estimate guard: single snapshot cannot estimate; returns null estimate honestly (Phase 1)'),
+  ZaraCapability('system.wifi.state', true, 'WiFi state + connected SSID via WifiManager/ConnectivityManager, read-only (Phase 1)'),
+  ZaraCapability('system.wifi.settings', true, 'Open system WiFi settings screen, user-confirmed (Phase 1)'),
+  ZaraCapability('system.bluetooth.state', true, 'Bluetooth state via BluetoothManager, read-only; honest unavailable without BLUETOOTH_CONNECT (Phase 1)'),
+  ZaraCapability('system.bluetooth.settings', true, 'Open system Bluetooth settings screen, user-confirmed (Phase 1)'),
+  ZaraCapability('system.hotspot.state', true, 'Hotspot state: honest unsupported, no public SoftAp API (Phase 1)'),
+  ZaraCapability('system.hotspot.settings', true, 'Open system hotspot settings screen, user-confirmed (Phase 1)'),
+  ZaraCapability('system.mobile_data.state', true, 'Mobile data state via TelephonyManager/ConnectivityManager, read-only (Phase 1)'),
+  ZaraCapability('system.mobile_data.settings', true, 'Open system mobile data settings screen, user-confirmed (Phase 1)'),
+  ZaraCapability('system.airplane_mode.state', true, 'Airplane mode state via Settings.Global, read-only (Phase 1)'),
+  ZaraCapability('system.airplane_mode.settings', true, 'Open system airplane mode settings screen, user-confirmed (Phase 1)'),
+  ZaraCapability('system.app.open', true, 'Open one allowlisted package via launch intent (Phase 1)'),
+  // ---- Phase 2: tiered state changes (verified or honest) ----
+  // applied:true only after native post-action verification; otherwise
+  // settings-UI/consent/deployment pointers with applied:false.
+  ZaraCapability('system.wifi.set', true, 'Change WiFi state: direct on legacy platform, else WiFi settings UI + verify (Phase 2)'),
+  ZaraCapability('system.bluetooth.set', true, 'Change Bluetooth state: consent dialog for enable, direct attempt for disable, else settings UI + verify (Phase 2)'),
+  ZaraCapability('system.hotspot.set', true, 'Change hotspot state: lab companion direct path, else tether settings UI + verify (Phase 2)'),
+  ZaraCapability('system.mobile_data.set', true, 'Change mobile-data state: settings UI + verify, no silent path by design (Phase 2)'),
+  ZaraCapability('system.airplane_mode.set', true, 'Change airplane mode: direct with ADB-granted permission, else settings UI + verify (Phase 2)'),
   // ---- reserved / by design ----
   ZaraCapability('voice.wake_word', false, 'Reserved wake phrase: "Hey Zara" — verified via manual capture only; no always-on DSP loop by design'),
   ZaraCapability('camera.available', false, 'Camera: not requested, no permission sought (by design)'),

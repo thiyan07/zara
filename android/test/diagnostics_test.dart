@@ -75,6 +75,16 @@ void main() {
           equals('provider mock, v2=true'));
     });
 
+    test('spoken transcripts keep words, lose secret shapes', () {
+      // Voice-turn log lines reuse this scrubber: ordinary speech passes
+      // through (debuggability kept) while assignment-shaped secrets do
+      // not land verbatim in logcat.
+      expect(redactSecretsForDisplay('password=hunter2 spoken aloud'),
+          isNot(contains('hunter2')));
+      expect(redactSecretsForDisplay('what is my battery level'),
+          equals('what is my battery level'));
+    });
+
     test('ready error describes refusal vs unreachable', () {
       expect(describeReadyError(const CoreException(403, 'x')),
           contains('unauthorized'));

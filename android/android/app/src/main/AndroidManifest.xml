@@ -6,6 +6,30 @@
     <!-- Normal permissions (auto-granted): backend connectivity + state. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Boot-completed is observe-only: the receiver posts an opt-in
+         "tap to resume" prompt. It cannot keep the agent alive (OS
+         background restrictions); see ZaraBootReceiver. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Phase 1 system-control reads (ordinary permissions only). -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <!-- API 31+ runtime (Dart bridge reports honest unavailable when denied). -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <!-- TelephonyManager.isDataEnabled read (runtime on some builds). -->
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+    <!-- Phase 2 tiered changes. CHANGE_WIFI_STATE/BLUETOOTH_ADMIN are
+         ordinary (legacy direct paths only); WRITE_SECURE_SETTINGS is
+         signature|privileged — declared here, effective only via the T1
+         ADB grant (bridge checks at call time and reports the setup
+         command otherwise). Companion signature permission: the main app
+         never holds it, it only calls the companion provider. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
+    <!-- Tier-3 lab companion call permission (signature): grantable only
+         when both APKs share the lab keystore. Declaring it here is inert
+         on ordinary builds; the bridge probes the companion at call time. -->
+    <uses-permission android:name="dev.zara.permission.SYSCONTROL" />
     <!-- Rung-1 pilot (emulator lab only): granted ONLY via priv-app image
          allowlist, never via runtime request. Missing allowlist entry is
          boot-fatal on enforcing builds; see docs/research. -->
@@ -93,6 +117,17 @@
                 android:name="android.accessibilityservice"
                 android:resource="@xml/zara_a11y_config" />
         </service>
+        <!-- Post-reboot resume prompt (opt-in marker file, no secrets).
+             No background execution: the receiver only notifies, and only
+             when the user enabled it in Settings. Tapping opens the app,
+             where credential-restore + register + loop run normally. -->
+        <receiver
+            android:name=".ZaraBootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and
@@ -104,5 +139,10 @@
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>
         </intent>
+        <!-- Phase 1 app-open targets (package visibility, no QUERY_ALL_PACKAGES). -->
+        <package android:name="com.android.settings" />
+        <package android:name="com.android.chrome" />
+        <package android:name="com.google.android.gm" />
+        <package android:name="com.google.android.calendar" />
     </queries>
 </manifest>

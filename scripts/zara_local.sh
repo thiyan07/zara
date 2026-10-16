@@ -53,7 +53,7 @@ print_env_contract() {
   local var val upper
   for var in ASSISTANT_TOKEN LLM_PROVIDER LLM_BASE_URL LLM_API_KEY LLM_MODEL \
              ZARA_MEMORY_DB ZARA_MISSION_DB ZARA_AUDIT_DB ZARA_FABRIC_DB \
-             ZARA_SESSION_DB ZARA_CHAT_DB ZARA_EMBEDDINGS; do
+             ZARA_SESSION_DB ZARA_CHAT_DB ZARA_DELEGATION_DB ZARA_EMBEDDINGS; do
     val="${!var:-<unset>}"
     upper="$(echo "$var" | tr '[:lower:]' '[:upper:]')"
     case "$upper" in
@@ -231,7 +231,8 @@ cmd_start() {
     : "${ZARA_FABRIC_DB:=$db_dir/fabric.db}"
     : "${ZARA_SESSION_DB:=$db_dir/session.db}"
     : "${ZARA_CHAT_DB:=$db_dir/chat.db}"
-    export ZARA_MEMORY_DB ZARA_MISSION_DB ZARA_AUDIT_DB ZARA_FABRIC_DB ZARA_SESSION_DB ZARA_CHAT_DB
+    : "${ZARA_DELEGATION_DB:=$db_dir/delegation.db}"
+    export ZARA_MEMORY_DB ZARA_MISSION_DB ZARA_AUDIT_DB ZARA_FABRIC_DB ZARA_SESSION_DB ZARA_CHAT_DB ZARA_DELEGATION_DB
     echo "zara_local: file-backed DBs under $db_dir"
   else
     echo "zara_local: all-memory mode (no --db-dir; shell env passes through, unset DB vars = in-memory)"

@@ -1,5 +1,9 @@
+import 'dart:async';
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:zara_android/connection.dart';
+import 'package:zara_android/core_client.dart';
 
 void main() {
   test('backoff grows then caps, attempts bounded', () {
@@ -51,5 +55,56 @@ void main() {
       }
     }
     expect(CoreLinkState.allowed['online']!.contains('offline'), isTrue);
+  });
+
+  group('transport mapping (Vivo connection-closed defect)', () {
+    test('mid-request kill maps to structured dropped-connection error',
+        () {
+      // Exact physical repro: Core SIGTERM during POST
+      // /v1/agent/register produced this raw exception in the UI banner.
+      final e = mapTransportError(
+          HttpException(
+              'Connection closed before full header was received',
+              uri: Uri.parse(
+                  'http://127.0.0.1:18204/v1/agent/register')),
+          'POST',
+          '/v1/agent/register');
+      expect(e, isA<CoreException>());
+      expect(e.status, equals(-1)); // transport, never a server verdict
+      expect('$e', contains('connection dropped'));
+      expect('$e', contains('POST /v1/agent/register'));
+      expect('$e', contains('HttpException')); // original kept for buckets
+    });
+
+    test('refused maps to unreachable, timeouts stay bounded', () {
+      final refused = mapTransportError(
+          const SocketException('Connection refused'), 'GET', '/v1/ready');
+      expect(refused.status, equals(-1));
+      expect('$refused', contains('unreachable'));
+      expect('$refused', contains('SocketException'));
+
+      final timedOut = mapTransportError(
+          TimeoutException('t', const Duration(seconds: 15)),
+          'POST',
+          '/v1/agent/voice/turn');
+      expect('$timedOut', contains('timed out after 15s'));
+      expect('$timedOut', contains('POST /v1/agent/voice/turn'));
+    });
+
+    test('server verdicts pass through untouched (never masked)', () {
+      const decided = CoreException(409, 'already decided');
+      expect(identical(mapTransportError(decided, 'POST', '/x'), decided),
+          isTrue);
+      const auth = AuthException(403, 'revoked');
+      expect(mapTransportError(auth, 'POST', '/x'), same(auth));
+    });
+
+    test('mapped errors never echo bodies, queries, or secrets', () {
+      final e = mapTransportError(
+          const SocketException('refused'), 'POST', '/v1/memory/search');
+      expect('$e', isNot(contains('Bearer')));
+      expect('$e', isNot(contains('zara-dev-')));
+      expect('$e', isNot(contains('audio_base64')));
+    });
   });
 }

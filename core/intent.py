@@ -23,6 +23,8 @@ from typing import Any, Callable, Optional, Protocol
 
 from pydantic import BaseModel, Field
 
+from .tanglish import normalize_utterance
+
 SCHEMA_VERSION = "1"
 PARSER_VERSION = "1"
 
@@ -76,10 +78,55 @@ _ALIASES: list[tuple[str, str, float]] = [
     ("power", "system.battery", 0.65),
     ("charging", "system.battery", 0.75),
     ("is it charging", "system.battery", 0.8),
+    ("battery time to full", "system.battery.charging_time", 0.85),
+    ("time to full charge", "system.battery.charging_time", 0.85),
+    ("how long to charge", "system.battery.charging_time", 0.85),
+    ("charging time", "system.battery.charging_time", 0.8),
     ("network", "system.network", 0.85),
     ("internet", "system.network", 0.8),
     ("wifi", "system.network", 0.85),
     ("wi-fi", "system.network", 0.85),
+    ("wifi status", "system.wifi.state", 0.9),
+    ("wifi settings", "system.wifi.settings", 0.85),
+    ("open wifi settings", "system.wifi.settings", 0.9),
+    ("turn on wifi", "system.wifi.set", 0.85),
+    ("turn off wifi", "system.wifi.set", 0.85),
+    ("enable wifi", "system.wifi.set", 0.8),
+    ("disable wifi", "system.wifi.set", 0.8),
+    ("bluetooth", "system.network", 0.85),
+    ("bluetooth status", "system.bluetooth.state", 0.9),
+    ("bluetooth settings", "system.bluetooth.settings", 0.85),
+    ("open bluetooth settings", "system.bluetooth.settings", 0.9),
+    ("turn on bluetooth", "system.bluetooth.set", 0.85),
+    ("turn off bluetooth", "system.bluetooth.set", 0.85),
+    ("enable bluetooth", "system.bluetooth.set", 0.8),
+    ("disable bluetooth", "system.bluetooth.set", 0.8),
+    ("hotspot", "system.hotspot.state", 0.85),
+    ("hotspot status", "system.hotspot.state", 0.9),
+    ("hotspot settings", "system.hotspot.settings", 0.85),
+    ("open hotspot settings", "system.hotspot.settings", 0.9),
+    ("turn on hotspot", "system.hotspot.set", 0.85),
+    ("turn off hotspot", "system.hotspot.set", 0.85),
+    ("enable hotspot", "system.hotspot.set", 0.8),
+    ("disable hotspot", "system.hotspot.set", 0.8),
+    ("mobile data", "system.mobile_data.state", 0.85),
+    ("mobile data status", "system.mobile_data.state", 0.9),
+    ("mobile data settings", "system.mobile_data.settings", 0.85),
+    ("open mobile data settings", "system.mobile_data.settings", 0.9),
+    ("turn on mobile data", "system.mobile_data.set", 0.85),
+    ("turn off mobile data", "system.mobile_data.set", 0.85),
+    ("enable mobile data", "system.mobile_data.set", 0.8),
+    ("disable mobile data", "system.mobile_data.set", 0.8),
+    ("airplane mode", "system.airplane_mode.state", 0.85),
+    ("airplane mode status", "system.airplane_mode.state", 0.9),
+    ("airplane mode settings", "system.airplane_mode.settings", 0.85),
+    ("open airplane mode settings", "system.airplane_mode.settings", 0.9),
+    ("turn on airplane mode", "system.airplane_mode.set", 0.85),
+    ("turn off airplane mode", "system.airplane_mode.set", 0.85),
+    ("enable airplane mode", "system.airplane_mode.set", 0.8),
+    ("disable airplane mode", "system.airplane_mode.set", 0.8),
+    ("flight mode on", "system.airplane_mode.set", 0.8),
+    ("flight mode off", "system.airplane_mode.set", 0.8),
     ("connection", "system.network", 0.7),
     ("connectivity", "system.network", 0.8),
     ("send", "files.transfer", 0.7),
@@ -102,6 +149,17 @@ _ALIASES: list[tuple[str, str, float]] = [
     ("list devices", "device.list", 0.9),
     ("available devices", "device.list", 0.85),
     ("my devices", "device.list", 0.8),
+    ("open app", "system.app.open", 0.85),
+    ("launch app", "system.app.open", 0.85),
+    ("start app", "system.app.open", 0.85),
+    ("open settings", "system.app.open", 0.8),
+    ("take a screenshot", "desktop.screenshot", 0.8),
+    ("screenshot", "desktop.screenshot", 0.7),
+    ("active window", "desktop.window.active", 0.8),
+    ("what window is active", "desktop.window.active", 0.85),
+    ("inspect ui", "desktop.a11y.inspect", 0.75),
+    ("show ui tree", "desktop.a11y.inspect", 0.8),
+    ("inspect app", "desktop.a11y.inspect", 0.75),
     ("what can you do", "assistant.help", 0.9),
     ("help", "assistant.help", 0.8),
     ("open url", "browser.open", 0.7),
@@ -323,20 +381,47 @@ class LocalIntentParser:
                            "to one task?", 0.3, utterance, self.name)
         text = utterance.strip()
         low = text.lower()
-        if _DANGEROUS.search(low):
+        # Tanglish / Tamil-script normalization (core/tanglish.py):
+        # matching runs on the normalized form while every proposal
+        # keeps the ORIGINAL utterance for audit. Unmapped input passes
+        # through unchanged, so English behavior is byte-identical.
+        norm = normalize_utterance(text)
+        match = norm.normalized.lower()
+        if _DANGEROUS.search(low) or _DANGEROUS.search(match):
             return unsupported(
                 "I can't help with that — it looks like a privileged or "
                 "destructive operation, which I never run from a chat "
                 "request.", text, self.name)
         # Multi-step split (bounded, no recursion into autonomy).
+        out = self._parse_text(match, low, text, ctx, norm.mapped)
+        # Translated input carries extra uncertainty: scale confidence
+        # down slightly (never up). Clarifications keep their own levels.
+        if norm.mapped and out.confidence > 0 and not out.needs_clarification:
+            out.confidence = round(out.confidence * 0.9, 3)
+        return out
+
+    def _parse_text(self, match: str, low: str, text: str,
+                    ctx: ParserContext, mapped: bool) -> IntentProposal:
+        """Single matching attempt over one lowered form. When the
+        normalized form yields no capability but mapping fired, callers
+        retry with the original phrasing so a reorder (e.g. "flight
+        mode on" -> "turn on flight mode") can never destroy an alias
+        the raw text already matched. Utterance stays original either
+        way."""
         parts = [p.strip() for p in re.split(
-            r"\s+(?:then|and then)\s+|;\s*", low) if p.strip()]
+            r"\s+(?:then|and then)\s+|;\s*", match) if p.strip()]
         if len(parts) > MAX_STEPS:
             return clarify("That's a long multi-step plan — could we take "
                            "it one step at a time?", 0.35, text, self.name)
         if len(parts) > 1:
-            return self._parse_multi(parts, text, ctx)
-        return self._parse_single(low, text, ctx)
+            out = self._parse_multi(parts, text, ctx)
+        else:
+            out = self._parse_single(match, text, ctx)
+        if mapped and not out.capability and match != low:
+            alt = self._parse_single(low, text, ctx)
+            if alt.capability:
+                return alt
+        return out
 
     def _parse_multi(self, parts: list[str], text: str,
                      ctx: ParserContext) -> IntentProposal:
@@ -375,11 +460,17 @@ class LocalIntentParser:
     def _parse_single(self, low: str, text: str,
                       ctx: ParserContext) -> IntentProposal:
         words = set(re.findall(r"[a-z][a-z0-9_\-]*", low))
-        # Device references are advisory only.
+        # Device references are advisory only. "mobile" inside the
+        # capability phrase "mobile data" is not a device mention —
+        # without this, every mobile-data query clarifies instead of
+        # parsing (observed: "mobile data status" -> 0.4 clarify).
+        dev_words = set(words)
+        if "mobile data" in low:
+            dev_words.discard("mobile")
         others_only = "other" in words
-        cands = _device_candidates(words, ctx,
+        cands = _device_candidates(dev_words, ctx,
                                    exclude_requester=others_only)
-        mentioned_device = bool(words & set(_DEVICE_WORDS)) or any(
+        mentioned_device = bool(dev_words & set(_DEVICE_WORDS)) or any(
             d.device_id.lower() in words for d in ctx.devices)
         preferred = ""
         if mentioned_device:
@@ -490,6 +581,22 @@ class LocalIntentParser:
             m = re.search(r"(\d+)", low)
             if m:
                 params["limit"] = min(int(m.group(1)), 200)
+        if cap.endswith(".set"):
+            # Direction words decide the boolean; both/neither present
+            # leaves params empty so grounding clarifies for `enabled`
+            # instead of guessing a radio change.
+            on_hit = re.search(
+                r"\b(on|enable|enabled|start|up)\b", low) is not None
+            off_hit = re.search(
+                r"\b(off|disable|disabled|stop|down)\b", low) is not None
+            if on_hit and not off_hit:
+                params["enabled"] = True
+            elif off_hit and not on_hit:
+                params["enabled"] = False
+        if cap == "desktop.a11y.inspect":
+            q = _QUOTED_RE.search(text)
+            if q and q.group(1).strip():
+                params["app"] = q.group(1).strip()[:120]
         return check_params(params)
 
 

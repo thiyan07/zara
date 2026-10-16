@@ -362,6 +362,15 @@ String describeTalkStreamError(Object e) {
   }
   if (s.contains('404')) return 'not found (talk endpoint unknown)';
   if (s.contains('409')) return 'conflict (turn already settled elsewhere)';
+  if (s.contains('unreachable')) {
+    return 'core unreachable (down or tunnel broken) — reconnect, nothing sent twice';
+  }
+  if (s.contains('connection dropped')) {
+    return 'connection dropped mid-stream (Core restarting?) — resend as a new turn';
+  }
+  if (s.contains('timed out')) {
+    return 'stream timed out — resend as a new turn';
+  }
   if (s.contains('FormatException')) {
     final oneLine = s.replaceAll('\n', ' ');
     return 'stream parse error: ${oneLine.length <= 160 ? oneLine : oneLine.substring(0, 160)}';

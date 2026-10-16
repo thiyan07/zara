@@ -7,7 +7,9 @@ delete/publish/irreversible) require human approval via the normal gate
 (submit is CONFIRM risk; financial/publish/delete patterns are refused).
 
 One shared browser session per process, headless, bounded (single page,
-navigation timeout, output caps). Uses system Chrome — no downloads.
+navigation timeout, output caps). Prefers system Chrome (no downloads);
+falls back to Playwright's bundled headless shell; fails honestly with
+neither present.
 """
 from __future__ import annotations
 import re
@@ -32,11 +34,50 @@ _jobs: _queue.Queue = _queue.Queue()
 _worker_started = False
 
 
+def _chrome_executable() -> str:
+    """System Chrome first (no downloads, matches prior behavior); fall back
+    to Playwright's bundled headless shell; None when neither exists, in
+    which case every browser tool fails honestly instead of hanging."""
+    import glob
+    import os
+    candidates = ["/usr/bin/google-chrome", "/usr/bin/chromium",
+                  "/usr/bin/chromium-browser"]
+    for c in candidates:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    home = os.path.expanduser("~")
+    for shell in sorted(glob.glob(os.path.join(
+            home, ".cache", "ms-playwright",
+            "chromium_headless_shell-*", "chrome-linux", "headless_shell"))):
+        if os.access(shell, os.X_OK):
+            return shell
+    for full in sorted(glob.glob(os.path.join(
+            home, ".cache", "ms-playwright", "chromium-*",
+            "chrome-linux", "chrome"))):
+        if os.access(full, os.X_OK):
+            return full
+    return ""
+
+
 def _worker():
     from playwright.sync_api import sync_playwright
     pw = sync_playwright().start()
+    exe = _chrome_executable()
+    if not exe:
+        try:
+            pw.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        while True:
+            fn, args, out = _jobs.get()
+            if fn is None:
+                out.put((False, "closed"))
+                return
+            out.put((False, RuntimeError(
+                "no browser executable: install system Chrome or "
+                "run `python -m playwright install chromium`")))
     browser = pw.chromium.launch(
-        executable_path="/usr/bin/google-chrome",
+        executable_path=exe,
         args=["--no-sandbox", "--disable-dev-shm-usage"])
     page = browser.new_page()
     page.set_default_navigation_timeout(30000)
@@ -179,15 +220,35 @@ def browser_submit(inputs: dict, ctx: dict) -> dict:
     return _call(_do)
 
 
-def browser_screenshot(inputs: dict, ctx: dict) -> dict:
-    import base64
+SCREENSHOT_MAX_RAW_BYTES = 1_500_000
+SCREENSHOT_MAX_B64_CHARS = 200_000
 
+
+def _encode_screenshot(data: bytes, url: str) -> dict:
+    """Validate + encode one screenshot. Pure for testing. Never truncates:
+    oversized or malformed input raises a structured ValueError naming the
+    limit and the safe recovery, so errors cannot be mistaken for images."""
+    if not isinstance(data, bytes) or not data.startswith(b"\x89PNG"):
+        raise ValueError("screenshot backend did not produce PNG data")
+    if len(data) > SCREENSHOT_MAX_RAW_BYTES:
+        raise ValueError(
+            f"screenshot {len(data)} bytes exceeds "
+            f"{SCREENSHOT_MAX_RAW_BYTES}-byte limit: use browser.extract "
+            f"for page content instead")
+    import base64
+    encoded = base64.b64encode(data).decode()
+    if len(encoded) > SCREENSHOT_MAX_B64_CHARS:
+        raise ValueError(
+            f"screenshot encodes to {len(encoded)} chars, over the "
+            f"{SCREENSHOT_MAX_B64_CHARS}-char transport cap: use "
+            f"browser.extract for page content instead")
+    return {"url": url, "png_base64": encoded, "bytes": len(data)}
+
+
+def browser_screenshot(inputs: dict, ctx: dict) -> dict:
     def _do(page):
         data = page.screenshot(full_page=False)
-        if len(data) > 2_000_000:
-            raise ValueError("screenshot too large")
-        return {"url": page.url,
-                "png_base64": base64.b64encode(data).decode()[:200000]}
+        return _encode_screenshot(bytes(data), page.url)
     return _call(_do)
 
 

@@ -622,6 +622,19 @@ void main() {
           contains('parse error'));
       expect(describeTalkStreamError(const CoreException(409, 'x')),
           contains('conflict'));
+      // Mapped transport failures render as actionable guidance.
+      expect(
+          describeTalkStreamError(const CoreException(
+              -1, 'unreachable POST /v1/talk/stream: SocketException')),
+          contains('unreachable'));
+      expect(
+          describeTalkStreamError(const CoreException(-1,
+              'connection dropped STREAM /v1/talk/stream: HttpException')),
+          contains('dropped'));
+      expect(
+          describeTalkStreamError(
+              const CoreException(-1, 'timed out after 15s STREAM x')),
+          contains('timed out'));
     });
   });
 

@@ -1,8 +1,10 @@
 """Hybrid memory: structured metadata + semantic retrieval, pluggable embeddings."""
 from __future__ import annotations
 import math
+import os as _os
 import re
 import threading
+import time as _time
 import uuid
 from collections import Counter
 from .models import MemoryItem, utcnow
@@ -26,6 +28,39 @@ def _coerce_now(now):
     if now is None:
         return utcnow()
     return _as_aware(now)
+
+
+# ---------- conservative retention ----------
+
+#: Opportunistic sweep cadence (seconds) and batch cap. Sweeps delete
+#: strictly-expired, non-pinned, non-superseded rows only — the same
+#: predicate as purge_expired — so they can never remove anything the
+#: manual purge would keep.
+SWEEP_MIN_INTERVAL_S = 3600.0
+SWEEP_BATCH_MAX = 500
+
+
+def is_pinned(item: MemoryItem) -> bool:
+    """User-pinned marker lives in metadata (no schema migration):
+    metadata {"pinned": true} survives forget/re-remember and SQLite
+    round-trips. Pinned rows are exempt from every automatic deletion."""
+    try:
+        return bool((item.metadata or {}).get("pinned") is True)
+    except Exception:  # noqa: BLE001 — malformed metadata fails safe
+        return False
+
+
+def default_ttl_days() -> float:
+    """Conservative configurable default TTL for new memories, in days.
+    0 (default) disables it: memories live until forgotten/purged.
+    Set ZARA_MEMORY_DEFAULT_TTL_DAYS to a positive number to opt in.
+    Invalid values fail safe to 0."""
+    try:
+        v = float((_os.environ.get("ZARA_MEMORY_DEFAULT_TTL_DAYS",
+                                   "") or "0").strip())
+    except ValueError:
+        return 0.0
+    return v if v > 0 else 0.0
 
 def _tokens(text: str) -> list[str]:
     return re.findall(r"[a-z0-9]{2,}", text.lower())
@@ -94,6 +129,7 @@ class MemoryStore:
         self._lock = threading.Lock()
         self.embedder = embedder or EmbeddingProvider()
         self.policy = policy or MemoryPolicy()
+        self._last_sweep = 0.0
 
     def remember(self, item: MemoryItem) -> MemoryItem | None:
         """Returns the stored item, or None if policy/secrets rejected it."""
@@ -102,22 +138,45 @@ class MemoryStore:
             raise ValueError("refused: secrets must not enter RAG memory")
         if not self.policy.keep(item):
             return None
+        if item.expires_at is None:
+            ttl = default_ttl_days()
+            if ttl > 0:
+                from datetime import timedelta as _td
+                item.expires_at = utcnow() + _td(days=ttl)
         item.id = item.id or f"mem-{uuid.uuid4().hex[:12]}"
         item.embedding = self.embedder.embed(item.text)
         item.updated_at = utcnow()
         with self._lock:
             self._items[item.id] = item
+        self._maybe_sweep()
         return item
 
     def forget(self, item_id: str) -> bool:
         with self._lock:
             return self._items.pop(item_id, None) is not None
 
+    def set_pinned(self, item_id: str, pinned: bool) -> bool:
+        """Mark/unmark a row as user-retained. Pinned rows are exempt
+        from every automatic deletion (sweeps and purges); explicit
+        forget() still removes them. Returns False for unknown ids."""
+        with self._lock:
+            it = self._items.get(item_id)
+            if it is None:
+                return False
+            meta = dict(it.metadata or {})
+            if pinned:
+                meta["pinned"] = True
+            else:
+                meta.pop("pinned", None)
+            it.metadata = meta
+            return True
+
     def purge_expired(self, now=None) -> int:
         """Delete rows with expires_at < now. Returns count removed.
 
         Boundary: expires_at == now or None is kept. Superseded
         provenance rows (metadata.superseded_by) are never purged.
+        Pinned rows (metadata.pinned) are never purged.
         Idempotent: second call with same clock returns 0.
         """
         ref = _coerce_now(now)
@@ -126,8 +185,48 @@ class MemoryStore:
                 k for k, it in self._items.items()
                 if it.expires_at is not None
                 and not (it.metadata or {}).get("superseded_by")
+                and not is_pinned(it)
                 and _as_aware(it.expires_at) < ref
             ]
+            for k in expired:
+                self._items.pop(k, None)
+        return len(expired)
+
+    def _maybe_sweep(self) -> int:
+        """Opportunistic expired-only cleanup, throttled and bounded.
+        Opt-in via ZARA_MEMORY_AUTO_SWEEP=1 (default off: existing
+        behavior is byte-for-byte unchanged without it). Never raises: a
+        sweep failure must not corrupt the calling operation. Returns
+        rows removed (0 on throttle/failure/disabled)."""
+        if (_os.environ.get("ZARA_MEMORY_AUTO_SWEEP", "").strip().lower()
+                not in ("1", "true", "yes", "on")):
+            return 0
+        now_mono = _time.monotonic()
+        # _last_sweep <= 0 means "never swept" (fresh store or test
+        # reset): the first sweep is always eligible instead of being
+        # throttled for up to SWEEP_MIN_INTERVAL_S after process start
+        # on machines with low monotonic uptime.
+        if self._last_sweep > 0 and \
+                now_mono - self._last_sweep < SWEEP_MIN_INTERVAL_S:
+            return 0
+        try:
+            removed = self._sweep_batch(SWEEP_BATCH_MAX)
+        except Exception:  # noqa: BLE001 — cleanup never breaks callers
+            return 0
+        self._last_sweep = now_mono
+        return removed
+
+    def _sweep_batch(self, limit: int) -> int:
+        """One bounded expired-only pass using the purge predicate."""
+        ref = utcnow()
+        with self._lock:
+            expired = [
+                k for k, it in self._items.items()
+                if it.expires_at is not None
+                and not (it.metadata or {}).get("superseded_by")
+                and not is_pinned(it)
+                and _as_aware(it.expires_at) < ref
+            ][:max(1, limit)]
             for k in expired:
                 self._items.pop(k, None)
         return len(expired)
@@ -154,6 +253,10 @@ class MemoryStore:
             score = 0.7 * sem + 0.3 * kw
             scored.append((it, score))
         scored.sort(key=lambda s: s[1], reverse=True)
+        # Opportunistic retention sweep rides the read path (throttled,
+        # bounded, never raising); recall results themselves are computed
+        # from the pre-sweep snapshot above.
+        self._maybe_sweep()
         return scored[:top_k]
 
     def all(self) -> list[MemoryItem]:
@@ -229,6 +332,17 @@ class PersistentMemoryStore(MemoryStore):
             self._db.execute("DELETE FROM memory WHERE id=?", (item_id,))
         return gone
 
+    def set_pinned(self, item_id: str, pinned: bool) -> bool:
+        ok = super().set_pinned(item_id, pinned)
+        if not ok:
+            return False
+        with self._lock, self._db:
+            item = self._items.get(item_id)
+            self._db.execute("UPDATE memory SET metadata=? WHERE id=?",
+                             (self._json.dumps(item.metadata if item else {}),
+                              item_id))
+        return True
+
     def purge_expired(self, now=None) -> int:
         """Delete rows with expires_at < now from SQLite + dict sweep.
 
@@ -241,8 +355,30 @@ class PersistentMemoryStore(MemoryStore):
                 k for k, it in self._items.items()
                 if it.expires_at is not None
                 and not (it.metadata or {}).get("superseded_by")
+                and not is_pinned(it)
                 and _as_aware(it.expires_at) < ref
             ]
+        if expired:
+            with self._lock, self._db:
+                self._db.execute(
+                    f"DELETE FROM memory WHERE id IN "
+                    f"({','.join('?' * len(expired))})", expired)
+                for k in expired:
+                    self._items.pop(k, None)
+        return len(expired)
+
+    def _sweep_batch(self, limit: int) -> int:
+        """Bounded expired-only pass, mirrored to SQLite in one
+        transaction: commit applies to both stores, rollback to neither."""
+        ref = utcnow()
+        with self._lock:
+            expired = [
+                k for k, it in self._items.items()
+                if it.expires_at is not None
+                and not (it.metadata or {}).get("superseded_by")
+                and not is_pinned(it)
+                and _as_aware(it.expires_at) < ref
+            ][:max(1, limit)]
         if expired:
             with self._lock, self._db:
                 self._db.execute(

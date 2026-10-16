@@ -92,13 +92,17 @@ class JobQueue:
                     return job
         return None
 
-    def complete(self, job_id: str, ok: bool, result: Optional[dict] = None,
-                 error: str = "") -> DeviceJob:
-        # Bounded ingest (Task 9, T3): a device payload is stored verbatim
-        # and served on every status poll, so oversize input is rejected
-        # here for direct callers (HTTP additionally rejects at the
-        # JobResultIn boundary). Never silently truncate: truncation would
-        # falsify verification and result content.
+    def complete_once(self, job_id: str, ok: bool,
+                      result: Optional[dict] = None,
+                      error: str = "") -> tuple:
+        """Accept a device result AND atomically report whether this call
+        performed the open->terminal transition: (job, True) for the first
+        accepted delivery, (job, False) for replays and late results after
+        terminal states. The flag is decided under the same Condition lock
+        as the mutation, so concurrent duplicate deliveries cannot both
+        observe True. Callers must emit first-delivery side effects
+        (bus/audit) on True OUTSIDE the lock — never hold queue state
+        across I/O. Bounds/validation identical to complete()."""
         if result:
             try:
                 blob = json.dumps(result)
@@ -115,15 +119,25 @@ class JobQueue:
         with self._cond:
             job = self._jobs[job_id]
             if job.state in ("done", "failed", "cancelled", "expired"):
-                return job  # idempotent: replays and late results after
-                # expiry return the recorded outcome; Core already failed
-                # the execution, and expiry must never resurrect to done.
+                return job, False  # idempotent: replays and late results
+                # after expiry return the recorded outcome; Core already
+                # failed the execution, and expiry must never resurrect.
             job.state = "done" if ok else "failed"
             job.result = result
             job.error = error
             job.finished_at = utcnow().isoformat()
             self._cond.notify_all()
-            return job
+            return job, True
+
+    def complete(self, job_id: str, ok: bool, result: Optional[dict] = None,
+                 error: str = "") -> DeviceJob:
+        # Bounded ingest (Task 9, T3): a device payload is stored verbatim
+        # and served on every status poll, so oversize input is rejected
+        # here for direct callers (HTTP additionally rejects at the
+        # JobResultIn boundary). Never silently truncate: truncation would
+        # falsify verification and result content.
+        job, _ = self.complete_once(job_id, ok, result, error)
+        return job
 
     def cancel(self, job_id: str) -> bool:
         with self._cond:

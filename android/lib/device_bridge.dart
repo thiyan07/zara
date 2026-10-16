@@ -28,6 +28,171 @@ class DeviceBridge {
     }
   }
 
+  /// Phase 1 read-only states. Each returns the native map verbatim;
+  /// {supported:false} means unavailable — never a fake state.
+  Future<Map<String, dynamic>> wifiState() async {
+    try {
+      final m = await _ch.invokeMapMethod<String, dynamic>('getWifiState');
+      return Map<String, dynamic>.from(m ?? {});
+    } on PlatformException {
+      return {'supported': false};
+    } catch (_) {
+      return {'supported': false};
+    }
+  }
+
+  Future<Map<String, dynamic>> bluetoothState() async {
+    try {
+      final m =
+          await _ch.invokeMapMethod<String, dynamic>('getBluetoothState');
+      return Map<String, dynamic>.from(m ?? {});
+    } on PlatformException {
+      return {'supported': false};
+    } catch (_) {
+      return {'supported': false};
+    }
+  }
+
+  Future<Map<String, dynamic>> hotspotState() async {
+    try {
+      final m =
+          await _ch.invokeMapMethod<String, dynamic>('getHotspotState');
+      return Map<String, dynamic>.from(m ?? {});
+    } on PlatformException {
+      return {'supported': false};
+    } catch (_) {
+      return {'supported': false};
+    }
+  }
+
+  Future<Map<String, dynamic>> mobileDataState() async {
+    try {
+      final m =
+          await _ch.invokeMapMethod<String, dynamic>('getMobileDataState');
+      return Map<String, dynamic>.from(m ?? {});
+    } on PlatformException {
+      return {'supported': false};
+    } catch (_) {
+      return {'supported': false};
+    }
+  }
+
+  Future<Map<String, dynamic>> airplaneModeState() async {
+    try {
+      final m =
+          await _ch.invokeMapMethod<String, dynamic>('getAirplaneModeState');
+      return Map<String, dynamic>.from(m ?? {});
+    } on PlatformException {
+      return {'supported': false};
+    } catch (_) {
+      return {'supported': false};
+    }
+  }
+
+  /// Phase 1 settings/app open (user-confirmed OS UI, never silent toggles).
+  Future<Map<String, dynamic>> openSettings(String screen) async {
+    try {
+      final m = await _ch.invokeMapMethod<String, dynamic>(
+          'openSettings', {'screen': screen});
+      return Map<String, dynamic>.from(m ?? {});
+    } on PlatformException catch (e) {
+      throw SysControlBridgeException(e.code, e.message ?? 'open failed');
+    } catch (e) {
+      throw SysControlBridgeException('failed', '$e');
+    }
+  }
+
+  Future<Map<String, dynamic>> openApp(String package) async {
+    try {
+      final m = await _ch.invokeMapMethod<String, dynamic>(
+          'openApp', {'package': package});
+      return Map<String, dynamic>.from(m ?? {});
+    } on PlatformException catch (e) {
+      throw SysControlBridgeException(e.code, e.message ?? 'open failed');
+    } catch (e) {
+      throw SysControlBridgeException('failed', '$e');
+    }
+  }
+
+  /// Phase 2 tiered state changes. Each returns the native result map
+  /// ({supported, applied, requested, method, verify, ...}) verbatim;
+  /// applied:true appears only after native post-action verification.
+  /// Channel failures throw SysControlBridgeException (never fake data).
+  Future<Map<String, dynamic>> setWifi(bool enabled) async {
+    try {
+      final m = await _ch.invokeMapMethod<String, dynamic>(
+          'setWifi', {'enabled': enabled});
+      return Map<String, dynamic>.from(m ?? {});
+    } on PlatformException catch (e) {
+      throw SysControlBridgeException(e.code, e.message ?? 'set failed');
+    } catch (e) {
+      throw SysControlBridgeException('failed', '$e');
+    }
+  }
+
+  Future<Map<String, dynamic>> setBluetooth(bool enabled) async {
+    try {
+      final m = await _ch.invokeMapMethod<String, dynamic>(
+          'setBluetooth', {'enabled': enabled});
+      return Map<String, dynamic>.from(m ?? {});
+    } on PlatformException catch (e) {
+      throw SysControlBridgeException(e.code, e.message ?? 'set failed');
+    } catch (e) {
+      throw SysControlBridgeException('failed', '$e');
+    }
+  }
+
+  Future<Map<String, dynamic>> setHotspot(bool enabled) async {
+    try {
+      final m = await _ch.invokeMapMethod<String, dynamic>(
+          'setHotspot', {'enabled': enabled});
+      return Map<String, dynamic>.from(m ?? {});
+    } on PlatformException catch (e) {
+      throw SysControlBridgeException(e.code, e.message ?? 'set failed');
+    } catch (e) {
+      throw SysControlBridgeException('failed', '$e');
+    }
+  }
+
+  Future<Map<String, dynamic>> setMobileData(bool enabled) async {
+    try {
+      final m = await _ch.invokeMapMethod<String, dynamic>(
+          'setMobileData', {'enabled': enabled});
+      return Map<String, dynamic>.from(m ?? {});
+    } on PlatformException catch (e) {
+      throw SysControlBridgeException(e.code, e.message ?? 'set failed');
+    } catch (e) {
+      throw SysControlBridgeException('failed', '$e');
+    }
+  }
+
+  Future<Map<String, dynamic>> setAirplaneMode(bool enabled) async {
+    try {
+      final m = await _ch.invokeMapMethod<String, dynamic>(
+          'setAirplaneMode', {'enabled': enabled});
+      return Map<String, dynamic>.from(m ?? {});
+    } on PlatformException catch (e) {
+      throw SysControlBridgeException(e.code, e.message ?? 'set failed');
+    } catch (e) {
+      throw SysControlBridgeException('failed', '$e');
+    }
+  }
+
+  /// Tier-3 probe: lab privileged companion installed + reachable?
+  /// Ordinary builds (and the physical phone) report present:false —
+  /// deployment_blocked, never an error.
+  Future<Map<String, dynamic>> privCompanionProbe() async {
+    try {
+      final m = await _ch.invokeMapMethod<String, dynamic>(
+          'privCompanionProbe');
+      return Map<String, dynamic>.from(m ?? {});
+    } on PlatformException {
+      return {'supported': false};
+    } catch (_) {
+      return {'supported': false};
+    }
+  }
+
   /// Resource telemetry snapshot (observation only, never authority).
   /// Returns raw native map; missing keys mean unavailable (never zero).
   /// Never throws — channel failure yields {} (heartbeat omits it).
@@ -226,6 +391,69 @@ class DeviceBridge {
     } catch (_) {/* channels are best-effort */}
   }
 
+  /// Background-resume opt-in flag (plain internal marker file, no
+  /// secrets). The boot receiver posts a "tap to resume" notification
+  /// only when this is true; the app never polls in the background on
+  /// its own. Defaults to false (opt-in).
+  Future<bool> resumeOptIn() async {
+    try {
+      final v = await _ch.invokeMethod<bool>('getResumeOptIn');
+      return v == true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> setResumeOptIn(bool enabled) async {
+    try {
+      await _ch.invokeMethod('setResumeOptIn', {'enabled': enabled});
+    } catch (_) {/* flag write is best-effort; UI shows last-known */}
+  }
+
+  /// Wake-word detection preference (plain internal marker file, no
+  /// secrets). Absent/unreadable reads as OFF — the safe default on
+  /// first install. Persisting the preference never overrides a
+  /// revoked mic permission, a missing model, or a failed init: those
+  /// re-validate on every enable.
+  Future<bool> wakeOptIn() async {
+    try {
+      final v = await _ch.invokeMethod<bool>('getWakeOptIn');
+      return v == true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> setWakeOptIn(bool enabled) async {
+    try {
+      await _ch.invokeMethod('setWakeOptIn', {'enabled': enabled});
+    } catch (_) {/* flag write is best-effort; UI shows last-known */}
+  }
+
+  /// Wake-model presence probe (report only). Always treats missing or
+  /// unreadable data as all-absent; `ready` comes from native (always
+  /// false until an engine ships) and is never upgraded here.
+  Future<Map<String, dynamic>> wakeModelStatus() async {
+    try {
+      final m =
+          await _ch.invokeMapMethod<String, dynamic>('getWakeModelStatus');
+      final out = Map<String, dynamic>.from(m ?? {});
+      out['model_info'] = out['model_info'] == true;
+      out['keyword_model'] = out['keyword_model'] == true;
+      out['mel_model'] = out['mel_model'] == true;
+      out['ready'] = out['ready'] == true;
+      return out;
+    } catch (_) {
+      return {
+        'model_info': false,
+        'keyword_model': false,
+        'mel_model': false,
+        'ready': false,
+        'note': 'probe failed'
+      };
+    }
+  }
+
   /// Assistant-role report (Stage 10). Absence of data is never success.
   Future<Map<String, dynamic>> assistantStatus() async {
     try {
@@ -280,4 +508,14 @@ class A11yBridgeException implements Exception {
   const A11yBridgeException(this.code, this.message);
   @override
   String toString() => 'A11yBridgeException($code): $message';
+}
+
+/// Structured system-control failure (Phase 1 settings/app open):
+/// denied|unavailable|failed — never a fake success.
+class SysControlBridgeException implements Exception {
+  final String code;
+  final String message;
+  const SysControlBridgeException(this.code, this.message);
+  @override
+  String toString() => 'SysControlBridgeException($code): $message';
 }

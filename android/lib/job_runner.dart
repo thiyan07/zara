@@ -57,6 +57,19 @@ class JobResult {
 typedef BatteryProbe = Map<String, dynamic> Function();
 typedef NetworkProbe = Map<String, dynamic> Function();
 
+/// Phase 1 state probes (wired to DeviceBridge wifi/bluetooth/... states).
+/// Async: DeviceBridge platform-channel calls always return Futures.
+typedef SysStateProbe = Future<Map<String, dynamic>> Function();
+
+/// Phase 1 executors (wired to DeviceBridge.openSettings/openApp).
+typedef SettingsOpener = Future<Map<String, dynamic>> Function(String screen);
+typedef AppOpener = Future<Map<String, dynamic>> Function(String package);
+
+/// Phase 2 tiered setters (wired to DeviceBridge.setWifi/... in main.dart,
+/// faked in tests). Each returns the native result map; applied:true only
+/// after native post-action verification. Null = gateway unavailable.
+typedef SysSetter = Future<Map<String, dynamic>> Function(bool enabled);
+
 /// Privileged executor (wired to DeviceBridge.privForceStop in main.dart,
 /// faked in tests). Null means the gateway is unavailable on this build.
 typedef ForceStopProbe = Future<Map<String, dynamic>> Function(String package);
@@ -82,6 +95,18 @@ class AndroidJobRunner {
   final A11yInspectProbe? a11yInspect;
   final A11yInspectWithParamsProbe? a11yInspectWithParams;
   final A11yTapProbe? a11yTap;
+  final SysStateProbe? wifiState;
+  final SysStateProbe? bluetoothState;
+  final SysStateProbe? hotspotState;
+  final SysStateProbe? mobileDataState;
+  final SysStateProbe? airplaneModeState;
+  final SettingsOpener? openSettings;
+  final AppOpener? openApp;
+  final SysSetter? setWifi;
+  final SysSetter? setBluetooth;
+  final SysSetter? setHotspot;
+  final SysSetter? setMobileData;
+  final SysSetter? setAirplaneMode;
   final Set<String> _seen = {};
   static const int maxSeen = 200;
 
@@ -91,11 +116,40 @@ class AndroidJobRunner {
       this.forceStop,
       this.a11yInspect,
       this.a11yInspectWithParams,
-      this.a11yTap});
+      this.a11yTap,
+      this.wifiState,
+      this.bluetoothState,
+      this.hotspotState,
+      this.mobileDataState,
+      this.airplaneModeState,
+      this.openSettings,
+      this.openApp,
+      this.setWifi,
+      this.setBluetooth,
+      this.setHotspot,
+      this.setMobileData,
+      this.setAirplaneMode});
 
   static const allowlisted = {
     'system.battery',
+    'system.battery.charging_time',
     'system.network',
+    'system.wifi.state',
+    'system.wifi.settings',
+    'system.bluetooth.state',
+    'system.bluetooth.settings',
+    'system.hotspot.state',
+    'system.hotspot.settings',
+    'system.mobile_data.state',
+    'system.mobile_data.settings',
+    'system.airplane_mode.state',
+    'system.airplane_mode.settings',
+    'system.wifi.set',
+    'system.bluetooth.set',
+    'system.hotspot.set',
+    'system.mobile_data.set',
+    'system.airplane_mode.set',
+    'system.app.open',
     'gui.screen.inspect',
     'gui.tap',
   };
@@ -109,6 +163,26 @@ class AndroidJobRunner {
   static const a11yTapTargets = {
     'dev.zara.zara_android',
     'dev.zara.lab.privtest',
+  };
+
+  /// Phase 1 app-open allowlist mirror — byte-equal to Core's
+  /// APP_OPEN_TARGETS. Refusals happen here even if a job arrived.
+  static const appOpenTargets = {
+    'dev.zara.zara_android',
+    'dev.zara.lab.privtest',
+    'com.android.settings',
+    'com.android.chrome',
+    'com.google.android.gm',
+    'com.google.android.calendar',
+  };
+
+  /// Phase 1 settings screens (must match native settingsActions keys).
+  static const settingsScreens = {
+    'wifi',
+    'bluetooth',
+    'hotspot',
+    'mobile_data',
+    'airplane_mode',
   };
 
   Future<JobResult> run(DeviceJob job, {CancelToken? cancel}) async {
@@ -233,6 +307,124 @@ class AndroidJobRunner {
             'applied': m['applied'] == true,
             'verify_state': '${m['verify_state'] ?? 'unknown'}',
           });
+        case 'system.battery.charging_time':
+          final b = battery();
+          final charging = b['charging'] == true;
+          final pct = b['battery_pct'];
+          // Single snapshot cannot estimate charge time: report honestly
+          // (null estimate) instead of inventing a duration.
+          return JobResult(ok: true, result: {
+            'battery_pct': pct,
+            'charging': charging,
+            'time_to_full_minutes': null,
+            'note': charging
+                ? 'charging; single snapshot cannot estimate time-to-full'
+                : 'not charging; no estimate',
+          });
+        case 'system.wifi.state':
+        case 'system.bluetooth.state':
+        case 'system.hotspot.state':
+        case 'system.mobile_data.state':
+        case 'system.airplane_mode.state':
+          final probe = switch (job.tool) {
+            'system.wifi.state' => wifiState,
+            'system.bluetooth.state' => bluetoothState,
+            'system.hotspot.state' => hotspotState,
+            'system.mobile_data.state' => mobileDataState,
+            _ => airplaneModeState,
+          };
+          if (probe == null) {
+            return const JobResult(
+                ok: false,
+                error: 'sys-state gateway unavailable on this build');
+          }
+          final s = await probe();
+          if (s['supported'] == false) {
+            return JobResult(
+                ok: false,
+                error: '${s['reason'] ?? s['error'] ?? 'unsupported'}',
+                result: Map<String, dynamic>.from(s));
+          }
+          return JobResult(ok: true, result: Map<String, dynamic>.from(s));
+        case 'system.wifi.settings':
+        case 'system.bluetooth.settings':
+        case 'system.hotspot.settings':
+        case 'system.mobile_data.settings':
+        case 'system.airplane_mode.settings':
+          final screen = job.tool.split('.')[1];
+          if (!settingsScreens.contains(screen)) {
+            return const JobResult(
+                ok: false, error: 'unknown settings screen (refused)');
+          }
+          final opener = openSettings;
+          if (opener == null) {
+            return const JobResult(
+                ok: false,
+                error: 'settings gateway unavailable on this build');
+          }
+          final m = await opener(screen);
+          return JobResult(ok: true, result: Map<String, dynamic>.from(m));
+        case 'system.app.open':
+          final pkg = job.inputs['package'];
+          if (pkg is! String || !appOpenTargets.contains(pkg)) {
+            return const JobResult(
+                ok: false,
+                error:
+                    'package not in app-open allowlist (refused, never executed)');
+          }
+          final fn = openApp;
+          if (fn == null) {
+            return const JobResult(
+                ok: false,
+                error: 'app-open gateway unavailable on this build');
+          }
+          final m = await fn(pkg);
+          return JobResult(ok: true, result: {
+            'package': '${m['package'] ?? pkg}',
+            'launched': m['launched'] == true,
+          });
+        case 'system.wifi.set':
+        case 'system.bluetooth.set':
+        case 'system.hotspot.set':
+        case 'system.mobile_data.set':
+        case 'system.airplane_mode.set':
+          final want = job.inputs['enabled'];
+          if (want is! bool) {
+            // No direction (or a non-boolean): refuse without touching
+            // any gateway. The intent layer normally fills `enabled`;
+            // a bare capability call clarifies instead of guessing.
+            return const JobResult(
+                ok: false,
+                error: 'bad enabled (need {enabled: boolean}, refused)');
+          }
+          final setter = switch (job.tool) {
+            'system.wifi.set' => setWifi,
+            'system.bluetooth.set' => setBluetooth,
+            'system.hotspot.set' => setHotspot,
+            'system.mobile_data.set' => setMobileData,
+            _ => setAirplaneMode,
+          };
+          if (setter == null) {
+            return const JobResult(
+                ok: false,
+                error: 'sys-set gateway unavailable on this build');
+          }
+          try {
+            final r = await setter(want);
+            if (r['supported'] == false) {
+              return JobResult(
+                  ok: false,
+                  error: '${r['reason'] ?? r['error'] ?? 'unsupported'}',
+                  result: Map<String, dynamic>.from(r));
+            }
+            // applied:false (settings-UI / consent / deployment-blocked)
+            // is an HONEST terminal outcome, not a failure to retry:
+            // the device did exactly what the tier allows and said so.
+            return JobResult(
+                ok: true, result: Map<String, dynamic>.from(r));
+          } catch (e) {
+            return JobResult(ok: false, error: 'runner fault: $e');
+          }
         default:
           // NOT an error to retry: structured refusal, Core sees it as done.
           return JobResult(

@@ -83,8 +83,11 @@ class NotificationCenter {
   final Map<String, DeviceNotification> _shown = {};
   final Set<String> _acked = {};
 
-  /// Returns true when newly shown; false on duplicate.
+  /// Returns true when newly shown; false on duplicate or acked id.
+  /// Late-response guard: an acked (decided or reconciled-away) card must
+  /// never reappear just because a stale fetch still lists it.
   bool show(DeviceNotification n) {
+    if (_acked.contains(n.id)) return false;
     if (_shown.containsKey(n.id)) return false;
     _shown[n.id] = n;
     while (_shown.length > maxSeen) {
@@ -98,6 +101,25 @@ class NotificationCenter {
       .toList();
 
   void ack(String id) => _acked.add(id);
+
+  /// Reconcile locally pending approval cards against the authoritative
+  /// server pending list (one successful fetch). Any approval card the
+  /// server no longer lists is stale (cancelled/decided/wiped/expired):
+  /// ack-dismiss it locally and return the dismissed cards for an
+  /// explanatory notice. Non-approval channels are untouched. Pure and
+  /// idempotent: already-acked ids are never returned twice, and cards
+  /// present server-side are never dismissed.
+  List<DeviceNotification> reconcileApprovals(Set<String> serverIds) {
+    final dismissed = <DeviceNotification>[];
+    for (final n in pending) {
+      if (n.channel == ZaraChannel.approvals &&
+          !serverIds.contains(n.id)) {
+        _acked.add(n.id);
+        dismissed.add(n);
+      }
+    }
+    return dismissed;
+  }
   bool get hasPendingApprovals =>
       pending.any((n) => n.channel == ZaraChannel.approvals);
 }

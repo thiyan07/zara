@@ -126,6 +126,46 @@ def test_local_network_alias():
         assert p.capability == "system.network", u
 
 
+def phase1_ctx():
+    caps = {"system.battery", "system.battery.charging_time",
+            "system.wifi.state", "system.wifi.settings",
+            "system.bluetooth.state", "system.bluetooth.settings",
+            "system.hotspot.state", "system.hotspot.settings",
+            "system.mobile_data.state", "system.mobile_data.settings",
+            "system.airplane_mode.state", "system.airplane_mode.settings",
+            "system.app.open"}
+    return ctx_with(caps, [], {c: {"properties": {}} for c in caps})
+
+
+def test_local_phase1_syscontrol_aliases():
+    cases = {
+        "wifi status": "system.wifi.state",
+        "open wifi settings": "system.wifi.settings",
+        "bluetooth status": "system.bluetooth.state",
+        "open bluetooth settings": "system.bluetooth.settings",
+        "hotspot status": "system.hotspot.state",
+        "open hotspot settings": "system.hotspot.settings",
+        "mobile data status": "system.mobile_data.state",
+        "open mobile data settings": "system.mobile_data.settings",
+        "airplane mode status": "system.airplane_mode.state",
+        "open airplane mode settings": "system.airplane_mode.settings",
+        "how long to charge": "system.battery.charging_time",
+        "time to full charge": "system.battery.charging_time",
+    }
+    for u, cap in cases.items():
+        p = LP.parse(u, phase1_ctx())
+        assert p.capability == cap, u
+        assert not p.needs_clarification, u
+
+
+def test_local_mobile_data_not_a_device_mention():
+    # "mobile" inside "mobile data" must not trigger the device
+    # disambiguation path when no devices are paired.
+    p = LP.parse("mobile data status", phase1_ctx())
+    assert p.capability == "system.mobile_data.state"
+    assert not p.needs_clarification
+
+
 def test_local_devices_builtin():
     p = LP.parse("show my devices", phone_ctx())
     assert p.capability == "device.list"

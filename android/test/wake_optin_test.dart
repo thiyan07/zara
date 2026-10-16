@@ -1,6 +1,8 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter/services.dart';
+import 'package:zara_android/device_bridge.dart';
 import 'package:zara_android/wake_optin.dart';
 
 Map<String, dynamic> okFlags() => {
@@ -210,4 +212,267 @@ void main() {
     await tester.pump();
     expect(find.textContaining('paused'), findsWidgets);
   });
+
+group('wake preference bridge (mock MethodChannel)', () {
+  const channel = MethodChannel('zara/device');
+
+  setUp(() {
+    TestWidgetsFlutterBinding.ensureInitialized();
+  });
+
+  tearDown(() {
+    TestWidgetsFlutterBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, null);
+  });
+
+  test('reads native flag verbatim; failure reads OFF, never ON', () async {
+    TestWidgetsFlutterBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      expect(call.method, 'getWakeOptIn');
+      return true;
+    });
+    expect(await DeviceBridge().wakeOptIn(), isTrue);
+    TestWidgetsFlutterBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      throw PlatformException(code: 'x');
+    });
+    expect(await DeviceBridge().wakeOptIn(), isFalse);
+  });
+
+  test('write passes the boolean through', () async {
+    String? seenMethod;
+    Map<dynamic, dynamic>? seenArgs;
+    TestWidgetsFlutterBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      seenMethod = call.method;
+      seenArgs = call.arguments as Map<dynamic, dynamic>?;
+      return null;
+    });
+    await DeviceBridge().setWakeOptIn(true);
+    expect(seenMethod, 'setWakeOptIn');
+    expect(seenArgs?['enabled'], isTrue);
+  });
+});
+
+group('detector phases: persisted ON/OFF, single listener, lifecycle', () {
+  WakeOptInState liveState(
+      {Future<String?> Function()? onStart, Future<void> Function()? onRelease}) {
+    final s = armedState(onRelease: onRelease);
+    s.onStartListening = onStart;
+    return s;
+  }
+
+  Future<WakeOptInState> armedForListen(
+      {Future<String?> Function()? onStart,
+      Future<void> Function()? onRelease}) async {
+    final s = liveState(onStart: onStart ?? () async => null,
+        onRelease: onRelease);
+    await s.updatePermission(true);
+    await s.setOptIn(true);
+    return s;
+  }
+
+  test('preference defaults OFF; persisted load never auto-starts', () async {
+    final s = armedState();
+    expect(s.optedIn, isFalse);
+    expect(s.phase, equals(WakeListenPhase.off));
+    expect(s.phaseLabel, contains('off'));
+    s.loadPersisted(true); // reboot restores the toggle, not capture
+    expect(s.optedIn, isTrue);
+    expect(s.phase, equals(WakeListenPhase.off));
+    expect(s.releaseCalls, equals(0));
+  });
+
+  test('ON starts one listener when prerequisites pass', () async {
+    var starts = 0;
+    final s = await armedForListen(onStart: () async {
+      starts++;
+      return null;
+    });
+    expect(await s.startListening(), isTrue);
+    expect(s.phase, equals(WakeListenPhase.listening));
+    expect(s.phaseLabel, contains('listening'));
+    expect(starts, equals(1));
+  });
+
+  test('repeated starts do not duplicate listeners', () async {
+    var starts = 0;
+    final s = await armedForListen(onStart: () async {
+      starts++;
+      return null;
+    });
+    expect(await s.startListening(), isTrue);
+    expect(await s.startListening(), isTrue);
+    expect(await s.startListening(), isTrue);
+    expect(starts, equals(1));
+  });
+
+  test('OFF stops capture and confirms release', () async {
+    var stops = 0;
+    final s = await armedForListen(onStart: () async => null);
+    await s.startListening();
+    s.onRelease = () async => stops++;
+    await s.setOptIn(false);
+    expect(s.phase, equals(WakeListenPhase.off));
+    expect(s.phaseLabel, contains('off'));
+    expect(stops, equals(1));
+  });
+
+  test('revoked permission prevents startup with actionable error',
+      () async {
+    var starts = 0;
+    final s = liveState(onStart: () async {
+      starts++;
+      return null;
+    });
+    await s.updatePermission(true);
+    await s.setOptIn(true);
+    await s.updatePermission(false);
+    expect(await s.startListening(), isFalse);
+    expect(s.phase, equals(WakeListenPhase.error));
+    expect(s.listenError, contains('microphone permission'));
+    expect(starts, equals(0)); // engine never touched
+  });
+
+  test('missing model is an honest error, never simulated listening',
+      () async {
+    final s = await armedForListen(
+        onStart: () async => 'no wake-word model on this build');
+    expect(await s.startListening(), isFalse);
+    expect(s.phase, equals(WakeListenPhase.error));
+    expect(s.phaseLabel, contains('error'));
+    expect(s.listenError, contains('no wake-word model'));
+  });
+
+  test('disabling suppresses pending and late wake events', () async {
+    final s = await armedForListen(onStart: () async => null);
+    await s.startListening();
+    final gen = s.listenGeneration;
+    expect(s.noteWakeEvent(generation: gen), isTrue); // live event passes
+    await s.setOptIn(false);
+    expect(s.noteWakeEvent(generation: gen), isFalse); // late: dropped
+    expect(s.noteWakeEvent(), isFalse); // phase off: dropped
+  });
+
+  test('cooldown prevents repeated wake events', () async {
+    final s = await armedForListen(onStart: () async => null);
+    s.wakeCooldown = const Duration(seconds: 30);
+    await s.startListening();
+    expect(s.noteWakeEvent(), isTrue);
+    expect(s.noteWakeEvent(), isFalse); // within cooldown
+  });
+
+  test('pause/logout/revoke path parks the listener (forceStandby)',
+      () async {
+    var stops = 0;
+    final s = await armedForListen(
+        onStart: () async => null, onRelease: () async => stops++);
+    await s.startListening();
+    await s.forceStandby();
+    expect(s.phase, equals(WakeListenPhase.off));
+    expect(stops, equals(1));
+    // Pref untouched: user may re-enable after resume/re-pair.
+    expect(s.optedIn, isTrue);
+    await s.forceStandby(); // idempotent, no extra release
+    expect(stops, equals(1));
+  });
+
+  test('init errors release resources and park at error', () async {
+    var stops = 0;
+    final s = await armedForListen(
+        onStart: () async {
+          throw StateError('audio init failed');
+        },
+        onRelease: () async => stops++);
+    expect(await s.startListening(), isFalse);
+    expect(s.phase, equals(WakeListenPhase.error));
+    expect(s.listenError, contains('audio init failed'));
+    expect(stops, equals(1));
+  });
+});
+
+group('wake model probe and start-error mapping', () {
+  const channel = MethodChannel('zara/device');
+
+  setUp(() {
+    TestWidgetsFlutterBinding.ensureInitialized();
+  });
+
+  tearDown(() {
+    TestWidgetsFlutterBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, null);
+  });
+
+  test('probe normalizes shapes; failure reads all-absent', () async {
+    TestWidgetsFlutterBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      expect(call.method, 'getWakeModelStatus');
+      return <String, dynamic>{
+        'model_info': true,
+        'keyword_model': false,
+        'mel_model': true,
+      };
+    });
+    final m = await DeviceBridge().wakeModelStatus();
+    expect(m['model_info'], isTrue);
+    expect(m['keyword_model'], isFalse);
+    expect(m['ready'], isFalse); // never upgraded client-side
+    TestWidgetsFlutterBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      throw PlatformException(code: 'x');
+    });
+    final down = await DeviceBridge().wakeModelStatus();
+    expect(down['ready'], isFalse);
+    expect(down.values.whereType<bool>().every((v) => !v), isTrue);
+  });
+
+  test('missing files name exactly what is absent', () {
+    final e = describeWakeModelError({
+      'model_info': false,
+      'keyword_model': false,
+      'mel_model': false,
+      'ready': false,
+    });
+    expect(e, contains('model_info.json'));
+    expect(e, contains('keyword model'));
+    expect(e, contains('mel frontend'));
+    expect(e, contains('WAKE_ONNX_SETUP.md'));
+  });
+
+  test('present files without engine stay an honest error', () {
+    final e = describeWakeModelError({
+      'model_info': true,
+      'keyword_model': true,
+      'mel_model': true,
+      'ready': false,
+    });
+    expect(e, contains('no on-device wake engine'));
+    expect(e, isNot(contains('listening')));
+  });
+
+  test('untrusted ready=true never starts capture', () {
+    final e = describeWakeModelError({
+      'model_info': true,
+      'keyword_model': true,
+      'mel_model': true,
+      'ready': true,
+    });
+    expect(e, contains('not starting'));
+  });
+
+  test('host check error surfaces in phase without listening', () async {
+    final s = armedState();
+    await s.updatePermission(true);
+    await s.setOptIn(true);
+    s.onStartListening = () async => describeWakeModelError({
+          'model_info': false,
+          'keyword_model': false,
+          'mel_model': false,
+          'ready': false,
+        });
+    expect(await s.startListening(), isFalse);
+    expect(s.phase, equals(WakeListenPhase.error));
+    expect(s.listenError, contains('model_info.json'));
+  });
+});
 }

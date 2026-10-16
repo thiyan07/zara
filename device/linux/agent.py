@@ -338,6 +338,7 @@ class DeviceAgent:
             pass  # describe retries on next boot; strings still route
         last_hb = 0.0
         backoff = POLL_IDLE_S
+        auth_failures = 0
         while not self._stop.is_set():
             try:
                 now = time.time()
@@ -346,8 +347,26 @@ class DeviceAgent:
                     last_hb = now
                 busy = self.run_one_job()
                 backoff = POLL_IDLE_S if busy else POLL_IDLE_S
+                auth_failures = 0
                 self._stop.wait(1.0 if busy else POLL_IDLE_S)
-            except (OSError, RuntimeError):
+            except (OSError, RuntimeError) as e:
+                # Revoked keys surface as 401/403 on heartbeat/register
+                # (poll swallows to None). Three consecutive auth failures
+                # mean the pairing is dead — stop with an operator-
+                # actionable message instead of backing off forever and
+                # hammering Core. Transient/network errors keep retrying.
+                if "HTTP 401" in str(e) or "HTTP 403" in str(e):
+                    auth_failures += 1
+                    if auth_failures >= 3:
+                        print(f"agent {self.device_id}: REVOKED or key "
+                              f"invalid (3 consecutive auth failures) — "
+                              f"ask the operator for a fresh pairing code "
+                              f"and re-run with --claim <code>",
+                              flush=True)
+                        self._stop.set()
+                        return
+                else:
+                    auth_failures = 0
                 self._stop.wait(backoff)
                 backoff = min(backoff * 2, POLL_BACKOFF_MAX_S)
         self.disconnect()

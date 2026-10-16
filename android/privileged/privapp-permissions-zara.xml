@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Lab-only priv-app permission allowlist for dev.zara.privcompanion.
+     Since Android 8, a priv-app holding signature|privileged permissions
+     WITHOUT an allowlist entry crashes system_server in a boot loop
+     (observed live on ZaraLab API 36: IllegalStateException in
+     AppIdPermissionPolicy). This file MUST be pushed alongside the APK
+     before the first reboot with it present. Narrow by design: exactly
+     the one privileged permission the companion needs. -->
+<permissions>
+    <privapp-permissions package="dev.zara.privcompanion">
+        <permission name="android.permission.TETHER_PRIVILEGED"/>
+    </privapp-permissions>
+</permissions>

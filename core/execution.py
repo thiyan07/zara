@@ -63,6 +63,11 @@ class ExecutionEngine:
         self.policy = policy
         self._records: dict[str, ExecutionRecord] = {}
         self._idem: dict[str, str] = {}
+        self._idem_lock = threading.Lock()
+        # Grants in progress: concurrent approve calls for the same
+        # execution must not both pass the WAITING check (double grant =
+        # double dispatch). Entries live only for the grant duration.
+        self._granting: set[str] = set()
         self._lock = threading.Lock()
         # Duplicate-submission guard: client idempotency key -> exec id.
         # Bounded (FIFO eviction); keys to reaped records are swept in
@@ -155,19 +160,30 @@ class ExecutionEngine:
         never authority); mismatched tool/inputs on the same key still
         return the original record with its original parameters."""
         key = self.check_idempotency_key(idempotency_key)
-        if key:
+        if not key:
+            return self.submit_async(tool, inputs, device_id, who, auth,
+                                     mission_id, max_retries, capability,
+                                     binding)
+        # Serialized per engine: check + submit + insert are one critical
+        # section, so concurrent replays of one key cannot double-execute.
+        # A SEPARATE lock from _lock (which _prepare takes for insert) —
+        # holding _lock across submit_async would self-deadlock.
+        with self._idem_lock:
             with self._lock:
                 prior = self._records.get(self._idem.get(key, ""))
-                if prior is not None:
-                    return prior
-        rec = self.submit_async(tool, inputs, device_id, who, auth,
-                                mission_id, max_retries, capability, binding)
-        if key:
+            if prior is not None:
+                return prior
+            rec = self.submit_async(tool, inputs, device_id, who, auth,
+                                    mission_id, max_retries, capability,
+                                    binding)
             with self._lock:
+                # A reaped-then-resubmitted id could theoretically collide
+                # here; last write wins and both records still exist, so
+                # no execution is lost or duplicated.
                 self._idem[key] = rec.id
                 while len(self._idem) > self.IDEM_MAP_MAX:
                     self._idem.pop(next(iter(self._idem)))
-        return rec
+            return rec
 
     def approve(self, execution_id: str, approver: str = "user") -> ExecutionRecord:
         """Synchronous approval: grants then runs inline to terminal."""
@@ -343,8 +359,42 @@ class ExecutionEngine:
         """
         with self._lock:
             rec = self._records[execution_id]
-        if rec.state != ExecutionState.WAITING_FOR_PERMISSION:
-            raise ValueError(f"execution {execution_id} is not awaiting approval")
+            if rec.state != ExecutionState.WAITING_FOR_PERMISSION:
+                raise ValueError(
+                    f"execution {execution_id} is not awaiting approval")
+            if rec.id in self._granting:
+                # A concurrent approve is already inside the grant: refuse
+                # instead of double-granting (double _run = double dispatch
+                # of the same approved operation).
+                raise ValueError(
+                    f"execution {execution_id} grant already in progress")
+            self._granting.add(rec.id)
+        try:
+            return self._grant_checked(rec, approver)
+        finally:
+            with self._lock:
+                self._granting.discard(rec.id)
+
+    def _transition_if_waiting(self, rec: ExecutionRecord,
+                               to: ExecutionState,
+                               error: Optional[str] = None,
+                               stamp: bool = True) -> bool:
+        """Locked compare-and-set: WAITING -> `to` only. Returns False when
+        an operator cancel (or another grant) already moved the record —
+        callers must then preserve the winner's state, never overwrite it.
+        error=None leaves rec.error untouched (re-park path)."""
+        with self._lock:
+            if rec.state != ExecutionState.WAITING_FOR_PERMISSION:
+                return False
+            rec.state = to
+            if error is not None:
+                rec.error = error
+            if stamp:
+                rec.ended_at = utcnow()
+            return True
+
+    def _grant_checked(self, rec: ExecutionRecord,
+                       approver: str = "user") -> ExecutionRecord:
         now = utcnow()
         parked = rec.parked_at or rec.requested_at
         try:
@@ -357,7 +407,14 @@ class ExecutionEngine:
             age = None
         if age is None or age > APPROVAL_TTL_S:
             # Expired: re-park (fresh window + fingerprint), refuse this
-            # attempt. The user must explicitly approve again.
+            # attempt. The user must explicitly approve again. Re-park only
+            # while still WAITING: an operator cancel that landed mid-grant
+            # wins and its CANCELLED state is preserved.
+            if not self._transition_if_waiting(
+                    rec, ExecutionState.WAITING_FOR_PERMISSION,
+                    error=None, stamp=False):
+                raise ValueError(
+                    f"execution {rec.id} no longer awaiting approval")
             rec.parked_at = now
             rec.requested_at = now
             definition = self.registry.get(rec.tool)
@@ -382,10 +439,12 @@ class ExecutionEngine:
             if hasattr(definition.risk, "value") else str(definition.risk),
             rec.capability, definition.version)
         if current != rec.approval_fingerprint:
-            rec.state = ExecutionState.DENIED
-            rec.error = ("approval invalidated: operation changed since park "
-                         "(tool/device/args/risk/capability drift)")
-            rec.ended_at = now
+            if not self._transition_if_waiting(
+                    rec, ExecutionState.DENIED,
+                    "approval invalidated: operation changed since park "
+                    "(tool/device/args/risk/capability drift)"):
+                raise ValueError(
+                    f"execution {rec.id} no longer awaiting approval")
             self._emit("approval_invalidated", execution_id=rec.id,
                        tool=rec.tool, reason=rec.error)
             raise ValueError(rec.error)
@@ -395,21 +454,34 @@ class ExecutionEngine:
             except Exception as e:  # fail closed on hook errors
                 ok, reason = False, f"revalidate error: {e}"
             if not ok:
-                rec.state = ExecutionState.DENIED
-                rec.error = f"approval invalidated at re-check: {reason}"[:300]
-                rec.ended_at = now
+                if not self._transition_if_waiting(
+                        rec, ExecutionState.DENIED,
+                        f"approval invalidated at re-check: {reason}"[:300]):
+                    raise ValueError(
+                        f"execution {rec.id} no longer awaiting approval")
                 self._emit("approval_invalidated", execution_id=rec.id,
                            tool=rec.tool, reason=rec.error)
                 raise ValueError(rec.error)
-        gid = self.policy.grant(approver, f"tool:{rec.tool}",
-                                rec.device_id, rec.tool)
-        rec.auth = PolicyDecision(allow=True, grant_id=gid,
-                                  scope=f"tool:{rec.tool}@{rec.device_id}",
-                                  reason=f"approved by {approver}")
+        # Final compare-and-set, grant mint included: a cancel that landed
+        # anywhere above wins and the grant is refused instead of
+        # resurrecting CANCELLED to RUNNING. policy.grant is a fast local
+        # mint (no engine callbacks), so holding _lock across it cannot
+        # deadlock; minting inside the lock also means a refused attempt
+        # never leaves a live unused grant that a later decide() could
+        # consume as approval.
+        with self._lock:
+            if rec.state != ExecutionState.WAITING_FOR_PERMISSION:
+                raise ValueError(
+                    f"execution {rec.id} no longer awaiting approval")
+            gid = self.policy.grant(approver, f"tool:{rec.tool}",
+                                    rec.device_id, rec.tool)
+            rec.auth = PolicyDecision(allow=True, grant_id=gid,
+                                      scope=f"tool:{rec.tool}@{rec.device_id}",
+                                      reason=f"approved by {approver}")
+            rec.state = ExecutionState.RUNNING
+            rec.started_at = utcnow()
+            rec.approved_at = rec.started_at
         self._emit("permission_granted", execution_id=rec.id, tool=rec.tool)
-        rec.state = ExecutionState.RUNNING
-        rec.started_at = utcnow()
-        rec.approved_at = rec.started_at
         return rec
 
     @staticmethod
@@ -452,7 +524,9 @@ class ExecutionEngine:
             try:
                 out = self.registry.call(rec.tool, rec.inputs,
                                          {"device_id": rec.device_id,
-                                          "execution_id": rec.id})
+                                          "execution_id": rec.id,
+                                          "cancel_requested":
+                                              lambda: rec.cancel_requested})
                 rec.result = out
                 rec.verified = True if tool.verification == "none" else bool(out)
                 rec.state = ExecutionState.SUCCEEDED

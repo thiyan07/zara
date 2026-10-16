@@ -130,8 +130,40 @@ def test_db_env_for_dir_layout():
         "ZARA_FABRIC_DB": "/tmp/opencode/zdata/fabric.db",
         "ZARA_SESSION_DB": "/tmp/opencode/zdata/session.db",
         "ZARA_CHAT_DB": "/tmp/opencode/zdata/chat.db",
+        "ZARA_DELEGATION_DB": "/tmp/opencode/zdata/delegation.db",
     }
 
 
 def test_db_env_empty_means_memory():
     assert db_env_for_dir("") == {}
+
+
+def test_body_limit_413_over_cap_allows_normal():
+    import os as _os
+    from fastapi.testclient import TestClient
+    old = _os.environ.get("ZARA_MAX_BODY_BYTES")
+    _os.environ["ZARA_MAX_BODY_BYTES"] = "100"
+    try:
+        from core.app import build_stack, create_app
+        c = TestClient(create_app(build_stack(fabric_db="")))
+        big = c.post("/v1/voice/turn", json={"audio_base64": "A" * 200},
+                     headers={"Authorization": "Bearer dev-token"})
+        assert big.status_code == 413, big.status_code
+        small = c.get("/v1/health")
+        assert small.status_code == 200
+    finally:
+        if old is None:
+            del _os.environ["ZARA_MAX_BODY_BYTES"]
+        else:
+            _os.environ["ZARA_MAX_BODY_BYTES"] = old
+
+
+def test_oversized_audio_rejected_on_both_voice_paths():
+    import base64 as _b64
+    from fastapi.testclient import TestClient
+    from core.app import build_stack, create_app
+    c = TestClient(create_app(build_stack(fabric_db="")))
+    blob = _b64.b64encode(b"x" * (2 * 1024 * 1024 + 1)).decode()
+    r = c.post("/v1/voice/turn", json={"audio_base64": blob},
+               headers={"Authorization": "Bearer dev-token"})
+    assert r.status_code == 413, r.status_code

@@ -51,6 +51,22 @@ class DeviceBridge(
         const val MAX_SECONDS = 30
         /** Last-known battery pct for the assistant session UI (same process). */
         @Volatile var lastBatteryPct: Int = -1
+        /** Background-resume opt-in marker filename (plain, no secrets). */
+        const val RESUME_OPT_IN_FILE = "zara_resume_optin"
+        /** Wake-word detection preference (plain, no secrets). Absent =
+            OFF. The listener itself never starts from this file — the
+            user must enable it in Settings each process lifetime, and
+            gating (mic permission, model, battery) re-validates then. */
+        const val WAKE_OPT_IN_FILE = "zara_wake_optin"
+        /** Wake-model directory (app-private filesDir/wake_models).
+            Expected once a licensed model exists: model_info.json (or a
+            .zip bundle containing it), the keyword .onnx, and
+            melspectrogram.onnx. Nothing here is executed without the
+            ONNX Runtime dependency, which is deliberately NOT added
+            (footprint + licensing unverified — see WAKE_ONNX_SETUP.md).
+            The probe below only reports file presence so errors stay
+            specific; it never claims readiness. */
+        const val WAKE_MODEL_DIR = "wake_models"
     }
 
     @Volatile private var capture: AudioRecord? = null
@@ -85,6 +101,22 @@ class DeviceBridge(
                     "createNotificationChannels" -> {
                         createChannels(); result.success(true)
                     }
+                    "getResumeOptIn" ->
+                        result.success(readResumeOptIn())
+                    "setResumeOptIn" -> {
+                        writeResumeOptIn(
+                            call.argument<Boolean>("enabled") == true)
+                        result.success(true)
+                    }
+                    "getWakeOptIn" ->
+                        result.success(readWakeOptIn())
+                    "setWakeOptIn" -> {
+                        writeWakeOptIn(
+                            call.argument<Boolean>("enabled") == true)
+                        result.success(true)
+                    }
+                    "getWakeModelStatus" ->
+                        result.success(wakeModelStatus())
                     "audioSelfTest" -> result.success(audioSelfTest())
                     "getAssistantStatus" -> result.success(assistantStatus())
                     "privForceStop" ->
@@ -97,6 +129,28 @@ class DeviceBridge(
                         call.argument<String>("package"),
                         call.argument<Any>("node_id"), result)
                     "a11yProbe" -> result.success(a11yProbe())
+                    "getWifiState" -> result.success(wifiState())
+                    "getBluetoothState" -> result.success(bluetoothState())
+                    "getHotspotState" -> result.success(hotspotState())
+                    "getMobileDataState" -> result.success(mobileDataState())
+                    "getAirplaneModeState" ->
+                        result.success(airplaneModeState())
+                    "openSettings" -> openSettings(
+                        call.argument<String>("screen"), result)
+                    "openApp" -> openApp(
+                        call.argument<String>("package"), result)
+                    "setWifi" -> setWifi(
+                        call.argument<Boolean>("enabled"), result)
+                    "setBluetooth" -> setBluetooth(
+                        call.argument<Boolean>("enabled"), result)
+                    "setHotspot" -> setHotspot(
+                        call.argument<Boolean>("enabled"), result)
+                    "setMobileData" -> setMobileData(
+                        call.argument<Boolean>("enabled"), result)
+                    "setAirplaneMode" -> setAirplaneMode(
+                        call.argument<Boolean>("enabled"), result)
+                    "privCompanionProbe" ->
+                        result.success(privCompanionProbe())
                     else -> result.notImplemented()
                 }
             }
@@ -500,6 +554,94 @@ class DeviceBridge(
             NotificationManager.IMPORTANCE_LOW))
     }
 
+    // ---------- background-resume opt-in marker ----------
+    //
+    // Plain internal file (no secrets, no credentials): true = the user
+    // opted into a "tap to resume" prompt after reboot. The boot receiver
+    // reads it; nothing else does. Default (absent/unreadable) is false.
+
+    private fun readResumeOptIn(): Boolean {
+        return try {
+            context.openFileInput(RESUME_OPT_IN_FILE).use {
+                it.readBytes().toString(Charsets.UTF_8).trim() == "1"
+            }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun writeResumeOptIn(enabled: Boolean) {
+        try {
+            if (enabled) {
+                context.openFileOutput(RESUME_OPT_IN_FILE,
+                    Context.MODE_PRIVATE).use {
+                    it.write("1".toByteArray(Charsets.UTF_8))
+                }
+            } else {
+                context.deleteFile(RESUME_OPT_IN_FILE)
+            }
+        } catch (e: Exception) {
+            // best-effort; UI keeps last-known state
+        }
+    }
+
+    // Wake-word preference file. Same plain-marker pattern as resume
+    // opt-in: "1" = user wants detection, absent = OFF. Read once at
+    // app start; the detector still requires mic permission, a model,
+    // and battery gating on every enable — this file never overrides
+    // a revoked permission or a missing model.
+    private fun readWakeOptIn(): Boolean {
+        return try {
+            context.openFileInput(WAKE_OPT_IN_FILE).use {
+                it.readBytes().toString(Charsets.UTF_8).trim() == "1"
+            }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun writeWakeOptIn(enabled: Boolean) {
+        try {
+            if (enabled) {
+                context.openFileOutput(WAKE_OPT_IN_FILE,
+                    Context.MODE_PRIVATE).use {
+                    it.write("1".toByteArray(Charsets.UTF_8))
+                }
+            } else {
+                context.deleteFile(WAKE_OPT_IN_FILE)
+            }
+        } catch (e: Exception) {
+            // best-effort; UI keeps last-known state
+        }
+    }
+
+    // Wake-model presence probe (report only). Lists which of the three
+    // expected files exist under filesDir/wake_models. `ready` is always
+    // false: without the ONNX Runtime dependency there is no engine, so
+    // presence must never be mistaken for readiness. The Dart side turns
+    // this into specific actionable errors (see describeWakeModelError).
+    private fun wakeModelStatus(): Map<String, Any> {
+        return try {
+            val dir = java.io.File(context.filesDir, WAKE_MODEL_DIR)
+            val info = java.io.File(dir, "model_info.json").exists() ||
+                dir.listFiles()?.any {
+                    it.isFile && it.name.endsWith(".zip")
+                } == true
+            val keyword = dir.listFiles()?.any {
+                it.isFile && it.name.endsWith(".onnx") &&
+                    it.name != "melspectrogram.onnx"
+            } == true
+            val mel = java.io.File(dir, "melspectrogram.onnx").exists()
+            mapOf("model_info" to info, "keyword_model" to keyword,
+                "mel_model" to mel, "ready" to false,
+                "note" to "no on-device wake engine on this build")
+        } catch (e: Exception) {
+            mapOf("model_info" to false, "keyword_model" to false,
+                "mel_model" to false, "ready" to false,
+                "note" to "probe failed")
+        }
+    }
+
     // ---------- assistant-role compatibility (report only) ----------
 
     /**
@@ -619,6 +761,460 @@ class DeviceBridge(
             "playback_api" to (outBuf > 0),
             "note" to "api path only; signal/audibility deferred",
         )
+    }
+
+    // ---------- Phase 1: system-control (read-only states + settings/app) ----------
+    //
+    // Read-only states use ordinary permissions only; anything requiring a
+    // privileged grant or a hidden API reports supported=false honestly.
+    // Writes are NEVER performed here: toggles are exposed only as
+    // Settings-screen intents (user confirms in the OS UI).
+
+    private fun wifiState(): Map<String, Any?> {
+        return try {
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE)
+                as ConnectivityManager
+            val caps = cm.getNetworkCapabilities(cm.activeNetwork)
+            val onWifi = caps?.hasTransport(
+                NetworkCapabilities.TRANSPORT_WIFI) == true
+            var ssid: String? = null
+            try {
+                @Suppress("DEPRECATION")
+                val wm = context.applicationContext.getSystemService(
+                    Context.WIFI_SERVICE) as android.net.wifi.WifiManager
+                ssid = wm.connectionInfo?.ssid?.takeIf {
+                    it.isNotEmpty() && it != "<unknown ssid>" }
+            } catch (_: Exception) { }
+            val enabled = try {
+                @Suppress("DEPRECATION")
+                val wm = context.applicationContext.getSystemService(
+                    Context.WIFI_SERVICE) as android.net.wifi.WifiManager
+                wm.isWifiEnabled || onWifi
+            } catch (_: Exception) { onWifi }
+            mapOf("supported" to true,
+                "state" to if (enabled) "enabled" else "disabled",
+                "connected" to onWifi,
+                "ssid" to ssid)
+        } catch (e: Exception) {
+            mapOf("supported" to false,
+                "error" to (e.message ?: "wifi unavailable").take(200))
+        }
+    }
+
+    private fun bluetoothState(): Map<String, Any?> {
+        return try {
+            val bm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR2) {
+                context.getSystemService(Context.BLUETOOTH_SERVICE)
+                    as? android.bluetooth.BluetoothManager
+            } else null
+            val adapter = bm?.adapter
+                ?: @Suppress("DEPRECATION") android.bluetooth.BluetoothAdapter
+                    .getDefaultAdapter()
+            if (adapter == null) {
+                return mapOf("supported" to false,
+                    "reason" to "no bluetooth adapter")
+            }
+            // API 31+ needs BLUETOOTH_CONNECT to read state; without it we
+            // report honestly instead of throwing.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                ContextCompat.checkSelfPermission(context,
+                    Manifest.permission.BLUETOOTH_CONNECT) !=
+                    PackageManager.PERMISSION_GRANTED) {
+                return mapOf("supported" to false,
+                    "reason" to "BLUETOOTH_CONNECT not granted")
+            }
+            val on = try { adapter.isEnabled } catch (_: Exception) { false }
+            mapOf("supported" to true,
+                "state" to if (on) "enabled" else "disabled")
+        } catch (e: Exception) {
+            mapOf("supported" to false,
+                "error" to (e.message ?: "bluetooth unavailable").take(200))
+        }
+    }
+
+    private fun hotspotState(): Map<String, Any?> {
+        // No public SoftAp-state API: best-effort tethering-transport
+        // observation, otherwise honest unsupported (never guessed).
+        return try {
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE)
+                as ConnectivityManager
+            val caps = cm.getNetworkCapabilities(cm.activeNetwork)
+            val tethered = caps?.hasTransport(
+                NetworkCapabilities.TRANSPORT_WIFI) == true &&
+                caps.hasCapability(
+                    NetworkCapabilities.NET_CAPABILITY_NOT_VPN) &&
+                cm.isActiveNetworkMetered
+            // Without a verified AP signal this stays unknown, not enabled.
+            mapOf("supported" to false,
+                "reason" to "hotspot state has no public API",
+                "tether_hint" to tethered)
+        } catch (e: Exception) {
+            mapOf("supported" to false,
+                "error" to (e.message ?: "hotspot unavailable").take(200))
+        }
+    }
+
+    private fun mobileDataState(): Map<String, Any?> {
+        return try {
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE)
+                as ConnectivityManager
+            val caps = cm.getNetworkCapabilities(cm.activeNetwork)
+            val onCell = caps?.hasTransport(
+                NetworkCapabilities.TRANSPORT_CELLULAR) == true
+            var enabled: Boolean? = null
+            try {
+                val tm = context.getSystemService(Context.TELEPHONY_SERVICE)
+                    as android.telephony.TelephonyManager
+                enabled = tm.isDataEnabled
+            } catch (_: Exception) { }
+            mapOf("supported" to true,
+                "state" to when (enabled) {
+                    true -> "enabled"; false -> "disabled"
+                    else -> if (onCell) "enabled" else "unknown" },
+                "on_cellular" to onCell)
+        } catch (e: Exception) {
+            mapOf("supported" to false,
+                "error" to (e.message ?: "mobile data unavailable").take(200))
+        }
+    }
+
+    private fun airplaneModeState(): Map<String, Any?> {
+        return try {
+            val on = android.provider.Settings.Global.getInt(
+                context.contentResolver,
+                android.provider.Settings.Global.AIRPLANE_MODE_ON, 0) != 0
+            mapOf("supported" to true,
+                "state" to if (on) "enabled" else "disabled")
+        } catch (e: Exception) {
+            mapOf("supported" to false,
+                "error" to (e.message ?: "airplane mode unreadable").take(200))
+        }
+    }
+
+    private val settingsActions = mapOf(
+        "wifi" to android.provider.Settings.ACTION_WIFI_SETTINGS,
+        "bluetooth" to android.provider.Settings.ACTION_BLUETOOTH_SETTINGS,
+        "hotspot" to android.provider.Settings.ACTION_WIRELESS_SETTINGS,
+        "mobile_data" to android.provider.Settings.ACTION_DATA_ROAMING_SETTINGS,
+        "airplane_mode" to android.provider.Settings.ACTION_AIRPLANE_MODE_SETTINGS,
+    )
+
+    private fun openSettings(screen: String?, result: MethodChannel.Result) {
+        val intent = settingsIntentFor(screen)
+        if (intent == null) {
+            result.error("denied",
+                "unknown settings screen (refused)", null)
+            return
+        }
+        try {
+            context.startActivity(intent)
+            result.success(mapOf("supported" to true, "screen" to screen,
+                "activity" to (intent.action ?: "")))
+        } catch (e: Exception) {
+            result.error("failed", (e.message ?: "open settings failed"), null)
+        }
+    }
+
+    private fun settingsIntentFor(screen: String?): Intent? {
+        val action = settingsActions[screen] ?: return null
+        return Intent(action).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+    }
+
+    private fun settingsFallback(screen: String, enabled: Boolean,
+                                 result: MethodChannel.Result,
+                                 extra: Map<String, Any?> = emptyMap()) {
+        // Tier-2 path shared by every set action: open the OS screen for
+        // user confirmation, report applied:false with a verify pointer.
+        // Opening settings is NEVER reported as success.
+        try {
+            val intent = settingsIntentFor(screen)
+            if (intent == null) {
+                result.error("denied",
+                    "unknown settings screen (refused)", null)
+                return
+            }
+            context.startActivity(intent)
+            result.success(mapOf("supported" to true, "applied" to false,
+                "requested" to enabled, "method" to "settings-ui",
+                "settings_opened" to true,
+                "verify" to "system.$screen.state") + extra)
+        } catch (e: Exception) {
+            result.error("failed",
+                (e.message ?: "open $screen settings failed"), null)
+        }
+    }
+
+    private val appOpenTargets = setOf(
+        "dev.zara.zara_android",
+        "dev.zara.lab.privtest",
+        "com.android.settings",
+        "com.android.chrome",
+        "com.google.android.gm",
+        "com.google.android.calendar",
+    )
+
+    private fun openApp(pkg: String?, result: MethodChannel.Result) {
+        if (pkg.isNullOrEmpty() || pkg !in appOpenTargets) {
+            result.error("denied",
+                "package not in app-open allowlist (refused)", null)
+            return
+        }
+        try {
+            val intent = context.packageManager
+                .getLaunchIntentForPackage(pkg)?.apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            if (intent == null) {
+                result.error("unavailable",
+                    "no launch intent for $pkg", null)
+                return
+            }
+            context.startActivity(intent)
+            result.success(mapOf("supported" to true, "package" to pkg,
+                "launched" to true))
+        } catch (e: Exception) {
+            result.error("failed", (e.message ?: "open app failed"), null)
+        }
+    }
+
+    // ---------- Phase 2: tiered state changes (verified or honest) ----------
+    //
+    // Every set method returns {supported, applied, requested, method,
+    // verify}. applied:true ONLY after re-reading the state. Anything that
+    // cannot be done at the current deployment tier returns applied:false
+    // with settings_opened/deployment/setup pointers — never success.
+
+    private fun btAdapter(): android.bluetooth.BluetoothAdapter? {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR2) {
+                (context.getSystemService(Context.BLUETOOTH_SERVICE)
+                    as? android.bluetooth.BluetoothManager)?.adapter
+            } else {
+                @Suppress("DEPRECATION")
+                android.bluetooth.BluetoothAdapter.getDefaultAdapter()
+            }
+        } catch (e: Exception) { null }
+    }
+
+    private fun hasBtConnect(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true
+        return ContextCompat.checkSelfPermission(context,
+            Manifest.permission.BLUETOOTH_CONNECT) ==
+            PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun hasWriteSecureSettings(): Boolean =
+        ContextCompat.checkSelfPermission(context,
+            "android.permission.WRITE_SECURE_SETTINGS") ==
+            PackageManager.PERMISSION_GRANTED
+
+    private fun setWifi(enabled: Boolean?, result: MethodChannel.Result) {
+        if (enabled == null) {
+            result.error("failed", "missing {enabled: boolean}", null)
+            return
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            try {
+                @Suppress("DEPRECATION")
+                val wm = context.applicationContext.getSystemService(
+                    Context.WIFI_SERVICE) as android.net.wifi.WifiManager
+                @Suppress("DEPRECATION")
+                wm.isWifiEnabled = enabled
+                val got = wifiState()["state"] == "enabled"
+                result.success(mapOf("supported" to true,
+                    "applied" to (got == enabled), "requested" to enabled,
+                    "method" to "direct-legacy",
+                    "verify" to "system.wifi.state"))
+                return
+            } catch (e: SecurityException) {
+                result.error("denied", "CHANGE_WIFI_STATE not granted", null)
+                return
+            } catch (e: Exception) {
+                // fall through to settings UI
+            }
+        }
+        settingsFallback("wifi", enabled, result)
+    }
+
+    private fun setBluetooth(enabled: Boolean?, result: MethodChannel.Result) {
+        if (enabled == null) {
+            result.error("failed", "missing {enabled: boolean}", null)
+            return
+        }
+        if (!enabled) {
+            // Direct disable attempt where the runtime permission allows it.
+            if (hasBtConnect()) {
+                try {
+                    val adapter = btAdapter()
+                    if (adapter != null) {
+                        @Suppress("DEPRECATION")
+                        adapter.disable()
+                        val got = bluetoothState()["state"] == "enabled"
+                        result.success(mapOf("supported" to true,
+                            "applied" to (got == enabled),
+                            "requested" to enabled,
+                            "method" to "direct-disable",
+                            "verify" to "system.bluetooth.state"))
+                        return
+                    }
+                } catch (e: SecurityException) {
+                    // fall through to settings UI
+                } catch (e: Exception) {
+                    // fall through to settings UI
+                }
+            }
+            settingsFallback("bluetooth", enabled, result)
+            return
+        }
+        // Enable needs explicit user consent: system dialog now, verified
+        // state on the next read (applied:false until then — never a vow).
+        try {
+            val intent = Intent(
+                android.bluetooth.BluetoothAdapter.ACTION_REQUEST_ENABLE)
+                .apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
+            context.startActivity(intent)
+            result.success(mapOf("supported" to true, "applied" to false,
+                "requested" to enabled, "method" to "consent-dialog",
+                "consent_requested" to true,
+                "verify" to "system.bluetooth.state"))
+        } catch (e: Exception) {
+            settingsFallback("bluetooth", enabled, result)
+        }
+    }
+
+    private fun setAirplaneMode(enabled: Boolean?,
+                                result: MethodChannel.Result) {
+        if (enabled == null) {
+            result.error("failed", "missing {enabled: boolean}", null)
+            return
+        }
+        if (hasWriteSecureSettings()) {
+            try {
+                android.provider.Settings.Global.putInt(
+                    context.contentResolver,
+                    android.provider.Settings.Global.AIRPLANE_MODE_ON,
+                    if (enabled) 1 else 0)
+            } catch (e: SecurityException) {
+                result.error("denied",
+                    "airplane write refused despite grant: " +
+                        (e.message ?: "SecurityException"), null)
+                return
+            } catch (e: Exception) {
+                // fall through to settings UI
+                settingsFallback("airplane_mode", enabled, result, mapOf(
+                    "deployment" to "t1-adb-grant",
+                    "setup" to ("adb shell pm grant " + context.packageName +
+                        " android.permission.WRITE_SECURE_SETTINGS")))
+                return
+            }
+            // Best-effort legacy broadcast: AIRPLANE_MODE_CHANGED is a
+            // protected broadcast on modern Android, so this may throw
+            // while the setting itself is already written. The framework
+            // observes Settings.Global directly; success is decided by
+            // the re-read below, never by this broadcast.
+            try {
+                context.sendBroadcast(Intent(
+                    Intent.ACTION_AIRPLANE_MODE_CHANGED).apply {
+                    putExtra("state", enabled)
+                })
+            } catch (e: Exception) {
+                // ignored: verified state decides
+            }
+            val got = airplaneModeState()["state"] == "enabled"
+            result.success(mapOf("supported" to true,
+                "applied" to (got == enabled), "requested" to enabled,
+                "method" to "direct-adb-grant",
+                "verify" to "system.airplane_mode.state"))
+            return
+        }
+        settingsFallback("airplane_mode", enabled, result, mapOf(
+            "deployment" to "t1-adb-grant",
+            "setup" to ("adb shell pm grant " + context.packageName +
+                " android.permission.WRITE_SECURE_SETTINGS")))
+    }
+
+    private fun setHotspot(enabled: Boolean?, result: MethodChannel.Result) {
+        if (enabled == null) {
+            result.error("failed", "missing {enabled: boolean}", null)
+            return
+        }
+        // Tier-3 lab companion first; ordinary builds have no direct path.
+        val comp = companionCall("setTether", enabled)
+        if (comp != null) {
+            val applied = comp["applied"] == true
+            result.success(mapOf("supported" to true, "applied" to applied,
+                "requested" to enabled, "method" to "priv-companion",
+                "verify" to "system.hotspot.state") +
+                (if (applied) emptyMap()
+                 else mapOf("error" to "${comp["error"] ?: "companion refused"}")))
+            return
+        }
+        settingsFallback("hotspot", enabled, result, mapOf(
+            "deployment" to "t3-priv-companion-or-settings-ui",
+            "setup" to "lab only: android/privileged + scripts/setup_privileged_lab.sh"))
+    }
+
+    private fun setMobileData(enabled: Boolean?,
+                              result: MethodChannel.Result) {
+        if (enabled == null) {
+            result.error("failed", "missing {enabled: boolean}", null)
+            return
+        }
+        // MODIFY_PHONE_STATE is system-only: no direct path by design.
+        settingsFallback("mobile_data", enabled, result)
+    }
+
+    // ---------- Tier-3 lab companion (priv-app ContentProvider) ----------
+    //
+    // The companion (android/privileged/) exposes
+    // content://dev.zara.privcompanion/control guarded by a signature
+    // permission. Absence (ordinary builds, physical phone) is
+    // deployment_blocked, never an error in the request itself.
+
+    private fun privCompanionProbe(): Map<String, Any?> {
+        return try {
+            context.packageManager.getPackageInfo(
+                "dev.zara.privcompanion", 0)
+            val out = companionCall("probe", null)
+            mapOf("supported" to true, "present" to true,
+                "reachable" to (out != null))
+        } catch (e: Exception) {
+            mapOf("supported" to true, "present" to false,
+                "reachable" to false,
+                "setup" to "lab only: android/privileged + scripts/setup_privileged_lab.sh")
+        }
+    }
+
+    private fun companionCall(method: String,
+                              enabled: Boolean?): Map<String, Any?>? {
+        return try {
+            // Authority MUST equal the provider's registered
+            // android:authorities string verbatim (validated live:
+            // a bare package-name authority resolves to nothing).
+            val uri = android.net.Uri.parse(
+                "content://dev.zara.privcompanion.control/cmd")
+            val client = context.contentResolver
+                .acquireContentProviderClient(uri) ?: return null
+            try {
+                val args = android.os.Bundle().apply {
+                    if (enabled != null) putBoolean("enabled", enabled)
+                }
+                val out = client.call(method, null, args) ?: return null
+                @Suppress("UNCHECKED_CAST")
+                mapOf("applied" to out.getBoolean("applied", false),
+                    "state" to (out.getString("state") ?: "unknown"),
+                    "error" to (out.getString("error") ?: ""))
+            } finally {
+                client.close()
+            }
+        } catch (e: SecurityException) {
+            mapOf("applied" to false, "state" to "unknown",
+                "error" to "companion permission denied")
+        } catch (e: Exception) {
+            null
+        }
     }
 
     private fun battery(): Map<String, Any?> {

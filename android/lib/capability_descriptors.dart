@@ -33,6 +33,26 @@ const Map<String, String> _riskOf = {
   // Rung-2 pilot: advisory only (Core policy decides). Lab emulator only.
   'gui.screen.inspect': 'confirm',
   'gui.tap': 'high_risk',
+  // Phase 1: states are safe reads; settings/app opens need user confirm.
+  'system.battery.charging_time': 'safe',
+  'system.wifi.state': 'safe',
+  'system.wifi.settings': 'confirm',
+  'system.bluetooth.state': 'safe',
+  'system.bluetooth.settings': 'confirm',
+  'system.hotspot.state': 'safe',
+  'system.hotspot.settings': 'confirm',
+  'system.mobile_data.state': 'safe',
+  'system.mobile_data.settings': 'confirm',
+  'system.airplane_mode.state': 'safe',
+  'system.airplane_mode.settings': 'confirm',
+  'system.app.open': 'confirm',
+  // Phase 2: state changes are disruptive (self-stranding hazard) —
+  // Core policy + approval decide; this advisory risk stays high.
+  'system.wifi.set': 'high_risk',
+  'system.bluetooth.set': 'high_risk',
+  'system.hotspot.set': 'high_risk',
+  'system.mobile_data.set': 'high_risk',
+  'system.airplane_mode.set': 'high_risk',
 };
 
 /// Android runtime permissions backing gated capabilities.
@@ -143,6 +163,40 @@ List<String> _aliasesOf(String name) {
   switch (name) {
     case 'system.battery':
       return ['battery level', 'battery percentage'];
+    case 'system.battery.charging_time':
+      return ['charging time', 'time to full charge'];
+    case 'system.wifi.state':
+      return ['wifi status', 'wifi state'];
+    case 'system.wifi.settings':
+      return ['open wifi settings'];
+    case 'system.bluetooth.state':
+      return ['bluetooth status'];
+    case 'system.bluetooth.settings':
+      return ['open bluetooth settings'];
+    case 'system.hotspot.state':
+      return ['hotspot status'];
+    case 'system.hotspot.settings':
+      return ['open hotspot settings'];
+    case 'system.mobile_data.state':
+      return ['mobile data status'];
+    case 'system.mobile_data.settings':
+      return ['open mobile data settings'];
+    case 'system.airplane_mode.state':
+      return ['airplane mode status'];
+    case 'system.airplane_mode.settings':
+      return ['open airplane mode settings'];
+    case 'system.app.open':
+      return ['open app', 'launch app'];
+    case 'system.wifi.set':
+      return ['turn on wifi', 'turn off wifi'];
+    case 'system.bluetooth.set':
+      return ['turn on bluetooth', 'turn off bluetooth'];
+    case 'system.hotspot.set':
+      return ['turn on hotspot', 'turn off hotspot'];
+    case 'system.mobile_data.set':
+      return ['turn on mobile data', 'turn off mobile data'];
+    case 'system.airplane_mode.set':
+      return ['turn on airplane mode', 'turn off airplane mode'];
     case 'system.network':
       return ['network status', 'connectivity'];
     case 'voice.input':

@@ -65,4 +65,24 @@ void main() {
         isFalse);
     expect(LifecycleSnapshot.fromMap(m).deviceId, equals('android-phone'));
   });
+
+  test('moveIfChanged: same-state re-assert is a no-op (physical Vivo)',
+      () {
+    // Reproduces the on-device defect: successful re-register while
+    // already online threw "illegal lifecycle transition online -> online"
+    // and surfaced a red error banner on every reconnect.
+    final l = DeviceLifecycle();
+    l.restore('android-phone');
+    l.move(DeviceLifecycleState.online);
+    l.moveIfChanged(DeviceLifecycleState.online);
+    expect(l.state, equals(DeviceLifecycleState.online));
+    // Repeated low-battery polls: degraded re-assert is also a no-op.
+    l.move(DeviceLifecycleState.degraded);
+    l.moveIfChanged(DeviceLifecycleState.degraded);
+    expect(l.state, equals(DeviceLifecycleState.degraded));
+    // Strictness preserved: a *different* illegal target still throws.
+    expect(() => l.move(DeviceLifecycleState.pairing), throwsStateError);
+    expect(
+        () => l.moveIfChanged(DeviceLifecycleState.pairing), throwsStateError);
+  });
 }

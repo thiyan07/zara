@@ -46,3 +46,15 @@ memories wrapped as untrusted data, deny-patterns hold even when the request
 arrives via NL, prompt-injection content cannot alter policy (tested),
 secrets redacted from every prompt, traces redacted. Full detail in
 LLM_CONTRACT.md, RAG_ARCHITECTURE.md, TOOL_REASONING_LOOP.md.
+
+## Tenancy boundary (single-operator)
+
+Memory, missions, approvals, and execution history form one shared store
+guarded by operator/device authentication — there is intentionally no
+per-user isolation inside a deployment. Devices are mutually trusted
+endpoints of one operator, not separate principals: a paired device's
+agent calls run with the operator's authority, and any authenticated
+operator token can read every memory. Do not deploy one Core for
+multiple mutually-untrusting users and do not describe the store as
+multi-user isolated. Per-device scoping applies to *execution targeting*
+(which device runs a tool), never to *data visibility*.

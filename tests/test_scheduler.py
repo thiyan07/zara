@@ -217,3 +217,328 @@ def test_S13_ranking_cannot_authorize_revoked():
     k = S.resolver_rank_key(False, True, False, False, "revoked", "online",
                             "cloud", 100.0, (1,), "c1")
     assert k[0] is True  # not-authorized sorts after authorized
+
+
+# ---------- fire hook: observability trigger, zero authority ----------
+
+def test_S20_fire_hook_called_once_with_payload():
+    import time as _t
+    from core import scheduler as _S
+    seen = []
+    s = _S.Scheduler(on_fire=lambda job: seen.append(dict(job)))
+    jid = s.schedule_once("ping", 0.02, {"k": "v"})
+    deadline = _t.time() + 5
+    while not seen and _t.time() < deadline:
+        _t.sleep(0.02)
+    assert len(seen) == 1
+    assert seen[0]["id"] == jid and seen[0]["payload"] == {"k": "v"}
+    assert [f["id"] for f in s.fired()] == [jid]
+    assert s.pending() == []
+
+
+def test_S21_cancel_before_fire_suppresses_hook():
+    import time as _t
+    from core import scheduler as _S
+    seen = []
+    s = _S.Scheduler(on_fire=lambda job: seen.append(job))
+    jid = s.schedule_once("never", 0.05)
+    assert s.cancel(jid) is True
+    _t.sleep(0.2)
+    assert seen == [] and s.fired() == []
+
+
+def test_S22_hook_exception_kills_nothing():
+    import time as _t
+    from core import scheduler as _S
+
+    def bad(job):
+        raise RuntimeError("hook blew up")
+
+    s = _S.Scheduler(on_fire=bad)
+    jid = s.schedule_once("x", 0.02)
+    deadline = _t.time() + 5
+    while not s.fired() and _t.time() < deadline:
+        _t.sleep(0.02)
+    assert [f["id"] for f in s.fired()] == [jid]
+
+
+def test_S23_fired_ledger_bounded_and_pending_consistent():
+    from core import scheduler as _S
+    s = _S.Scheduler()
+    for i in range(_S.Scheduler.FIRED_KEEP_MAX + 5):
+        jid = f"j{i}"
+        s._jobs[jid] = {"id": jid, "name": "n", "run_at": 0.0,
+                        "payload": {}, "cancelled": False}
+        s._fire(jid)
+    assert len(s.fired()) == _S.Scheduler.FIRED_KEEP_MAX
+    assert s.pending() == []
+
+
+def test_S24_stack_scheduler_announces_and_audits():
+    import time as _t
+    from core.app import build_stack
+    stack = build_stack(fabric_db="")
+    heard = []
+    stack["bus"].subscribe("scheduled_event", lambda ev: heard.append(ev))
+    jid = stack["sched"].schedule_once("probe", 0.02)
+    deadline = _t.time() + 5
+    while not heard and _t.time() < deadline:
+        _t.sleep(0.02)
+    assert heard and heard[0].payload.get("job_id") == jid
+    rows = stack["audit"].query()
+    assert any(r["actor"] == "scheduler" and r["action"] == "timer_fired"
+               for r in rows), [(r["actor"], r["action"]) for r in rows][-5:]
+
+
+# ---------- persistence + restart recovery (SQLite, rollback-safe) ----------
+
+def test_S30_future_job_survives_restart_and_fires_once():
+    import time as _t
+    from core import scheduler as _S
+    import tempfile, os
+    db = os.path.join(tempfile.mkdtemp(), "sched.db")
+    seen = []
+    s1 = _S.Scheduler(on_fire=lambda job: seen.append(job["id"]),
+                      db_path=db)
+    jid = s1.schedule_once("later", 0.3, {"n": 1})
+    # Simulate process death before due: kill the live timer thread
+    # without marking cancelled (del alone would let it fire).
+    s1._jobs[jid]["timer"].cancel()
+    del s1
+    seen2 = []
+    s2 = _S.Scheduler(on_fire=lambda job: seen2.append(job["id"]),
+                      db_path=db)
+    assert any(j["id"] == jid for j in s2.pending())
+    deadline = _t.time() + 5
+    while not seen2 and _t.time() < deadline:
+        _t.sleep(0.02)
+    assert seen2 == [jid]
+    assert seen == []  # first instance never fired
+    assert s2.pending() == []
+
+
+def test_S31_due_on_recovery_fires_exactly_once():
+    import time as _t
+    from core import scheduler as _S
+    import tempfile, os
+    db = os.path.join(tempfile.mkdtemp(), "sched.db")
+    s1 = _S.Scheduler(db_path=db)
+    jid = s1.schedule_once("soon", 0.05)
+    _t.sleep(0.2)  # let it fire in instance 1
+    assert [f["id"] for f in s1.fired()] == [jid]
+    del s1
+    seen = []
+    s2 = _S.Scheduler(on_fire=lambda job: seen.append(job["id"]),
+                      db_path=db)
+    _t.sleep(0.2)
+    assert seen == []  # already fired: recovery must not re-announce
+    assert s2.pending() == []
+
+
+def test_S32_cancel_persists_across_restart():
+    import time as _t
+    from core import scheduler as _S
+    import tempfile, os
+    db = os.path.join(tempfile.mkdtemp(), "sched.db")
+    s1 = _S.Scheduler(db_path=db)
+    jid = s1.schedule_once("nope", 0.05)
+    assert s1.cancel(jid) is True
+    del s1
+    seen = []
+    s2 = _S.Scheduler(on_fire=lambda job: seen.append(job["id"]),
+                      db_path=db)
+    _t.sleep(0.2)
+    assert seen == [] and s2.pending() == [] and s2.fired() == []
+
+
+def test_S33_broken_db_path_raises_loudly():
+    from core import scheduler as _S
+    import tempfile, os
+    bad = os.path.join(tempfile.mkdtemp(), "no-such-dir", "s.db")
+    with pytest.raises(Exception):
+        _S.Scheduler(db_path=bad)
+
+
+def test_S34_firing_creates_no_execution_and_needs_no_approval():
+    import time as _t
+    from core.app import build_stack
+    stack = build_stack(fabric_db="")
+    jid = stack["sched"].schedule_once("probe2", 0.02)
+    deadline = _t.time() + 5
+    while not stack["sched"].fired() and _t.time() < deadline:
+        _t.sleep(0.02)
+    assert [f["id"] for f in stack["sched"].fired()] == [jid]
+    # The hook announces; nothing was submitted, granted, or approved.
+    assert stack["engine"]._records == {}
+    assert stack["jobs"].pending() == [] if hasattr(
+        stack["jobs"], "pending") else True
+
+
+# ---------- scheduled dispatch: due timer -> authorized submit path ----------
+
+def _wait_for(cond, deadline_s=5.0):
+    import time as _t
+    end = _t.time() + deadline_s
+    while _t.time() < end:
+        if cond():
+            return True
+        _t.sleep(0.02)
+    return cond()
+
+
+def test_S40_future_timer_does_not_fire_early():
+    from core.app import build_stack
+    stack = build_stack(fabric_db="")
+    jid = stack["sched"].schedule_once(
+        "future", 30.0, {"exec": {"tool": "system.battery",
+                                  "device_id": "cloud", "inputs": {}}})
+    import time as _t
+    _t.sleep(0.3)
+    assert stack["sched"].fired() == []
+    assert stack["engine"]._records == {}
+    assert stack["sched"].cancel(jid) is True
+
+
+def test_S41_due_timer_submits_one_safe_execution():
+    from core.app import build_stack
+    stack = build_stack(fabric_db="")
+    jid = stack["sched"].schedule_once(
+        "poll-battery", 0.02, {"exec": {"tool": "system.battery",
+                                        "device_id": "cloud", "inputs": {}}})
+    assert _wait_for(lambda: len(stack["engine"]._records) == 1)
+    recs = list(stack["engine"]._records.values())
+    assert len(recs) == 1
+    assert recs[0].binding.get("scheduled_job_id") == jid
+    rows = stack["audit"].query()
+    assert any(r["actor"] == "scheduler" and r["action"] == "timer_fired"
+               for r in rows)
+    assert any(r["actor"] == "scheduler" and
+               r["action"] == "dispatch_submitted" for r in rows)
+
+
+def test_S42_repeated_fire_never_duplicates_submission():
+    from core.app import build_stack
+    stack = build_stack(fabric_db="")
+    jid = stack["sched"].schedule_once(
+        "once", 0.02, {"exec": {"tool": "system.battery",
+                                "device_id": "cloud", "inputs": {}}})
+    assert _wait_for(lambda: len(stack["engine"]._records) == 1)
+    # Forced refire (poll race / restart re-announce): idempotency key
+    # collapses into the same execution.
+    stack["sched"]._fire(jid)
+    stack["sched"]._fire(jid)
+    import time as _t
+    _t.sleep(0.2)
+    assert len(stack["engine"]._records) == 1
+
+
+def test_S43_confirm_risk_parks_for_approval_never_auto_runs():
+    from core.app import build_stack
+    from core.models import ExecutionState
+    stack = build_stack(fabric_db="")
+    # filesystem.write is CONFIRM-gated: the due timer must park it.
+    jid = stack["sched"].schedule_once(
+        "nightly-write", 0.02,
+        {"exec": {"tool": "filesystem.write", "device_id": "cloud",
+                  "inputs": {"path": "scratch/n.txt", "text": "hi"}}})
+    assert _wait_for(lambda: len(stack["engine"]._records) == 1)
+    rec = list(stack["engine"]._records.values())[0]
+    assert rec.binding.get("scheduled_job_id") == jid
+    assert rec.state == ExecutionState.WAITING_FOR_PERMISSION
+    assert rec.result is None  # nothing executed without approval
+
+
+def test_S44_revoked_target_never_reports_success():
+    from core.app import build_stack
+    from core.models import DeviceKind, DeviceState
+    stack = build_stack(fabric_db="")
+    code = stack["device_auth"].enroll("doomed", DeviceKind("linux"))
+    stack["device_auth"].claim(code)
+    stack["devices"].register(DeviceState(
+        device_id="doomed", kind=DeviceKind("linux"),
+        capabilities=["system.battery"], online=True, status="online"))
+    stack["fabric"].revoke_device("doomed", "test revoke")
+    jid = stack["sched"].schedule_once(
+        "doomed-poll", 0.02, {"exec": {"tool": "system.battery",
+                                       "device_id": "doomed", "inputs": {}}})
+    assert _wait_for(lambda: stack["sched"].fired() != [])
+    import time as _t
+    _t.sleep(0.3)
+    # Identical to a manual submit at a revoked device: the request is
+    # audited, and any resulting record stays unverified with no result —
+    # the revoked agent can never authenticate its poll. Success is
+    # never reported.
+    rows = stack["audit"].query()
+    assert any(r["actor"] == "scheduler" and r["action"] in (
+        "dispatch_submitted", "dispatch_rejected") for r in rows), \
+        [(r["actor"], r["action"]) for r in rows][-8:]
+    mine = [r for r in stack["engine"]._records.values()
+            if r.binding.get("scheduled_job_id") == jid]
+    for rec in mine:
+        assert rec.state.value != "succeeded"
+        assert rec.verified is False
+        assert rec.result is None
+
+
+def test_S45_cancel_prevents_future_submission():
+    import time as _t
+    from core.app import build_stack
+    stack = build_stack(fabric_db="")
+    jid = stack["sched"].schedule_once(
+        "cancelled-job", 0.05, {"exec": {"tool": "system.battery",
+                                         "device_id": "cloud", "inputs": {}}})
+    assert stack["sched"].cancel(jid) is True
+    _t.sleep(0.3)
+    assert stack["engine"]._records == {}
+    rows = stack["audit"].query()
+    assert not any(r["actor"] == "scheduler" and
+                   r["action"] == "dispatch_submitted" for r in rows)
+
+
+def test_S46_unknown_tool_rejected_loudly_never_completed():
+    from core.app import build_stack
+    stack = build_stack(fabric_db="")
+    jid = stack["sched"].schedule_once(
+        "bad-tool", 0.02, {"exec": {"tool": "nope.not_a_tool",
+                                    "device_id": "cloud", "inputs": {}}})
+    assert _wait_for(lambda: stack["sched"].fired() != [])
+    import time as _t
+    _t.sleep(0.2)
+    assert stack["engine"]._records == {}
+    rows = stack["audit"].query()
+    assert any(r["actor"] == "scheduler" and
+               r["action"] == "dispatch_rejected" for r in rows)
+    assert not any(r["actor"] == "scheduler" and
+                   r["action"] == "dispatch_submitted" for r in rows)
+
+
+def test_S47_restart_after_processed_exec_never_resubmits():
+    import tempfile, os
+    import time as _t
+    from core import scheduler as _S
+    from core.app import build_stack
+    db = os.path.join(tempfile.mkdtemp(), "sched.db")
+    stack = build_stack(fabric_db="")
+    submitted = []
+
+    def hook(job):
+        req = (job.get("payload") or {}).get("exec")
+        if isinstance(req, dict):
+            rec = stack["engine"].submit_async_idem(
+                req["tool"], {}, "cloud",
+                who="scheduler", binding={"scheduled_job_id": job["id"]},
+                idempotency_key=f"sched-{job['id']}")
+            submitted.append(rec.id)
+
+    s1 = _S.Scheduler(on_fire=hook, db_path=db)
+    jid = s1.schedule_once("nightly", 0.05,
+                           {"exec": {"tool": "system.battery"}})
+    assert _wait_for(lambda: len(submitted) == 1)
+    del s1
+    # Restart: the fired flag persisted, so recovery must not re-announce
+    # and must not submit a second execution.
+    seen = []
+    s2 = _S.Scheduler(on_fire=lambda job: seen.append(job["id"]), db_path=db)
+    _t.sleep(0.3)
+    assert seen == [] and s2.pending() == []
+    assert len(submitted) == 1

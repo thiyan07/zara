@@ -27,6 +27,12 @@ enum WakeOptInStatus {
   unsupported,
 }
 
+/// Detector phases for the persisted ON/OFF setting. `off` is the only
+/// resting state without capture; `starting` covers async init;
+/// `listening` means exactly one active listener was confirmed;
+/// `error` carries an actionable message and holds no resources.
+enum WakeListenPhase { off, starting, listening, error }
+
 /// Pure opt-in state (no Flutter, no timers). The host wires:
 ///   * [onRelease] to the existing stop path (VoiceFlowController.interrupt)
 ///   * [voiceFlags] from DeviceBridge.voiceSupport()
@@ -46,8 +52,32 @@ class WakeOptInState extends ChangeNotifier {
   /// Exceptions are swallowed: release must never crash the UI.
   Future<void> Function()? onRelease;
 
+  /// Detector start attempt, injected by the host. Returns null when
+  /// exactly one listener is confirmed live, or an actionable error
+  /// string (permission/model/hardware) when it cannot start. Null
+  /// host (tests default) means no engine: start always reports the
+  /// missing-engine error instead of pretending to listen.
+  Future<String?> Function()? onStartListening;
+
   /// Count of release invocations (tests assert disable really releases).
   int releaseCalls = 0;
+
+  /// Detector phase + last error. Phase is `off` unless a start was
+  /// confirmed; late callbacks carry a stale generation and are dropped.
+  WakeListenPhase phase = WakeListenPhase.off;
+  String listenError = '';
+  int _listenGeneration = 0;
+  int get listenGeneration => _listenGeneration;
+
+  /// True when nothing is held (fresh, parked, or just released).
+  /// Makes standby idempotent: repeated pause/logout calls never
+  /// stack releases. Cleared whenever gating re-arms.
+  bool _stoodBy = true;
+
+  /// Duplicate-event suppression: minimum gap between accepted wake
+  /// events. Conservative default; host may override per model card.
+  Duration wakeCooldown = const Duration(seconds: 2);
+  DateTime? _lastWakeFire;
 
   WakeOptInState({
     this.batteryPolicy = const WakeBatteryPolicy(),
@@ -137,21 +167,146 @@ class WakeOptInState extends ChangeNotifier {
   }
 
   /// User flips the opt-in switch. Turning OFF from armed releases
-  /// resources via the existing stop path.
+  /// resources via the existing stop path. The persisted preference is
+  /// written by the HOST (it owns the bridge); this object never does
+  /// I/O, so preference writes stay best-effort and testable.
+  /// Release everything held (listener and/or gated resources) and park
+  /// the phase at OFF without touching the persisted preference. Used
+  /// by pause, logout, and revocation: the user may re-enable later,
+  /// but nothing keeps running meanwhile. Idempotent: a second call
+  /// with nothing held does nothing (no extra release, no repaint).
+  Future<void> forceStandby() async {
+    if (phase == WakeListenPhase.off &&
+        (_stoodBy || !effectivelyArmed)) {
+      return;
+    }
+    await stopListening();
+  }
+
   Future<void> setOptIn(bool value) async {
-    final wasArmed = effectivelyArmed;
+    if (!value) {
+      // Standby BEFORE flipping: it must still see the armed state to
+      // release gated resources (then the OFF repaint below confirms).
+      await forceStandby();
+    } else {
+      _stoodBy = false; // re-armed gating may hold resources again
+    }
     _optedIn = value;
-    if (!value && wasArmed) await _release();
     notifyListeners();
+  }
+
+  /// Restores a persisted preference WITHOUT starting anything: no
+  /// auto-listen at boot. The user re-enables listening explicitly in
+  /// the foreground after gates re-validate.
+  void loadPersisted(bool savedOptIn) {
+    _optedIn = savedOptIn;
+    phase = WakeListenPhase.off;
+    listenError = '';
+    _stoodBy = true;
+    _listenGeneration++; // ancient callbacks from a past life are stale
+    _lastWakeFire = null;
+    notifyListeners();
+  }
+
+  /// Starts exactly one listener when all prerequisites pass. Repeated
+  /// calls while starting/listening are no-ops (no duplicate mic
+  /// sessions). Returns true only when listening was confirmed.
+  Future<bool> startListening() async {
+    if (phase == WakeListenPhase.starting ||
+        phase == WakeListenPhase.listening) {
+      return phase == WakeListenPhase.listening; // single-listener guard
+    }
+    if (!effectivelyArmed) {
+      phase = WakeListenPhase.error;
+      listenError = _prerequisiteError() ??
+          'enable the opt-in with mic permission and battery-ok first';
+      notifyListeners();
+      return false;
+    }
+    final gen = ++_listenGeneration;
+    phase = WakeListenPhase.starting;
+    listenError = '';
+    notifyListeners();
+    String? err;
+    if (onStartListening != null) {
+      try {
+        err = await onStartListening!();
+      } catch (e) {
+        err = '$e';
+      }
+    } else {
+      // Null host (tests default) means no engine: report the missing
+      // engine instead of pretending to listen.
+      err = 'no wake engine on this build (model unavailable)';
+    }
+    if (gen != _listenGeneration) return false; // stopped while starting
+    if (err == null) {
+      phase = WakeListenPhase.listening;
+      listenError = '';
+      _stoodBy = false; // a live listener is now held
+    } else {
+      phase = WakeListenPhase.error;
+      listenError = err;
+      await _release();
+      _stoodBy = true;
+    }
+    notifyListeners();
+    return err == null;
+  }
+
+  /// Stops capture and inference promptly, releases audio resources,
+  /// cancels retries (via the shared stop path), and invalidates queued
+  /// wake events by bumping the generation. The OFF phase is shown only
+  /// after release completes (confirmed stop).
+  Future<void> stopListening() async {
+    _listenGeneration++; // late callbacks from here on are stale
+    if (phase == WakeListenPhase.off && _stoodBy) {
+      listenError = '';
+      return; // fully parked already: no work, no repaint storm
+    }
+    if (!_stoodBy) {
+      await _release();
+      _stoodBy = true;
+    }
+    phase = WakeListenPhase.off;
+    listenError = '';
+    notifyListeners();
+  }
+
+  /// Accepts a wake event only from the live generation while listening
+  /// and outside the cooldown window. Late, duplicate, or post-disable
+  /// events return false and must never open a session.
+  bool noteWakeEvent({int? generation}) {
+    if (generation != null && generation != _listenGeneration) return false;
+    if (phase != WakeListenPhase.listening) return false;
+    final now = DateTime.now();
+    if (_lastWakeFire != null &&
+        now.difference(_lastWakeFire!) < wakeCooldown) {
+      return false;
+    }
+    _lastWakeFire = now;
+    return true;
+  }
+
+  String? _prerequisiteError() {
+    if (!deviceSupported) return unsupportedReason;
+    if (!_optedIn) return 'wake opt-in is off';
+    if (!micGranted) return 'microphone permission revoked or denied';
+    if (batteryGate != 'listening') return 'paused: $batteryGate';
+    return null;
   }
 
   /// Host pushes mic permission state (including mid-flow revocation).
   /// Revocation while armed stops everything: explicit
   /// permission-required state, no crash, no silent listening.
   Future<void> updatePermission(bool granted) async {
-    final wasArmed = effectivelyArmed;
+    if (!granted) {
+      // Standby BEFORE flipping: same armed-visibility rule as setOptIn.
+      await forceStandby(); // pref never overrides revocation
+    } else {
+      _stoodBy = false; // re-grant re-arms the gate
+    }
     micGranted = granted;
-    if (!granted && wasArmed) await _release();
     notifyListeners();
   }
 
@@ -179,12 +334,52 @@ class WakeOptInState extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Detector phase line for the Settings toggle area: Off, Starting,
+  /// Listening, or Error with the actionable message. Never claims
+  /// listening unless a start was confirmed.
+  String get phaseLabel {
+    switch (phase) {
+      case WakeListenPhase.off:
+        return 'detection: off';
+      case WakeListenPhase.starting:
+        return 'detection: starting…';
+      case WakeListenPhase.listening:
+        return 'detection: listening (foreground only)';
+      case WakeListenPhase.error:
+        return 'detection: error — ${listenError.isEmpty ? 'could not start' : listenError}';
+    }
+  }
+
   Future<void> _release() async {
     releaseCalls += 1;
     try {
       await onRelease?.call();
     } catch (_) {/* release is best-effort, never a crash */}
   }
+}
+
+/// Maps a wake-model status probe to the actionable start error shown
+/// in Settings. Pure for testing. Never returns null (there is always
+/// something honest to say); never claims readiness.
+String describeWakeModelError(Map<String, dynamic> status) {
+  if (status['ready'] == true) {
+    // No engine ships, so a ready=true probe is untrusted: say so
+    // instead of starting capture on an unverified claim.
+    return 'wake engine reported ready but this build has no verified '
+        'wake engine — not starting (see WAKE_ONNX_SETUP.md)';
+  }
+  final missing = <String>[];
+  if (status['model_info'] != true) missing.add('model_info.json');
+  if (status['keyword_model'] != true) missing.add('keyword model');
+  if (status['mel_model'] != true) missing.add('mel frontend');
+  if (missing.isEmpty) {
+    return 'wake model files present but no on-device wake engine on '
+        'this build (see WAKE_ONNX_SETUP.md; nothing is downloaded '
+        'automatically)';
+  }
+  return 'no wake-word model on this build (missing: ${missing.join(', ')}; '
+      'see WAKE_ONNX_SETUP.md for the training + install path; nothing '
+      'is downloaded automatically)';
 }
 
 /// Wake opt-in panel: switch + mic status/request + battery gate +
@@ -201,8 +396,17 @@ class WakeOptInPanel extends StatefulWidget {
   /// Manual refresh (host's existing refresh; never called on a timer).
   final Future<void> Function()? onRefresh;
 
+  /// Persists the preference (host's bridge write; best-effort). The
+  /// host also wires `state.onStartListening` to its engine check; the
+  /// panel only drives pref + start/stop calls.
+  final Future<void> Function(bool value)? onPersist;
+
   const WakeOptInPanel(
-      {super.key, required this.state, this.onRequestMic, this.onRefresh});
+      {super.key,
+      required this.state,
+      this.onRequestMic,
+      this.onRefresh,
+      this.onPersist});
 
   @override
   State<WakeOptInPanel> createState() => _WakeOptInPanelState();
@@ -238,8 +442,28 @@ class _WakeOptInPanelState extends State<WakeOptInPanel> {
   }
 
   Future<void> _flip(bool value) async {
-    await widget.state.setOptIn(value);
-    if (mounted) setState(() {});
+    if (_busy) return;
+    setState(() => _busy = true);
+    try {
+      await widget.state.setOptIn(value);
+      await widget.onPersist?.call(value);
+      if (value) await widget.state.startListening();
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _stopNow() async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    try {
+      // Immediate disable without leaving the screen: preference off,
+      // persisted off, detector confirmed stopped.
+      await widget.state.setOptIn(false);
+      await widget.onPersist?.call(false);
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
   }
 
   Future<void> _mic() async {
@@ -285,6 +509,14 @@ class _WakeOptInPanelState extends State<WakeOptInPanel> {
             '${s.charging ? ', charging' : ''}'
             '${s.powerSave ? ', power-save' : ''})'),
         Text(s.caption),
+        Text(s.phaseLabel,
+            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                color: s.phase == WakeListenPhase.error
+                    ? Theme.of(context).colorScheme.error
+                    : null)),
+        const Text('Listening runs only in the foreground and may '
+            'increase battery usage. No audio leaves the device for '
+            'detection; nothing is recorded.'),
         const SizedBox(height: 4),
         Wrap(
           spacing: 8,
@@ -296,6 +528,9 @@ class _WakeOptInPanelState extends State<WakeOptInPanel> {
             OutlinedButton(
                 onPressed: _busy ? null : _refresh,
                 child: const Text('Refresh wake state')),
+            OutlinedButton(
+                onPressed: (_busy || !s.optedIn) ? null : _stopNow,
+                child: const Text('Stop listening now')),
           ],
         ),
       ],

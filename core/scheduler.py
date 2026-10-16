@@ -5,21 +5,97 @@ import time
 import uuid
 
 class Scheduler:
-    def __init__(self) -> None:
+    def __init__(self, on_fire=None, db_path: str = "") -> None:
         self._jobs: dict[str, dict] = {}
         self._lock = threading.Lock()
         self._fired: list[dict] = []
+        # Fired ids are remembered forever (tiny strings): ledger eviction
+        # must never resurrect a fired job into pending().
+        self._fired_ids: set[str] = set()
+        # Optional fire hook: called once per fired job on the timer
+        # thread. Dependency-inverted on purpose (this module must not
+        # import engine/policy/registry — see test_S12): the hook may
+        # observe (bus/audit) but is never given execution authority.
+        self._on_fire = on_fire
+        # Optional persistence (rollback-safe: plain new table, no
+        # migration of existing data). Empty path = process-local only,
+        # exactly the historical behavior. A broken path raises loudly
+        # at construction instead of silently dropping scheduled work.
+        self._db = None
+        self._db_path = db_path or ""
+        if self._db_path:
+            import json as _json
+            import sqlite3 as _sqlite3
+            self._json = _json
+            self._db = _sqlite3.connect(self._db_path,
+                                        check_same_thread=False)
+            with self._lock, self._db:
+                self._db.execute("PRAGMA journal_mode=WAL")
+                self._db.execute(
+                    "CREATE TABLE IF NOT EXISTS scheduled_jobs ("
+                    "id TEXT PRIMARY KEY, name TEXT NOT NULL, "
+                    "run_at REAL NOT NULL, payload TEXT DEFAULT '{}', "
+                    "cancelled INTEGER DEFAULT 0, fired INTEGER DEFAULT 0, "
+                    "created_at REAL NOT NULL)")
+            self._recover()
+
+    def _recover(self) -> None:
+        """Restart recovery, once at construction: re-arm future timers,
+        announce already-due work through the normal fire path (observe-
+        only hook; no execution authority), honor persisted cancels.
+        Due work fires through _fire, so fire-once + hook rules apply."""
+        import time as _t
+        now = _t.time()
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT id, name, run_at, payload, cancelled, fired "
+                "FROM scheduled_jobs").fetchall()
+        for (jid, name, run_at, payload, cancelled, fired) in rows:
+            try:
+                data = self._json.loads(payload or "{}")
+            except Exception:  # noqa: BLE001 — corrupt payload fails safe
+                data = {}
+            if fired:
+                self._fired_ids.add(jid)
+                continue
+            job = {"id": jid, "name": name, "run_at": run_at,
+                   "payload": data, "cancelled": bool(cancelled)}
+            with self._lock:
+                self._jobs[jid] = job
+            if job["cancelled"]:
+                continue
+            if run_at <= now:
+                self._fire(jid)
+            else:
+                self._arm(job, max(0.0, run_at - now))
+
+    def _arm(self, job: dict, delay_s: float) -> None:
+        t = threading.Timer(delay_s, self._fire, args=(job["id"],))
+        t.daemon = True
+        job["timer"] = t
+        t.start()
+
+    # Fired ledger bound: observability only, never replayed.
+    FIRED_KEEP_MAX = 200
 
     def schedule_once(self, name: str, delay_s: float, payload: dict | None = None) -> str:
         jid = f"job-{uuid.uuid4().hex[:12]}"
         job = {"id": jid, "name": name, "run_at": time.time() + delay_s,
                "payload": payload or {}, "cancelled": False}
+        if self._db is not None:
+            try:
+                blob = self._json.dumps(job["payload"])
+            except (TypeError, ValueError) as e:
+                raise ValueError(f"payload not JSON-serializable: {e}")
+            with self._lock, self._db:
+                self._db.execute(
+                    "INSERT INTO scheduled_jobs "
+                    "(id, name, run_at, payload, cancelled, fired, "
+                    "created_at) VALUES (?,?,?,?,?,?,?)",
+                    (jid, name, job["run_at"], blob, 0, 0, time.time()))
         with self._lock:
             self._jobs[jid] = job
-        t = threading.Timer(delay_s, self._fire, args=(jid,))
-        t.daemon = True
-        job["timer"] = t
-        t.start()
+        self._arm(job, delay_s)
         return jid
 
     def cancel(self, job_id: str) -> bool:
@@ -29,16 +105,47 @@ class Scheduler:
                 return False
             job["cancelled"] = True
             timer = job.get("timer")
+        if self._db is not None:
+            with self._lock, self._db:
+                self._db.execute(
+                    "UPDATE scheduled_jobs SET cancelled=1 WHERE id=?",
+                    (job_id,))
         if timer:
             timer.cancel()
         return True
+
+    def is_cancelled(self, job_id: str) -> bool:
+        """Cancel-race check for fire hooks: a cancel landing between the
+        timer firing and the hook running must win over dispatch."""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            return bool(job is not None and job.get("cancelled", False))
 
     def _fire(self, job_id: str) -> None:
         with self._lock:
             job = self._jobs.get(job_id)
             if not job or job["cancelled"]:
                 return
+            if job_id in self._fired_ids:
+                return  # fire-once: never double-deliver
+            self._fired_ids.add(job_id)
             self._fired.append(job)
+            while len(self._fired) > self.FIRED_KEEP_MAX:
+                self._fired.pop(0)
+            hook, snapshot = self._on_fire, dict(job)
+        if self._db is not None:
+            try:
+                with self._lock, self._db:
+                    self._db.execute(
+                        "UPDATE scheduled_jobs SET fired=1 WHERE id=?",
+                        (job_id,))
+            except Exception:  # noqa: BLE001 — memory state stands;
+                pass  # restart may re-announce; never lose the fire
+        if hook is not None:
+            try:
+                hook(snapshot)
+            except Exception:  # noqa: BLE001 — hook failure kills nothing
+                pass
 
     def fired(self) -> list[dict]:
         with self._lock:
@@ -47,7 +154,7 @@ class Scheduler:
     def pending(self) -> list[dict]:
         with self._lock:
             return [j for j in self._jobs.values() if not j["cancelled"]
-                    and j not in self._fired]
+                    and j.get("id") not in self._fired_ids]
 
 
 """Canonical scheduler primitives — ranking + explanation (pure only).

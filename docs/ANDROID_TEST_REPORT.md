@@ -1,4 +1,8 @@
-# Android Test Report (Stage 9)
+# Android Test Report (Stage 9 — historical snapshot, not current totals)
+
+> Scope: Stage 9 only (frozen at that milestone). Later Android suites
+> (approvals, tasks, fleet, targeting, recovery) live under android/test/
+> and are reported with their own runs.
 
 ## Automated
 

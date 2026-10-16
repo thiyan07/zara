@@ -59,6 +59,14 @@ class DeviceLifecycle {
     onChange?.call(to);
   }
 
+  /// Re-asserting the current state is a no-op (physical-device fix:
+  /// register/heartbeat retries fire while already online/degraded).
+  /// Any *different* illegal target still throws — the guard stays strict.
+  void moveIfChanged(String to) {
+    if (state == to) return;
+    move(to);
+  }
+
   /// Cold start: stored ID exists -> try registering; else -> pairing.
   /// Returns the snapshot the app should persist (ID only).
   LifecycleSnapshot restore(String? storedDeviceId) {

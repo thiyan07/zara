@@ -1,4 +1,8 @@
-# Stage 6 Emulator Test Report (checklist A–Z)
+# Stage 6 Emulator Test Report (checklist A–Z — historical record)
+
+> This report predates the isolated-port rule (`docs/RUNBOOK.md` §2:
+> never touch :8080 for test runs). Its :8080 usage is preserved as
+> run history, not current procedure.
 
 Backend: `uvicorn core.app` on 0.0.0.0:8080, fresh token, stage-6 file DBs.
 App reached it via 10.0.2.2 (dev `CoreClient` URL; production URL deferred).

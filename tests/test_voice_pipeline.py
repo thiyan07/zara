@@ -196,3 +196,171 @@ def test_text_only_fallback_matches_voice_reply():
     voice_out = pipe.handle_audio(b"fake-audio-bytes")
     text_result = s["loop"].handle_text("what is my battery level")
     assert text_result.reply == voice_out["reply"] == "Battery is 87 percent."
+
+
+def test_overlapping_turn_supersedes_older_speech():
+    s = _stack()
+    tts = SlowTTS(delay=0.01)
+    pipe1 = VoicePipeline(MockSTT("long reply please"), tts,
+                          s["loop"], s["sessions"])
+    # Both turns run on one pipeline (shared generation domain, like a
+    # real session): the older in-flight speech must truncate.
+    results = {}
+
+    def run_a():
+        results["a"] = pipe1.handle_audio(b"audio-a")
+
+    t = threading.Thread(target=run_a)
+    t.start()
+    # Let turn A enter TTS streaming (60 words * 10ms); interrupt it with
+    # a newer turn on the same pipeline halfway through.
+    time.sleep(0.15)
+    results["b"] = pipe1.handle_audio(b"audio-b")
+    t.join(timeout=15)
+    assert results["a"]["ok"] is True and results["b"]["ok"] is True
+    assert results["a"]["superseded"] is True
+    assert results["b"]["superseded"] is False
+    assert results["a"]["audio_bytes"] < 60 * 8  # 60-word reply, cut short
+
+
+def test_interrupt_truncates_and_marks_superseded():
+    s = _stack()
+    tts = SlowTTS(delay=0.01)
+    pipe = VoicePipeline(MockSTT("long reply please"), tts,
+                         s["loop"], s["sessions"])
+    results = {}
+
+    def run():
+        results["out"] = pipe.handle_audio(b"audio")
+
+    t = threading.Thread(target=run)
+    t.start()
+    time.sleep(0.15)
+    pipe.interrupt()
+    t.join(timeout=15)
+    out = results["out"]
+    assert out["ok"] is True
+    assert out["superseded"] is True
+    assert out["audio_bytes"] < 60 * 8  # 60-word reply, truncated
+
+
+def test_sequential_turns_both_complete_clean():
+    s = _stack()
+    pipe = VoicePipeline(MockSTT("what is my battery level"), MockTTS(),
+                         s["loop"], s["sessions"])
+    first = pipe.handle_audio(b"a")
+    second = pipe.handle_audio(b"b")
+    assert first["superseded"] is False
+    assert second["superseded"] is False
+    assert first["audio_bytes"] > 0 and second["audio_bytes"] > 0
+
+
+class BoomTTS(MockTTS):
+    name = "boom-tts"
+
+    def stream_speak(self, text, cancel=None):
+        raise RuntimeError("speaker dead")
+        yield b"never"
+
+
+def test_tts_failure_fails_loudly_no_silent_text():
+    s = _stack()
+    pipe = VoicePipeline(MockSTT("what is my battery level"), BoomTTS(),
+                         s["loop"], s["sessions"])
+    out = pipe.handle_audio(b"fake-audio-bytes")
+    assert out["ok"] is False
+    assert "tts" in out["error"]
+    assert out["state"] == "error"
+
+
+def test_interrupt_when_idle_is_safe_noop():
+    s = _stack()
+    pipe = VoicePipeline(MockSTT("hello"), MockTTS(),
+                         s["loop"], s["sessions"])
+    pipe.interrupt()  # no in-flight speech: must not raise or corrupt
+    out = pipe.handle_audio(b"fake-audio-bytes")
+    assert out["ok"] is True and out["superseded"] is False
+
+
+class BoomLoop:
+    def handle_text(self, *a, **k):
+        raise TimeoutError("provider timed out after 60s")
+
+
+def test_loop_failure_loud_no_crash_no_invented_reply():
+    from core.voice import VoicePipeline
+    from core.voice import MockSTT, MockTTS
+    s = _stack()
+    pipe = VoicePipeline(MockSTT("hello there"), MockTTS(),
+                         BoomLoop(), s["sessions"])
+    out = pipe.handle_audio(b"fake-audio-bytes")
+    assert out["ok"] is False
+    assert out["error"].startswith("loop:")
+    assert "timed out" in out["error"]
+    assert out["transcript"] == "hello there"  # STT result preserved
+    assert "reply" not in out  # nothing invented
+    assert out["state"] == "error"
+
+
+def test_resume_approval_unknown_id_loud():
+    from core.voice import VoiceConversation, VoicePipeline
+    from core.voice import MockSTT, MockTTS
+    s = _stack()
+    pipe = VoicePipeline(MockSTT("hi"), MockTTS(), s["loop"], s["sessions"])
+    conv = VoiceConversation(pipe)
+    conv.pending_approval = "exec-nonexistent"
+    out = conv.resume_approval()
+    assert out["ok"] is False  # unknown approval or loop failure: loud
+    assert out["error"].startswith("loop:")
+
+
+def test_tamil_local_model_refusal_before_audio_or_load():
+    # tiny.en must never silently transcribe as Tamil: loud refusal
+    # before validation, load, or inference (no model download here).
+    from core.voice import FasterWhisperSTT
+    s = FasterWhisperSTT(model="tiny.en", language="ta-IN")
+    with __import__("pytest").raises(RuntimeError, match="unsupported"):
+        s.transcribe(b"not-even-wav")
+
+
+def test_local_whisper_empty_audio_refused():
+    import io as _io
+    import wave as _wave
+    from core.voice import FasterWhisperSTT
+    buf = _io.BytesIO()
+    with _wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(b"")
+    s = FasterWhisperSTT(model="tiny.en")
+    with __import__("pytest").raises(ValueError, match="empty audio"):
+        s.transcribe(buf.getvalue())
+
+
+def test_tamil_tts_voice_mapping_and_unmapped_refusal():
+    # Config-level integration only (no network): ta-IN resolves to a
+    # real Edge voice; unmapped languages refuse loudly instead of
+    # silently falling back to English speech.
+    import pytest as _pytest
+    from core.voice import EdgeTTSProvider
+    assert EdgeTTSProvider(language="ta-IN").voice == \
+        "ta-IN-PallaviNeural"
+    assert EdgeTTSProvider(language="en-US").voice == "en-US-AriaNeural"
+    with _pytest.raises(RuntimeError, match="voice missing"):
+        EdgeTTSProvider(language="xx-YY")
+
+
+def test_tanglish_transcript_preserved_through_voice_turn():
+    # A Tanglish STT transcript travels the voice turn untouched (no
+    # mangling, no translation at the audio layer); understanding
+    # happens downstream in the intent layer (see test_tanglish.py).
+    s = _stack()
+    tts = MockTTS()
+    pipe = VoicePipeline(MockSTT("phone battery evlo irukku"), tts,
+                         s["loop"], s["sessions"])
+    conv = VoiceConversation(pipe)
+    out = conv.turn(b"fake-audio-bytes")
+    assert out["ok"] is True and out["turn"] == 1
+    assert out["transcript"] == "phone battery evlo irukku"
+    assert out["state"] == "idle"

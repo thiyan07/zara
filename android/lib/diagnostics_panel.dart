@@ -54,12 +54,17 @@ class ReadyInfo {
 }
 
 /// Redact secret-looking material before display: Bearer tokens,
-/// sk-... keys, api-key assignments, device-key headers. Pure for testing.
+/// sk-... keys, api-key/device-key/token/password assignments. Pure for
+/// testing. Assignment-shaped only: free-form prose passes through, so
+/// spoken free-text secrets outside assignments are a known limitation
+/// (voice log lines keep transcripts for debugging; shape-matched
+/// secrets do not land verbatim).
 String redactSecretsForDisplay(String s) {
   var out = s.replaceAll(
       RegExp(r'Bearer\s+\S+', caseSensitive: false), 'Bearer [redacted]');
   out = out.replaceAll(RegExp(r'sk-[A-Za-z0-9_-]+'), '[redacted]');
-  out = out.replaceAll(RegExp(r'(api[_-]?key|device[_-]?key|token)\s*[:=]\s*\S+',
+  out = out.replaceAll(
+      RegExp(r'(api[_-]?key|device[_-]?key|token|password|passwd|passcode|secret)\s*[:=]\s*\S+',
       caseSensitive: false), r'$1=[redacted]');
   return out;
 }

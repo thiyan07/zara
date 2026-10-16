@@ -287,6 +287,10 @@ class MemoryConfirmIn(BaseModel):
     candidate_id: str
     ok: bool = True
 
+
+class MemoryPinIn(BaseModel):
+    pinned: bool = True
+
 def _make_embedder():
     from .memory import EmbeddingProvider, LocalEmbeddingProvider
     if os.environ.get("ZARA_EMBEDDINGS", "hash").strip().lower() == "local":
@@ -300,7 +304,8 @@ def _make_embedder():
 
 
 def build_stack(memory_db: str = "", audit_db: str = ":memory:",
-                mission_db: str = "", fabric_db: str = ""):
+                mission_db: str = "", fabric_db: str = "",
+                scheduler_db: str = ""):
     bus = EventBus()
     audit = AuditLog(audit_db)
     policy = PolicyEngine()
@@ -333,7 +338,84 @@ def build_stack(memory_db: str = "", audit_db: str = ":memory:",
         memory = MemoryStore(embedder=_make_embedder())
     memory_service = MemoryService(memory)
     ctx = ContextManager()
-    sched = Scheduler()
+    def _sched_fire(job: dict) -> None:
+        # Announce + authorized dispatch requests. The timer itself never
+        # executes anything: a fired job with an "exec" payload is offered
+        # to the NORMAL engine submit path (policy re-decided, approvals
+        # preserved, revocation rechecked at dispatch). Time is never
+        # approval: CONFIRM/HIGH_RISK requests park as WAITING_FOR_
+        # PERMISSION exactly like a manual submit. No "exec" payload =
+        # announce-only timer (historical behavior, unchanged).
+        jid = job.get("id", "")
+        try:
+            bus.publish("scheduled_event", source="scheduler",
+                        payload={"job_id": jid,
+                                 "name": job.get("name", "")})
+        except Exception:  # noqa: BLE001 — hook failure kills nothing
+            pass
+        try:
+            audit.record("scheduler", "timer_fired", jid,
+                         str(job.get("name", ""))[:200])
+        except Exception:  # noqa: BLE001
+            pass
+        payload = job.get("payload") or {}
+        req = payload.get("exec")
+        if not isinstance(req, dict):
+            return
+        if sched.is_cancelled(jid):
+            try:
+                audit.record("scheduler", "dispatch_suppressed_cancelled",
+                             jid, str(job.get("name", ""))[:200])
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        tool = str(req.get("tool", ""))
+        device_id = str(req.get("device_id", "cloud"))
+        inputs = req.get("inputs", {})
+        if not isinstance(inputs, dict):
+            inputs = {}
+        if not tool:
+            try:
+                audit.record("scheduler", "dispatch_rejected", jid,
+                             "scheduled exec payload has no tool")
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        # Fire-once + restart-safe: the key derives from the job id, so a
+        # repeated fire or a post-restart re-announce collapses into the
+        # SAME execution instead of duplicating side effects.
+        key = str(req.get("idempotency_key", "") or f"sched-{jid}")
+        binding = {"scheduled_job_id": jid,
+                   "scheduled_name": str(job.get("name", ""))[:200],
+                   "resolution_status": "scheduled-dispatch"}
+        try:
+            rec = engine.submit_async_idem(
+                tool, inputs, device_id,
+                who=str(req.get("who", "scheduler") or "scheduler"),
+                mission_id=req.get("mission_id"),
+                capability=req.get("capability"),
+                binding=binding, idempotency_key=key)
+        except Exception as e:  # noqa: BLE001 — unknown tool, bad
+            try:  # inputs, hard-deny: loud audit, never a false submit.
+                audit.record("scheduler", "dispatch_rejected", jid,
+                             f"{tool}@{device_id}: {e}"[:300])
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        try:
+            audit.record("scheduler", "dispatch_submitted", jid,
+                         f"{rec.id} {rec.state.value} {tool}@{device_id}"
+                         [:300])
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            bus.publish("scheduled_dispatch", source="scheduler",
+                        payload={"job_id": jid, "execution_id": rec.id,
+                                 "state": rec.state.value,
+                                 "tool": tool, "device_id": device_id})
+        except Exception:  # noqa: BLE001
+            pass
+    sched = Scheduler(on_fire=_sched_fire, db_path=scheduler_db)
     notifs = NotificationManager(on_event=lambda t, p: bus.publish(t, source="notifications", payload=p))
     from .push import PushRegistry as _PushRegistry
     push = _PushRegistry()
@@ -430,19 +512,32 @@ def build_stack(memory_db: str = "", audit_db: str = ":memory:",
                 presence = fabric.presence_of(rec.device_id)
                 if presence in ("offline", "unknown", "stale"):
                     return (False, f"device presence {presence}")
-                cap = rec.capability or rec.tool
-                verdict = fabric.authorize_capability(cap, rec.device_id)
-                if not verdict.get("authorized", False):
-                    return (False,
-                            f"capability unauthorized: "
-                            f"{verdict.get('reason', '?')}"[:200])
-                # Descriptor staleness: a re-registered-without-describe
-                # snapshot must not authorize fresh dispatches.
+                # Capability check: resolve-path executions carry a real
+                # capability id; direct submits (POST /v1/executions) carry
+                # none, so authorize the TOOL's required capabilities —
+                # never the tool name itself. The fabric catalog holds
+                # advertised capability ids (e.g. "shell.exec.readonly"),
+                # not tool names, so a tool-name lookup fails closed even
+                # for fully-advertised devices (this broke every direct-
+                # submitted device approval in production while tests
+                # passed only because they advertise tool names).
                 try:
-                    required = list(registry.get(rec.tool).required_capabilities
-                                    or [])
+                    required = list(registry.get(rec.tool)
+                                    .required_capabilities or [])
                 except Exception:
                     required = []
+                caps = [rec.capability] if rec.capability else required
+                if not caps:
+                    caps = [rec.tool]
+                for cap in caps:
+                    verdict = fabric.authorize_capability(cap, rec.device_id)
+                    if not verdict.get("authorized", False):
+                        return (False,
+                                f"capability unauthorized: "
+                                f"{verdict.get('reason', '?')}"[:200])
+                # Descriptor staleness: a re-registered-without-describe
+                # snapshot must not authorize fresh dispatches.
+                # (required[] reused from the check above.)
                 try:
                     descs = {c.name: c for c in fabric.capabilities_for(
                         rec.device_id)}
@@ -496,6 +591,17 @@ def build_stack(memory_db: str = "", audit_db: str = ":memory:",
         SessionStateStore(
             _SessionDatabase(_session_db_path)
             if _session_db_path else None))
+    # Delegated specialist sessions: durable tracking + safe restart
+    # recovery. ZARA_DELEGATION_DB unset = in-memory only (tests); file =
+    # write-through metadata (no prompts, bounded tails) + startup
+    # reconciliation that never reruns tasks or kills strangers.
+    from .opencode_tools import (DelegationStore as _DelegationStore,
+                                 configure_delegation as _configure_deleg,
+                                 recover_delegated_sessions as _recover_deleg)
+    _delegation_path = _os.environ.get("ZARA_DELEGATION_DB", "")
+    delegation = _DelegationStore(_delegation_path or ":memory:")
+    _configure_deleg(delegation)
+    _recover_deleg(delegation)
     return {"bus": bus, "audit": audit, "policy": policy, "registry": registry,
             "engine": engine, "missions": missions, "devices": devices,
             "memory": memory, "memory_service": memory_service,
@@ -505,7 +611,8 @@ def build_stack(memory_db: str = "", audit_db: str = ":memory:",
             "sessions": sessions, "tracer": tracer, "loop": loop,
             "voice": voice, "wake": wake, "limits": limits, "push": push,
             "fabric": fabric, "xfer": xfer, "resolver": resolver,
-            "intent": intent_service, "session": session_service}
+            "intent": intent_service, "session": session_service,
+            "delegation": delegation}
 
 def create_app(stack=None) -> FastAPI:
     s = stack or build_stack()
@@ -513,6 +620,28 @@ def create_app(stack=None) -> FastAPI:
     app.state.stack = s
 
     SENSITIVE_PATHS = ("/v1/agent/enroll", "/v1/agent/claim")
+
+    # Global request-body cap (OCI small-VM guard): the largest legitimate
+    # body is voice audio at 2 MiB (per-endpoint 413); transfer chunks are
+    # <= 64 KiB. Default 5 MiB via ZARA_MAX_BODY_BYTES; enforced on
+    # Content-Length before any parsing. Chunked bodies without a length
+    # still hit the per-endpoint caps.
+    try:
+        _max_body = int(os.environ.get("ZARA_MAX_BODY_BYTES", "5242880"))
+    except ValueError:
+        _max_body = 5242880
+
+    @app.middleware("http")
+    async def body_limit(request, call_next):
+        try:
+            clen = request.headers.get("content-length", "")
+            if clen and int(clen) > _max_body:
+                return JSONResponse(
+                    status_code=413,
+                    content={"detail": "request body too large"})
+        except ValueError:
+            pass
+        return await call_next(request)
 
     @app.middleware("http")
     async def rate_limit(request, call_next):
@@ -586,6 +715,22 @@ def create_app(stack=None) -> FastAPI:
             dev = s["devices"].get(body.device_id)
         except KeyError:
             dev = None
+        # Fast reject: a revoked target must fail clearly at submit time
+        # instead of parking a job that can never be claimed (observed
+        # live: post-revoke submit sat pending until proxy expiry).
+        # Unknown devices keep the existing fail-open behavior.
+        try:
+            if s["fabric"].trust_of(body.device_id) == "revoked":
+                s["audit"].record("api", "exec_reject", body.tool,
+                                  f"revoked target: {body.device_id}"[:300])
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"device revoked: {body.device_id} "
+                           f"(re-enroll to repair)")
+        except HTTPException:
+            raise
+        except Exception:  # noqa: BLE001 — trust read never blocks submit
+            pass
         # Canonical provider: one snapshot source for every exec path.
         # Unknown devices yield the bare default (fail-open to unknown).
         try:
@@ -662,6 +807,22 @@ def create_app(stack=None) -> FastAPI:
             dev = s["devices"].get(body.device_id)
         except KeyError:
             dev = None
+        # Fast reject: a revoked target must fail clearly at submit time
+        # instead of parking a job that can never be claimed (observed
+        # live: post-revoke submit sat pending until proxy expiry).
+        # Unknown devices keep the existing fail-open behavior.
+        try:
+            if s["fabric"].trust_of(body.device_id) == "revoked":
+                s["audit"].record("api", "exec_reject", body.tool,
+                                  f"revoked target: {body.device_id}"[:300])
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"device revoked: {body.device_id} "
+                           f"(re-enroll to repair)")
+        except HTTPException:
+            raise
+        except Exception:  # noqa: BLE001 — trust read never blocks submit
+            pass
         # Canonical provider: one snapshot source for every exec path.
         # Unknown devices yield the bare default (fail-open to unknown).
         try:
@@ -1474,6 +1635,15 @@ def create_app(stack=None) -> FastAPI:
         """Delete expired memories (expires_at past). Returns count."""
         return {"purged": s["memory"].purge_expired()}
 
+    @app.post("/v1/memory/{memory_id}/pin")
+    def memory_pin(memory_id: str, body: MemoryPinIn, _=Depends(auth)):
+        """Pin/unpin a memory against automatic deletion. Pinned rows
+        survive sweeps and purges; explicit forget still removes them.
+        Unknown ids -> 404."""
+        if not s["memory"].set_pinned(memory_id, body.pinned):
+            raise HTTPException(status_code=404, detail="unknown memory")
+        return {"pinned": memory_id, "retained": body.pinned}
+
     @app.get("/v1/trace/{trace_id}")
     def get_trace(trace_id: str, _=Depends(auth)):
         return [{"name": sp.name, "latency_s": round(sp.latency_s, 3),
@@ -1504,6 +1674,8 @@ def create_app(stack=None) -> FastAPI:
                 else b"mock-audio"
         except Exception:  # noqa: BLE001
             raise HTTPException(status_code=422, detail="invalid audio_base64")
+        if len(audio) > 2 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="audio too large")
         out = s["voice"].handle_audio(audio, session_id=body.session_id,
                                       device_id=body.device_id, who=body.who)
         return out
@@ -1684,13 +1856,20 @@ def create_app(stack=None) -> FastAPI:
                               f"{device_id} != {job.device_id}", ok=False)
             raise HTTPException(status_code=403,
                                 detail="job not targeted at this device")
-        job = s["jobs"].complete(body.job_id, body.ok, body.result, body.error)
-        s["bus"].publish("execution_finished", source="device",
-                         device_id=device_id,
-                         payload={"job_id": body.job_id, "ok": body.ok,
-                                  "error": body.error[:300]})
-        s["audit"].record("device", "job_result", body.job_id,
-                          f"{job.tool} ok={body.ok}", ok=body.ok)
+        # complete_once() decides first-delivery ATOMICALLY with the
+        # open->terminal transition (same lock): concurrent duplicates
+        # cannot both observe True, so exactly one delivery emits bus +
+        # audit. Emission itself stays outside the queue lock (no I/O
+        # under lock); duplicates still return idempotent {"ok": True}.
+        job, first_delivery = s["jobs"].complete_once(
+            body.job_id, body.ok, body.result, body.error)
+        if first_delivery:
+            s["bus"].publish("execution_finished", source="device",
+                             device_id=device_id,
+                             payload={"job_id": body.job_id, "ok": body.ok,
+                                      "error": body.error[:300]})
+            s["audit"].record("device", "job_result", body.job_id,
+                              f"{job.tool} ok={body.ok}", ok=body.ok)
         return {"ok": True}
 
     @app.post("/v1/agent/jobs/{job_id}/cancel")
@@ -2099,9 +2278,16 @@ def _db_path(name: str, default: str = "") -> str:
 
 
 def _stack_from_env():
+    if not os.environ.get("ASSISTANT_TOKEN"):
+        # Startup validation (production path only — tests build stacks
+        # directly): operator auth wide open must be unmissable.
+        print("ZARA WARNING: ASSISTANT_TOKEN unset — using default "
+              "dev-token; set a long random value before exposing this "
+              "service. See docs/OCI_BUDGET.md.", flush=True)
     return build_stack(memory_db=_db_path("ZARA_MEMORY_DB"),
                        audit_db=_db_path("ZARA_AUDIT_DB", ":memory:"),
-                       mission_db=_db_path("ZARA_MISSION_DB"))
+                       mission_db=_db_path("ZARA_MISSION_DB"),
+                       scheduler_db=_db_path("ZARA_SCHEDULER_DB"))
 
 
 app = create_app(_stack_from_env())

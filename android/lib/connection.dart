@@ -48,6 +48,16 @@ class RetryPolicy {
   }
 }
 
+/// Equal-jitter backoff: half deterministic, half random, so a fleet of
+/// devices reconnecting after the same outage does not thundering-herd
+/// Core. Pure for testing: [roll] must be in [0, 1); production passes
+/// Random().nextDouble(). Result is always in [base/2, base].
+Duration applyJitter(Duration base, double roll) {
+  assert(roll >= 0 && roll < 1, 'roll must be in [0, 1)');
+  final half = base.inMicroseconds ~/ 2;
+  return Duration(microseconds: half + (half * roll).round());
+}
+
 int _reqSeq = 0;
 
 /// Opaque request ID: monotonic + timestamp. Stale responses (wrong ID)

@@ -30,6 +30,10 @@ def _pipe():
     p.states = VoiceStateMachine()
     import threading
     p._speak_cancel = threading.Event()
+    # Generation guard fields from __init__ (turn-supersede checks in
+    # handle_audio require them; __new__ bypass must mirror __init__).
+    p._generation = 0
+    p._gen_lock = threading.Lock()
     p.language = "en-US"
     return p, loop
 
