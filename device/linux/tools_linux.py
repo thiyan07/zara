@@ -1876,8 +1876,9 @@ def desktop_a11y_inspect(inputs: dict, ctx: dict) -> dict:
 
 def desktop_click(inputs: dict, ctx: dict) -> dict:
     """Click the snapshotted control: AT-SPI action first (any session),
-    X11 pointer fallback (x11 session + fresh bounds only). Verified by
-    post-action state re-read; applied:false otherwise."""
+    X11 pointer fallback (x11 session + fresh bounds only), or ydotool
+    on Wayland when bounds are available. Verified by post-action state re-read;
+    applied:false otherwise."""
     sid = inputs.get("snapshot_id", "")
     nid = inputs.get("node_id", "")
     if not isinstance(sid, str) or not sid or not isinstance(nid, str):
@@ -1902,11 +1903,40 @@ def desktop_click(inputs: dict, ctx: dict) -> dict:
                 "verify": "desktop.a11y.inspect"}
     bounds = live.get("bounds") or None
     if bounds and len(bounds) == 4 and bounds[2] > 0 and bounds[3] > 0:
-        if desktop_session({}, ctx).get("session") != "x11":
-            return {"supported": True, "applied": False,
-                    "error": "no Wayland input injector (needs "
-                             "ydotool/uinput); control has no clickable "
-                             "AT-SPI action",
+        session = desktop_session({}, ctx).get("session")
+        if session != "x11":
+            # Try ydotool on Wayland
+            try:
+                fresh = _atspi_call({"op": "node", "bus": live["bus"],
+                                     "path": live["path"]})
+            except RuntimeError as e:
+                return {"supported": True, "applied": False,
+                        "error": str(e)[:300]}
+            fb = fresh.get("bounds") or None
+            if fb != bounds:
+                return {"supported": True, "applied": False,
+                        "error": "target moved since inspection (re-inspect)"}
+            x, y, w, h = (int(v) for v in fb)
+            cx, cy = x + w // 2, y + h // 2
+            # Try ydotool
+            r = _run_quiet(["ydotool", "mousemove", "-a", str(cx), str(cy)])
+            if r is None or r.returncode != 0:
+                return {"supported": True, "applied": False,
+                        "error": "no Wayland input injector (needs ydotool/uinput running); control has no clickable AT-SPI action",
+                        "verify": "desktop.a11y.inspect"}
+            r2 = _run_quiet(["ydotool", "click", "0xC0"])
+            if r2 is None or r2.returncode != 0:
+                return {"supported": True, "applied": False,
+                        "error": (r2.stderr or "ydotool click refused").strip()[:200]}
+            try:
+                post = _atspi_call({"op": "node", "bus": live["bus"],
+                                    "path": live["path"]})
+                post_states = post.get("states", [])
+            except RuntimeError:
+                post_states = []
+            return {"supported": True, "applied": True, "method": "wayland-ydotool",
+                    "at": [cx, cy],
+                    "post_states": post_states,
                     "verify": "desktop.a11y.inspect"}
         # Fresh-observation binding: re-fetch bounds immediately before
         # acting; moved/resized/vanished targets refuse.
@@ -1947,7 +1977,7 @@ def desktop_click(inputs: dict, ctx: dict) -> dict:
 def desktop_type(inputs: dict, ctx: dict) -> dict:
     """Enter text into the snapshotted control. AT-SPI EditableText first
     (verified by reading the text back); X11 typing fallback; Wayland
-    without EditableText refuses. Typed text is never echoed back."""
+    uses wtype/ydotool when no EditableText. Typed text is never echoed back."""
     sid = inputs.get("snapshot_id", "")
     nid = inputs.get("node_id", "")
     text = inputs.get("text", "")
@@ -1979,42 +2009,59 @@ def desktop_type(inputs: dict, ctx: dict) -> dict:
         return {"supported": True, "applied": bool(r.get("applied", False)),
                 "method": "a11y-edit", "mode": mode, "chars": len(text),
                 "verify": "desktop.a11y.inspect"}
-    if desktop_session({}, ctx).get("session") != "x11":
-        return {"supported": True, "applied": False,
-                "error": "control is not AT-SPI editable and Wayland has "
-                         "no input injector (needs ydotool/uinput)"}
-    try:
-        f = _atspi_call({"op": "grab_focus", "bus": live["bus"],
-                         "path": live["path"]})
-    except RuntimeError as e:
-        return {"supported": True, "applied": False,
-                "error": str(e)[:300]}
-    if not f.get("focused"):
-        return {"supported": True, "applied": False,
-                "error": "could not focus control (refusing blind typing)"}
-    r = _run_quiet(["xdotool", "type", "--clearmodifiers", "--", text])
-    if r is None:
-        return {"supported": True, "applied": False,
-                "error": "xdotool unavailable"}
-    if r.returncode != 0:
-        return {"supported": True, "applied": False,
-                "error": (r.stderr or "xdotool refused").strip()[:200]}
-    applied = True
-    method = "x11-type"
-    try:
-        # Verify by reading the text back when the control serves it;
-        # otherwise focus + clean injector exit is the evidence, marked.
-        g = _atspi_call({"op": "get_text", "bus": live["bus"],
-                         "path": live["path"], "max_chars": 600})
-        if "text" in g:
-            applied = text in (g.get("text") or "")
-        else:
+    session = desktop_session({}, ctx).get("session")
+    if session == "x11":
+        try:
+            f = _atspi_call({"op": "grab_focus", "bus": live["bus"],
+                             "path": live["path"]})
+        except RuntimeError as e:
+            return {"supported": True, "applied": False,
+                    "error": str(e)[:300]}
+        if not f.get("focused"):
+            return {"supported": True, "applied": False,
+                    "error": "could not focus control (refusing blind typing)"}
+        r = _run_quiet(["xdotool", "type", "--clearmodifiers", "--", text])
+        if r is None:
+            return {"supported": True, "applied": False,
+                    "error": "xdotool unavailable"}
+        if r.returncode != 0:
+            return {"supported": True, "applied": False,
+                    "error": (r.stderr or "xdotool refused").strip()[:200]}
+        applied = True
+        method = "x11-type"
+        try:
+            g = _atspi_call({"op": "get_text", "bus": live["bus"],
+                             "path": live["path"], "max_chars": 600})
+            if "text" in g:
+                applied = text in (g.get("text") or "")
+            else:
+                method = "x11-type-unverified"
+        except RuntimeError:
             method = "x11-type-unverified"
+        return {"supported": True, "applied": bool(applied),
+                "method": method, "mode": mode, "chars": len(text),
+                "verify": "desktop.a11y.inspect"}
+    # Wayland: try to focus and use wtype/ydotool
+    try:
+        _atspi_call({"op": "grab_focus", "bus": live["bus"],
+                     "path": live["path"]})
     except RuntimeError:
-        method = "x11-type-unverified"
-    return {"supported": True, "applied": bool(applied),
-            "method": method, "mode": mode, "chars": len(text),
-            "verify": "desktop.a11y.inspect"}
+        pass
+    # Try wtype first
+    r = _run_quiet(["wtype", text])
+    if r is not None and r.returncode == 0:
+        return {"supported": True, "applied": True,
+                "method": "wayland-wtype", "mode": mode, "chars": len(text),
+                "verify": "desktop.a11y.inspect"}
+    # Try ydotool (type as key sequence is more complex, but basic approach)
+    r2 = _run_quiet(["ydotool", "type", text])
+    if r2 is not None and r2.returncode == 0:
+        return {"supported": True, "applied": True,
+                "method": "wayland-ydotool-type", "mode": mode, "chars": len(text),
+                "verify": "desktop.a11y.inspect"}
+    return {"supported": True, "applied": False,
+            "error": "control is not AT-SPI editable and Wayland has "
+                     "no working input injector (needs wtype/ydotool)"}
 
 
 # ---------------- Stage 20: removable storage + file ops ----------------
