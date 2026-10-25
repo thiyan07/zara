@@ -141,15 +141,19 @@ def test_W08_approve_twice_never_replays_execution():
     c, stack = make_client()
     dev, _ = enroll_claim(stack, "d9", "android")
     register(stack, "d9")
+    # Stage 30: gui.screen.inspect is read-only auto-allow now, so the
+    # approve-twice replay-proofing uses gui.tap (still parks).
     stack["devices"].register(DeviceState(
         device_id="d9", kind=DeviceKind("android"),
-        capabilities=["gui.screen.inspect"], online=True, status="online"))
+        capabilities=["gui.tap", "dev.zara.lab.privtest"],
+        online=True, status="online"))
     stack["fabric"].advertise([
-        {"id": "gui.screen.inspect", "name": "gui.screen.inspect",
-         "descriptor_version": "1", "version": "1.0.0", "risk": "confirm",
+        {"id": "gui.tap", "name": "gui.tap",
+         "descriptor_version": "1", "version": "1.0.0", "risk": "high",
          "availability": "available"}], "d9")
     r = c.post("/v1/executions",
-               json={"tool": "gui.screen.inspect", "inputs": {},
+               json={"tool": "gui.tap",
+                     "inputs": {"target_package": "dev.zara.lab.privtest"},
                      "device_id": "d9"}, headers=OP)
     assert r.status_code == 202, r.text
     eid = r.json()["id"]

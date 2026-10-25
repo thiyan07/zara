@@ -28,6 +28,12 @@ self-test transcript at the bottom of this doc.
 
 # extra env from a file (KEY=VALUE lines; values are never echoed)
 ./scripts/zara_local.sh start --port 18081 --env-file /path/to/zara.env
+
+# HTTPS (production transport — see docs/TRANSPORT_TLS.md); also set
+# ZARA_REQUIRE_HTTPS=1 (e.g. in an --env-file) to refuse non-loopback
+# plain HTTP at the middleware level
+./scripts/zara_local.sh start --port 18443 \
+    --tls-cert leaf.pem --tls-key leaf.key [--tls-ca ca.pem]
 ```
 
 `start` waits up to ~30 s for `GET /v1/ready`, prints the ready JSON

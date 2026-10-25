@@ -1,11 +1,17 @@
 # Wake-word setup: ONNX detector + "Hey Zara" model path
 
-Status: **integration complete, real detection unavailable** — no
-compatible "Hey Zara" model exists in this repository, and none is
-downloaded automatically. The Settings toggle, persisted preference,
-detector lifecycle, and spotter adapter are implemented and tested;
-with no model files every start attempt reports an actionable error
-instead of pretending to listen.
+Status: **detection live on this laptop (binding validated, model
+trained on the user's own recordings)** — `OpenWakeWordSpotter`
+(`core/voice.py`) runs the trained "Hey Zara" model fully offline over
+onnxruntime, and is differentially validated against the upstream
+openWakeWord reference implementation (331 streaming calls, identical
+scores). Measured behaviour lives in `training/hey_zara_metrics.json`
+(recall 0.954 @ threshold 0.5 over 1009 positive clips — 1000 synthetic
++ 9 real user takes that all fire ≥0.99; adversarial soundalike
+negatives give an elevated false-accept rate that no threshold meets a
+0.5 FP/hr bar — see that file's `limitation`). Nothing is downloaded
+automatically; a machine without the model files fails closed with an
+actionable error.
 
 ## Engine selected and why
 
@@ -27,6 +33,46 @@ Two deliberate non-reuses:
 - **No model shipped.** Keyword models are custom-trained per phrase;
   a generic English model never counts as "Hey Zara" (the spotter
   refuses when the configured keyword is absent from `model_info.json`).
+
+## The openWakeWord route (implemented, validated binding)
+
+`OnnxWakeSpotter` above is engine B. Engine A — the one actually in use
+on this laptop — is `OpenWakeWordSpotter` (same `core/voice.py`), the
+openWakeWord (Apache-2.0) custom-model path:
+
+- Model: `~/.cache/zara-wake/hey_zara.onnx` — trained from the
+  workspace `~/.cache/zara-wake-train/` (piper-sample-generator
+  positives + adversarial soundalike negatives + FMA/RIR augmentation;
+  user's own 9 recorded takes held out and used for validation). The
+  openWakeWord release frontends (`melspectrogram.onnx`,
+  `embedding_model.onnx`, ~2.4 MB) live in `~/.cache/zara-wake/oww/`.
+- Runtime: numpy + onnxruntime only — the streaming semantics
+  (80 ms chunks; mel → 76-frame embedding windows → 16-frame classifier
+  window; per-call max over new chunks; <1280-sample calls repeat the
+  previous score; first five scored calls warm up at 0.0) are
+  re-implemented exactly and differentially validated against the
+  upstream reference (`sys.path` import of the training checkout when
+  present): **331 calls over real clips, 0 mismatches (≤5e-6)**.
+- Policy on top of raw scores: threshold 0.5 (env
+  `WAKE_OWW_THRESHOLD`) → `cons_frames` 2 consecutive confirmed chunks
+  → 1.5 s cooldown. `ZARA_WAKE_ENGINE` selects the engine
+
+
+  (`auto` | `oww` | `onnx`; auto prefers the trained openWakeWord model
+  when all three files exist; unknown values are refused loudly).
+- `wake_listen_once` and `WakeListenSession` default to
+  `ZARA_WAKE_ENGINE` auto-selection (explicit spotter arguments always
+  win; tests inject their own). The default spotter is a process-wide
+  persistent engine — a fresh engine per call could never pass the
+  reference warm-up.
+- Known measured limitation: "hey Sarah"-class soundalikes in the
+  adversarial negative set trigger a false accept at meaningful rates
+  (training/hey_zara_metrics.json). A wake event only opens a voice
+  turn; the turn is then transcribed by STT and must match the wake
+  phrase / intent flow — a false wake therefore costs a short
+  listening window, never an action. Improving the negative corpus
+  (more synthetic soundalike + real-room ambient hours) is the known
+  training-time remedy and is disk-budget-limited on this laptop.
 
 ## Inference contract (implemented in `OnnxWakeSpotter`)
 
@@ -128,7 +174,13 @@ Settings → **Wake-word opt-in ("Hey Zara")**:
 
 ## What remains blocked
 
-1. A licensed, compatible "Hey Zara" ONNX model (train + verify).
-2. Physical validation: false-accept/reject rates, latency, idle
-   CPU/RAM, battery OFF-vs-ON (estimates only until measured).
-3. Android native audio loop + model packaging (needs 1 + 2 first).
+1. Live-room validation: continuous `WakeListenSession` runs against
+   the real room (false-accept/reject rates on ambient + real noise,
+   latency, idle CPU/RAM, battery OFF-vs-ON) need the user's explicit
+   consent to run the mic in-session — acoustic evidence so far comes
+   from the user's own recorded takes and the synthetic sets.
+2. Persistent wake reliability: the adversarial soundalike false-accept
+   class noted above (more/better negative data at training time; the
+   ACAV100M background feature file (~15 GB) stayed out of disk budget).
+3. Android native audio loop + model packaging (needs 1 + a foreground
+   service design; see Platform limits above).

@@ -1,6 +1,8 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:zara_android/connection.dart';
 import 'package:zara_android/device_lifecycle.dart';
 import 'package:zara_android/main.dart';
+import 'package:zara_android/network_monitor.dart';
 
 void main() {
   test('409 means stale card (dismiss), other errors keep the card', () {
@@ -42,6 +44,17 @@ void main() {
       expect(isStaleApproval(e), isFalse, reason: e);
     }
   });
+
+  test('R21-#3: a fresh bridge read decides the stale-offline gate', () {
+    // Screen-off boot may cache offline. The fix re-probes each tick and
+    // maps the FRESH snapshot — a fresh online read can never keep the
+    // loop stuck at offline, and a still-offline read reports offline.
+    final stale = NetworkSnapshot.fromBridge({'network': 'offline'});
+    final fresh = NetworkSnapshot.fromBridge({'network': 'wifi',
+                                              'metered': false});
+    expect(coreLinkForNetwork(stale), CoreLinkState.offline);
+    expect(coreLinkForNetwork(fresh),
+        isNot(CoreLinkState.offline), reason: 'fresh online read');  });
 
   test('loop resumes on foreground when online or degraded only', () {
     expect(shouldResumeLoop(DeviceLifecycleState.online), isTrue);

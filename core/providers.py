@@ -9,6 +9,55 @@ from typing import Iterator, Optional
 from .llm import (ACTION_CONTRACT, LLMError, LLMErrorKind, LLMOutcome,
                   classify_http_error, parse_llm_action)
 
+
+def _salvage_action(text: str):
+    """Bounded salvage for reasoning-model prefix glitches (2026-10-22,
+    nemotron-3-ultra live: the plan arrived as
+    '{"type":"{"type":"response",\u2026}' — a truncated first attempt the
+    model restarted; strings are unbalanced AT the glitch point, so
+    candidates are anchored at each '{"' occurrence (rightmost-first,
+    bounded) and accepted ONLY on a full strict parse (parse_llm_action).
+    Never widens execution: a salvaged plan is a completely valid action
+    object and runs through the same registration/policy/approval gates
+    as every other plan."""
+    s = text or ""
+    if len(s) > 20000 or "{" not in s:
+        return None
+    starts = [i for i in range(len(s) - 2, -1, -1)
+              if s[i] == "{" and s[i + 1] == '"'][:200]
+    for i in starts:
+        depth = 1
+        in_str = False
+        esc = False
+        ok = False
+        for j in range(i + 1, len(s)):
+            ch = s[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    ok = True
+                    break
+        if ok and not in_str:
+            cand = s[i:j + 1]
+            try:
+                return parse_llm_action(cand)
+            except LLMError:
+                continue
+    return None
+
+
 @dataclass
 class ModelResponse:
     text: str
@@ -116,7 +165,12 @@ class OpenAICompatibleProvider(ModelProvider):
         import urllib.error
         body = json.dumps({"model": self.model,
                            "messages": [{"role": "user", "content": prompt}],
-                           "max_tokens": kwargs.get("max_tokens", 512)}).encode()
+                           # 2026-10-22 (nemotron-3-ultra live): hosted
+                           # intent parses must not have their output
+                           # cut by the reasoning channel burn; same
+                           # budget rule as the plan paths.
+                           "max_tokens": kwargs.get("max_tokens", 1024),
+                           "temperature": 0.2}).encode()
         req = urllib.request.Request(
             f"{self.base_url}/chat/completions", data=body,
             headers={"Content-Type": "application/json",
@@ -184,7 +238,11 @@ class OpenAICompatibleProvider(ModelProvider):
         payload = {"model": self.model,
                    "messages": [{"role": "system", "content": ACTION_CONTRACT},
                                 {"role": "user", "content": prompt}],
-                   "max_tokens": 512, "temperature": 0.2}
+                   # 2026-10-22 (nemotron-3-ultra live): reasoning-class
+                   # models spend tokens on the scratchpad BEFORE the
+                   # JSON plan — 512 truncated it mid-object ("unreadable
+                   # plan"). 1024 leaves room for reasoning + plan.
+                   "max_tokens": 1024, "temperature": 0.2}
         if self.model:  # JSON mode where supported; strict parse regardless
             payload["response_format"] = {"type": "json_object"}
         start = time.time()
@@ -200,7 +258,14 @@ class OpenAICompatibleProvider(ModelProvider):
                                    f"{type(e).__name__}")
                 usage = data.get("usage", {}) if isinstance(data, dict) \
                     else {}
-                action = parse_llm_action(text)
+                try:
+                    action = parse_llm_action(text)
+                except LLMError as e:
+                    # Reasoning-model glitch absorption: try the bounded
+                    # salvage BEFORE failing the whole turn.
+                    action = _salvage_action(text)
+                    if action is None:
+                        raise e
                 return LLMOutcome(action=action, text=action.text or text,
                                   provider=self.name, model=self.model,
                                   latency_s=time.time() - start,
@@ -226,7 +291,16 @@ class OpenAICompatibleProvider(ModelProvider):
                                 {"role": "user",
                                  "content": f"{system}\n\nAVAILABLE TOOLS: "
                                             f"{json.dumps(tool_names)}\n\nUSER REQUEST:\n{user}"}],
-                   "max_tokens": 512, "temperature": 0.2, "stream": True}
+                   # 2026-10-22 (NVIDIA gpt-oss-20b live): reasoning-class
+                   # models burn the completion budget on the reasoning
+                   # channel BEFORE any content — at 512 tokens the stream
+                   # ended with reasoning-only chunks and an EMPTY visible
+                   # reply. reasoning_effort=low caps that; 1024 leaves
+                   # room for the actual answer after the scratchpad.
+                   # Reasoning deltas are dropped below (content only),
+                   # so the scratchpad never reaches the user.
+                   "max_tokens": 1024, "temperature": 0.2,
+                   "reasoning_effort": "low", "stream": True}
         req = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload).encode(),

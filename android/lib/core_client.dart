@@ -3,6 +3,9 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart' as crypto;
+
+import 'ed25519.dart';
 import 'stream_client.dart';
 
 /// Zara Core REST client (dart:io only, no third-party deps).
@@ -68,10 +71,45 @@ class CoreClient {
   final Duration timeout;
   String? deviceId;
   String? deviceKey;
+  String? deviceSecret; // Ed25519 seed (hex) for challenge-proof auth
+  String? _spareNonce; // chained server nonce for the next proof call
+  bool _challengeSupported = true; // flipped off on old-core 409
   String? devToken; // local development only
   String? operatorToken; // in-memory operator Bearer token for /v1/executions
 
-  CoreClient(this.baseUrl, {this.timeout = const Duration(seconds: 15)});
+  /// Explicit opt-out for a trusted flat LAN: default false — plain
+  /// HTTP to anything that is not a documented local alias is refused.
+  final bool allowInsecureTransport;
+
+  CoreClient(this.baseUrl,
+      {this.timeout = const Duration(seconds: 15),
+      this.allowInsecureTransport = false}) {
+    _assertTransportPolicy();
+  }
+
+  /// Hosts where plain HTTP is local by definition; 10.0.2.2 is the
+  /// Android-emulator NAT alias for the host loopback.
+  static const _plaintextOkHosts = [
+    'localhost',
+    '127.0.0.1',
+    '::1',
+    '10.0.2.2',
+  ];
+
+  /// Refuse to carry device credentials over plain HTTP to non-local
+  /// cores: signatures protect identity, never confidentiality — TLS
+  /// does. see docs/TRANSPORT_TLS.md.
+  void _assertTransportPolicy() {
+    final uri = Uri.tryParse(baseUrl);
+    if (uri == null || uri.scheme != 'http') return;
+    if (_plaintextOkHosts.contains(uri.host)) return;
+    if (allowInsecureTransport) return; // deliberate, user-visible choice
+    throw CoreException(
+        -1,
+        'insecure transport: plain HTTP to a non-local core is refused; '
+        'use https:// or set allowInsecureTransport=true for a trusted '
+        'local network (docs/TRANSPORT_TLS.md)');
+  }
 
   Map<String, String> get _deviceHeaders {
     final h = <String, String>{'Content-Type': 'application/json'};
@@ -79,6 +117,70 @@ class CoreClient {
     if (id != null) h['X-Device-Id'] = id;
     if (key != null) h['X-Device-Key'] = key;
     return h;
+  }
+
+  /// Proof-auth headers for one request: signs the canonical v2 message
+  /// "METHOD path nonce sha256(body)" with the registered Ed25519 seed —
+  /// the device key value itself never travels on these calls. Path
+  /// excludes any query string; every request body is small fixed-shape
+  /// JSON (held in memory here), so the exact bytes fed to sha256 are
+  /// exactly the bytes sent by [_sendRaw] via jsonEncode(body).
+  Map<String, String> _proofHeaders(String nonce, String p,
+      {String method = 'POST', String bodyJson = '{}'}) {
+    final bodySha = crypto.sha256
+        .convert(utf8.encode(bodyJson))
+        .bytes
+        .map((b) => b.toRadixString(16).padLeft(2, '0'))
+        .join();
+    return {
+      'Content-Type': 'application/json',
+      'X-Device-Id': deviceId!,
+      'X-Device-Nonce': nonce,
+      'X-Device-Proof':
+          ed25519SignB64(deviceSecret!, '$method ${_pathOf(p)} $nonce $bodySha'),
+    };
+  }
+
+  String _pathOf(String pathWithQuery) {
+    final i = pathWithQuery.indexOf('?');
+    return i < 0 ? pathWithQuery : pathWithQuery.substring(0, i);
+  }
+
+  /// One usable single-use nonce: spend the chained spare when held
+  /// (proof-authed challenge fetch), else fetch with the raw key (first
+  /// use, or after restart/eviction). Returns null when challenge auth
+  /// cannot work for this credential (no signing key bound -> 409, or
+  /// an old Core without the endpoint -> 404).
+  Future<String?> _acquireNonce(
+      {Duration? timeoutOver, CancelScope? cancel}) async {
+    if (_spareNonce != null) {
+      final spare = _spareNonce!;
+      _spareNonce = null;
+      try {
+        final out = await _sendRaw('/v1/agent/challenge', {},
+            _proofHeaders(spare, '/v1/agent/challenge'),
+            timeoutOver: timeoutOver, cancel: cancel);
+        _spareNonce = out['next_nonce'] as String?;
+        return out['nonce'] as String?;
+      } on CoreException {
+        // stale/evicted spare: raw-key bootstrap below
+      }
+    }
+    try {
+      final out = await _sendRaw(
+          '/v1/agent/challenge', {}, _deviceHeaders,
+          timeoutOver: timeoutOver, cancel: cancel);
+      _spareNonce = out['next_nonce'] as String?;
+      return out['nonce'] as String?;
+    } on CoreException catch (e) {
+      if (e.status == 409) {
+        // credential has no bound signing key (pre-feature claim):
+        // challenge auth is impossible — go raw-key for the process.
+        _challengeSupported = false;
+        return null;
+      }
+      rethrow; // revoked/expired etc.: surfaces like the raw path would
+    }
   }
 
   /// Headers for the operator-authed execution contracts
@@ -97,31 +199,22 @@ class CoreClient {
   }
 
   Never _raise(String path, int status, String text,
-      [String method = 'POST']) {
-    final msg = '$method $path -> $status: ${text.take(300)}';
+      [String method = 'POST']) {    final msg = '$method $path -> $status: ${text.take(300)}';
     if (status == 401 || status == 403) throw AuthException(status, msg);
     if (status == 404) throw NotRegisteredException(status, msg);
     throw CoreException(status, msg);
   }
 
-  Future<Map<String, dynamic>> _post(
-      String path, Map<String, dynamic> body,
-      {bool deviceAuth = true, CancelScope? cancel}) async {
-    if (cancel?.isCancelled ?? false) {
-      throw const CoreException(-1, 'cancelled before send');
-    }
+  Future<Map<String, dynamic>> _sendRaw(
+      String path, Map<String, dynamic> body, Map<String, String> headers,
+      {CancelScope? cancel, Duration? timeoutOver}) async {
     final client = HttpClient();
     try {
       final req = await client.postUrl(Uri.parse('$baseUrl$path'));
-      final headers = deviceAuth
-          ? _deviceHeaders
-          : {
-              'Content-Type': 'application/json',
-              if (devToken != null) 'Authorization': 'Bearer $devToken',
-            };
       headers.forEach(req.headers.set);
-      req.write(jsonEncode(body));
-      final resp = await req.close().timeout(timeout);
+      req.add(utf8.encode(jsonEncode(body)));
+      final resp =
+          await req.close().timeout(timeoutOver ?? timeout);
       final text = await resp.transform(utf8.decoder).join();
       if (cancel?.isCancelled ?? false) {
         throw const CoreException(-1, 'cancelled while waiting');
@@ -135,10 +228,65 @@ class CoreClient {
     }
   }
 
+  Future<Map<String, dynamic>> _post(
+      String path, Map<String, dynamic> body,
+      {bool deviceAuth = true, CancelScope? cancel,
+      Duration? timeoutOver}) async {
+    if (cancel?.isCancelled ?? false) {
+      throw const CoreException(-1, 'cancelled before send');
+    }
+    // Challenge-proof transport first (secret stays in secure storage).
+    // An auth-shaped rejection means Core did NOT execute the request
+    // (auth runs before handlers), so one raw-key retry cannot double a
+    // consequential action.
+    if (deviceAuth &&
+        _challengeSupported &&
+        deviceId != null &&
+        deviceSecret != null &&
+        deviceSecret!.isNotEmpty) {
+      try {
+        final nonce =
+            await _acquireNonce(cancel: cancel, timeoutOver: timeoutOver);
+        if (nonce != null) {
+          final bodyJson = jsonEncode(body);
+          return await _sendRaw(path, body,
+              _proofHeaders(nonce, path, bodyJson: bodyJson),
+              cancel: cancel, timeoutOver: timeoutOver);
+        }
+      } on AuthException {
+        // Core refused our challenge/auth setup (unbound key, older
+        // verification state): fall back to the proven raw-key path.
+        _spareNonce = null;
+      } on NotRegisteredException {
+        // 404: credential not registered (revoked/expired since bind).
+        _spareNonce = null;
+        rethrow;
+      }
+    }
+    final headers = deviceAuth
+        ? _deviceHeaders
+        : {
+            'Content-Type': 'application/json',
+            if (devToken != null) 'Authorization': 'Bearer $devToken',
+          };
+    return _sendRaw(path, body, headers,
+        cancel: cancel, timeoutOver: timeoutOver);
+  }
+
   /// Operator-visible step is done out-of-band; the app claims with the code.
+  /// An Ed25519 signing keypair is generated ON DEVICE and its public
+  /// half is bound at claim time (authorized by the pairing ceremony) so
+  /// every later device call can use challenge proofs instead of the key.
   Future<void> claim(String pairingCode, String id) async {
-    final out = await _post('/v1/agent/claim', {'pairing_code': pairingCode},
-        deviceAuth: false);
+    final kp = ed25519Generate();
+    deviceSecret = kp.secretHex;
+    final out = await _sendRaw(
+        '/v1/agent/claim',
+        {'pairing_code': pairingCode, 'pubkey': kp.publicKeyHex},
+        {
+          'Content-Type': 'application/json',
+          if (devToken != null) 'Authorization': 'Bearer $devToken',
+        });
     deviceId = out['device_id'] as String? ?? id;
     deviceKey = out['device_key'] as String?;
   }
@@ -228,6 +376,28 @@ class CoreClient {
     }
   }
 
+  /// Active/known file-transfer missions + relay transfers (operator
+  /// token; Stage 21). Shape: {missions: [...], transfers: [...]}.
+  Future<Map<String, dynamic>> transferMissions(
+      {CancelScope? cancel}) async {
+    final client = HttpClient();
+    try {
+      final req =
+          await client.getUrl(Uri.parse('$baseUrl/v1/transfer-missions'));
+      executionHeaders().forEach(req.headers.set);
+      final resp = await req.close().timeout(timeout);
+      final text = await resp.transform(utf8.decoder).join();
+      if (resp.statusCode >= 400) {
+        _raise('/v1/transfer-missions', resp.statusCode, text, 'GET');
+      }
+      return Map<String, dynamic>.from(jsonDecode(text) as Map);
+    } catch (e) {
+      throw mapTransportError(e, 'GET', '/v1/transfer-missions', timeout);
+    } finally {
+      client.close();
+    }
+  }
+
   /// Operator-side enroll: mint a one-time pairing code for [deviceId]
   /// (shown once, 10-minute TTL, single use). The new device claims it
   /// from its own Chat tab; discovery never authorizes control by itself.
@@ -248,8 +418,18 @@ class CoreClient {
         cancel: cancel);
   }
 
-  Future<Map<String, dynamic>?> pollJobs({CancelScope? cancel}) async {
-    final out = await _post('/v1/agent/jobs/poll', {}, cancel: cancel);
+  Future<Map<String, dynamic>?> pollJobs(
+      {CancelScope? cancel, double waitSecs = 0}) async {
+    final path = waitSecs > 0
+        ? '/v1/agent/jobs/poll?wait_secs=${waitSecs
+            .toStringAsFixed(1)}'
+        : '/v1/agent/jobs/poll';
+    // The server may hold an empty response up to wait_secs (bounded
+    // long poll) — extend the response deadline above the hold, unlike
+    // regular posts. waitSecs==0 keeps the legacy instant contract and
+    // the default client timeout (same wire contract for old cores).
+    final hold = waitSecs > 0 ? Duration(seconds: waitSecs.ceil() + 5) : null;
+    final out = await _post(path, {}, cancel: cancel, timeoutOver: hold);
     return out['job'] as Map<String, dynamic>?;
   }
 
@@ -367,7 +547,7 @@ class CoreClient {
           .replace(queryParameters: query.isEmpty ? null : query);
       final req = await client.openUrl(method, uri);
       executionHeaders().forEach(req.headers.set);
-      if (body != null) req.write(jsonEncode(body));
+      if (body != null) req.add(utf8.encode(jsonEncode(body)));
       final resp = await req.close().timeout(timeout);
       final text = await resp.transform(utf8.decoder).join();
       if (cancel?.isCancelled ?? false) {
@@ -436,6 +616,64 @@ class CoreClient {
         .whereType<Map>()
         .map((e) => Map<String, dynamic>.from(e))
         .toList();
+  }
+
+  // --- Messaging approvals (mission-bound send decisions) ---
+  //
+  // Frozen Core contracts (core/app.py; reads are read-only, plus exactly
+  // the two decision POSTs):
+  //   GET  /v1/messaging/approvals             -> {approvals:[view]}
+  //   GET  /v1/messaging/approvals/{id}        -> {state,...}
+  //   POST /v1/messaging/approvals/{id}/approve -> executes the BOUND plan
+  //   POST /v1/messaging/approvals/{id}/cancel  -> {state: cancelled}
+  // Views NEVER carry message plaintext or the binding fingerprint; the
+  // panel renders recipient + state + action labels only. Approval is a
+  // real mission-bound decision: the POST approves the exact bound plan,
+  // not a general permission.
+
+  /// GET /v1/messaging/approvals — redacted pending rows (bounded);
+  /// empty list on a non-list shape, never a guessed row.
+  Future<List<Map<String, dynamic>>> messagingListPending(
+      {CancelScope? cancel}) async {
+    final out = await _memoryRequest(
+        'GET', '/v1/messaging/approvals', cancel: cancel);
+    final rows = (out is Map ? out['approvals'] : out);
+    if (rows is! List) return [];
+    return rows
+        .whereType<Map>()
+        .map((e) => Map<String, dynamic>.from(e))
+        .toList();
+  }
+
+  /// GET /v1/messaging/approvals/{id} — one redacted record.
+  Future<Map<String, dynamic>> messagingStatus(String approvalId,
+      {CancelScope? cancel}) async {
+    final out = await _memoryRequest(
+        'GET', messagingApprovalPath(approvalId), cancel: cancel);
+    if (out is Map) return Map<String, dynamic>.from(out);
+    return {'state': 'missing'};
+  }
+
+  /// POST /v1/messaging/approvals/{id}/approve {who} — one-time
+  /// consumption of the pending approval; runs only the bound plan.
+  Future<Map<String, dynamic>> messagingApprove(String approvalId,
+      {String who = 'user', CancelScope? cancel}) async {
+    final out = await _memoryRequest(
+        'POST', '${messagingApprovalPath(approvalId)}/approve',
+        body: buildMessagingApproveBody(who), cancel: cancel);
+    if (out is Map) return Map<String, dynamic>.from(out);
+    return {'status': 'unknown'};
+  }
+
+  /// POST /v1/messaging/approvals/{id}/cancel — pending/approved ->
+  /// cancelled (409 when already ended; branch on messagingConflict).
+  Future<Map<String, dynamic>> messagingCancel(String approvalId,
+      {CancelScope? cancel}) async {
+    final out = await _memoryRequest(
+        'POST', '${messagingApprovalPath(approvalId)}/cancel',
+        body: {}, cancel: cancel);
+    if (out is Map) return Map<String, dynamic>.from(out);
+    return {'state': 'unknown'};
   }
 
   /// POST /v1/diagnostics/provider-check (operator-authed, explicit
@@ -532,7 +770,7 @@ class CoreClient {
       final req = await client.postUrl(Uri.parse('$baseUrl/v1/talk/stream'));
       executionHeaders().forEach(req.headers.set);
       req.headers.set(HttpHeaders.acceptHeader, 'text/event-stream');
-      req.write(jsonEncode(body));
+      req.add(utf8.encode(jsonEncode(body)));
       final resp = await req.close().timeout(openTimeout ?? timeout);
       if (resp.statusCode >= 400) {
         final text = await resp.transform(utf8.decoder).join();
@@ -639,7 +877,7 @@ class CoreClient {
     try {
       final req = await client.postUrl(Uri.parse('$baseUrl$path'));
       executionHeaders().forEach(req.headers.set);
-      req.write(jsonEncode(body));
+      req.add(utf8.encode(jsonEncode(body)));
       final resp = await req.close().timeout(timeout);
       final text = await resp.transform(utf8.decoder).join();
       if (cancel?.isCancelled ?? false) {
@@ -1073,6 +1311,47 @@ bool isMemoryNotFound(Object e) => e.toString().contains('404');
 /// 422 on POST /v1/memory = secret/credential refusal (never stored).
 /// Fix the text, not the polling. Pure for testing.
 bool isMemorySecretRejected(Object e) => e.toString().contains('422');
+
+/// Exact path for GET /v1/messaging/approvals/{id} (core/app.py
+/// messaging_status). Pure for testing. Throws ArgumentError on an empty
+/// id — that would be a Core 404, so fail fast instead of sending
+/// known-bad requests.
+String messagingApprovalPath(String approvalId) {
+  if (approvalId.isEmpty) {
+    throw ArgumentError('approval id must not be empty');
+  }
+  return '/v1/messaging/approvals/${Uri.encodeComponent(approvalId)}';
+}
+
+/// Exact wire body for the approve POST (core/app.py MessagingApproveIn:
+/// who). Pure for testing.
+Map<String, dynamic> buildMessagingApproveBody([String who = 'user']) =>
+    {'who': who};
+
+
+/// 409 on a messaging decision = the approval already ended (approved,
+/// cancelled, expired, completed). Pure for testing.
+bool isMessagingConflict(Object e) => e.toString().contains('409');
+
+/// Explicit decision-failure text per status family (409/404/401/403).
+/// Never invents the approval state: on 404 the list is refreshed from
+/// Core instead of assuming. Pure for testing.
+String messagingDecisionError(Object e, {required bool approve}) {
+  final kind = approve ? 'Approve' : 'Cancel';
+  final s = e.toString();
+  if (isMessagingConflict(s)) {
+    return '$kind failed: the approval already ended — tap Refresh and '
+        'decide from the current list.';
+  }
+  if (s.contains('404')) {
+    return '$kind failed: the approval is gone (dropped after expiry or a '
+        'restart) — tap Refresh.';
+  }
+  if (s.contains('401') || s.contains('403')) {
+    return '$kind failed: missing or wrong operator token (Tasks tab).';
+  }
+  return '$kind failed: $s';
+}
 
 /// Exact query for GET /v1/sessions (core/app.py list_sessions: limit,
 /// clamped server-side to 1..100). Pure for testing.

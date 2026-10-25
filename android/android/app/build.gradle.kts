@@ -47,3 +47,10 @@ kotlin {
 flutter {
     source = "../.."
 }
+
+// Pure-JVM unit tests for the deterministic core logic (SemTarget
+// contract-v3 selector matching, mirroring core/uicontrol.py's
+// ElementTarget semantics). Runner: ./gradlew testDebugUnitTest --offline
+dependencies {
+    testImplementation("junit:junit:4.12")
+}

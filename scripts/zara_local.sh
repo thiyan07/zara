@@ -2,6 +2,12 @@
 # zara_local.sh — local launcher for Zara Core (uvicorn core.app:app).
 # Commands: start | stop | status
 #   start [--port P] [--db-dir D] [--env-file F]
+#         [--tls-cert CERT --tls-key KEY [--tls-ca CA]]
+#         TLS: serves https when cert+key given; --tls-ca makes the
+#         readiness probe verify against that CA (OMIT: pinned-loopback
+#         liveness probe only — real clients MUST verify; see
+#         docs/TRANSPORT_TLS.md). ZARA_REQUIRE_HTTPS=1 additionally
+#         makes Core refuse any non-loopback plain-HTTP request.
 #   stop  [--port P]
 #   status [--port P]
 #
@@ -53,7 +59,8 @@ print_env_contract() {
   local var val upper
   for var in ASSISTANT_TOKEN LLM_PROVIDER LLM_BASE_URL LLM_API_KEY LLM_MODEL \
              ZARA_MEMORY_DB ZARA_MISSION_DB ZARA_AUDIT_DB ZARA_FABRIC_DB \
-             ZARA_SESSION_DB ZARA_CHAT_DB ZARA_DELEGATION_DB ZARA_EMBEDDINGS; do
+             ZARA_SESSION_DB ZARA_CHAT_DB ZARA_DELEGATION_DB ZARA_DEVICE_AUTH_DB \
+             ZARA_EMBEDDINGS; do
     val="${!var:-<unset>}"
     upper="$(echo "$var" | tr '[:lower:]' '[:upper:]')"
     case "$upper" in
@@ -165,6 +172,7 @@ cmd_status() {
 
 cmd_start() {
   local req_port="" db_dir="" env_file="" port fell_back="no" pidfile logfile
+  local tls_cert="" tls_key="" tls_ca=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --port) req_port="${2:-}"; shift 2 ;;
@@ -173,9 +181,24 @@ cmd_start() {
       --db-dir=*) db_dir="${1#--db-dir=}"; shift ;;
       --env-file) env_file="${2:-}"; shift 2 ;;
       --env-file=*) env_file="${1#--env-file=}"; shift ;;
+      --tls-cert) tls_cert="${2:-}"; shift 2 ;;
+      --tls-cert=*) tls_cert="${1#--tls-cert=}"; shift ;;
+      --tls-key) tls_key="${2:-}"; shift 2 ;;
+      --tls-key=*) tls_key="${1#--tls-key=}"; shift ;;
+      --tls-ca) tls_ca="${2:-}"; shift 2 ;;
+      --tls-ca=*) tls_ca="${1#--tls-ca=}"; shift ;;
       *) echo "zara_local: unknown start flag: $1" >&2; exit 1 ;;
     esac
   done
+  if { [ -n "$tls_cert" ] || [ -n "$tls_key" ]; } \
+     && { [ -z "$tls_cert" ] || [ -z "$tls_key" ]; }; then
+    echo "zara_local: --tls-cert and --tls-key must be given together" >&2
+    exit 1
+  fi
+  if [ -n "$tls_cert" ]; then
+    [ -r "$tls_cert" ] || { echo "zara_local: cert not readable: $tls_cert" >&2; exit 1; }
+    [ -r "$tls_key" ] || { echo "zara_local: key not readable: $tls_key" >&2; exit 1; }
+  fi
   [ -z "$req_port" ] && req_port="${ZARA_PORT:-}"
   [ -n "$env_file" ] && load_env_file "$env_file"
 
@@ -232,7 +255,8 @@ cmd_start() {
     : "${ZARA_SESSION_DB:=$db_dir/session.db}"
     : "${ZARA_CHAT_DB:=$db_dir/chat.db}"
     : "${ZARA_DELEGATION_DB:=$db_dir/delegation.db}"
-    export ZARA_MEMORY_DB ZARA_MISSION_DB ZARA_AUDIT_DB ZARA_FABRIC_DB ZARA_SESSION_DB ZARA_CHAT_DB ZARA_DELEGATION_DB
+    : "${ZARA_DEVICE_AUTH_DB:=$db_dir/device_auth.db}"
+    export ZARA_MEMORY_DB ZARA_MISSION_DB ZARA_AUDIT_DB ZARA_FABRIC_DB ZARA_SESSION_DB ZARA_CHAT_DB ZARA_DELEGATION_DB ZARA_DEVICE_AUTH_DB
     echo "zara_local: file-backed DBs under $db_dir"
   else
     echo "zara_local: all-memory mode (no --db-dir; shell env passes through, unset DB vars = in-memory)"
@@ -247,16 +271,37 @@ cmd_start() {
   # interpreter path resolution), so the "zara_local" marker lives in the
   # -c program text itself, which is preserved verbatim in /proc cmdline.
   # stop/ verifies this marker before signalling any PID.
-  nohup python3 -c '# zara_local managed server
+  if [ -n "$tls_cert" ]; then
+    TLSCF="$tls_cert" TLSKF="$tls_key" \
+    nohup python3 -c '# zara_local managed server
+import os
+from uvicorn import run
+run("core.app:app", host="127.0.0.1", port='"$port"',
+    ssl_certfile=os.environ["TLSCF"], ssl_keyfile=os.environ["TLSKF"])' >"$logfile" 2>&1 &
+  else
+    nohup python3 -c '# zara_local managed server
 from uvicorn import run
 run("core.app:app", host="127.0.0.1", port='"$port"')' >"$logfile" 2>&1 &
+  fi
   newpid=$!
   echo "$newpid" >"$pidfile"
   echo "zara_local: launched pid $newpid; waiting for /v1/ready (<= ${READY_TIMEOUT_S}s)"
 
-  local waited=0 body=""
+  local waited=0 body="" proto="http://" rca=""
+  if [ -n "$tls_cert" ]; then
+    proto="https://"
+    if [ -n "$tls_ca" ]; then
+      rca="--cacert $tls_ca"
+    else
+      # Readiness ONLY: loopback liveness probe against our own server.
+      # Without a staged CA we cannot verify a self-signed cert here;
+      # pinned -k proves nothing beyond liveness. Real clients MUST
+      # verify — docs/TRANSPORT_TLS.md.
+      rca="-k"
+    fi
+  fi
   while [ "$waited" -lt "$READY_TIMEOUT_S" ]; do
-    body="$(curl -sf --max-time 2 "http://127.0.0.1:$port/v1/ready" 2>/dev/null || true)"
+    body="$(curl -sf $rca --max-time 2 "${proto}127.0.0.1:$port/v1/ready" 2>/dev/null || true)"
     if [ -n "$body" ]; then break; fi
     sleep 1; waited=$((waited + 1))
   done

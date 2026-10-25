@@ -95,13 +95,23 @@ void main() {
       forceStopGranted: true,
       a11yReady: true,
     );
-    for (final id in ['gui.screen.inspect', 'gui.tap']) {
+    for (final id in [
+      'gui.screen.inspect',
+      'gui.tap',
+      'gui.set_text',
+      'gui.scroll'
+    ]) {
       expect(ready.firstWhere((d) => d['id'] == id)['availability'],
           'available');
     }
     final notReady = androidCapabilityDocs(
         micPermission: true, notifPermission: true);
-    for (final id in ['gui.screen.inspect', 'gui.tap']) {
+    for (final id in [
+      'gui.screen.inspect',
+      'gui.tap',
+      'gui.set_text',
+      'gui.scroll'
+    ]) {
       final doc = notReady.firstWhere((d) => d['id'] == id);
       expect(doc['availability'], 'unavailable');
       expect((doc['availability_reason'] as String), contains('accessibility'));
@@ -149,6 +159,14 @@ void main() {
     expect(tap['availability'], 'available');
     expect((tap['aliases'] as List), contains('tap'));
     expect(tap['execution'], 'on-device');
+    final setText = docs.firstWhere((d) => d['id'] == 'gui.set_text');
+    expect(setText['risk'], 'high_risk');
+    expect(setText['requires'], isEmpty);
+    expect(setText['availability'], 'available');
+    expect((setText['aliases'] as List), contains('type text'));
+    final scroll = docs.firstWhere((d) => d['id'] == 'gui.scroll');
+    expect(scroll['risk'], 'high_risk');
+    expect((scroll['aliases'] as List), contains('scroll'));
   });
 
   test('malformed server answers stay inert (no crash on junk)', () {    // Docs are plain maps; a junk answer decodes to nothing we act on.

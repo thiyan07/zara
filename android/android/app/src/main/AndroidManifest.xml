@@ -26,6 +26,39 @@
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
     <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
+    <!-- Stage 31-P3h: ACTION_SET_ALARM dispatch (normal permission;
+         the clock app opens pre-filled and the user completes it —
+         Zara never completes an alarm silently). -->
+    <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
+    <!-- Stage 31-P3 phase B (P3d): call with contact resolution.
+         READ_CONTACTS backs the bounded name lookup; CALL_PHONE lets the
+         CONFIRMED call skip the dialer (user decision: direct call on
+         YES). Both are DANGEROUS — runtime-requested at enablement,
+         never silently. -->
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
+    <uses-permission android:name="android.permission.CALL_PHONE" />
+    <uses-permission android:name="android.permission.SEND_SMS" />
+    <!-- Stage 31-P3 phase B (P3c): photo INVENTORY only (count-only
+         MediaStore metadata). The pull stays the operator's adb seam;
+         no ACCESS_MEDIA_LOCATION is requested (no EXIF/GPS reads),
+         and nothing here enables delete. -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <!-- Android 11+ package visibility: without <queries>, the handler
+         presence check in QuickActions (alarm clock, VIEW links) sees
+         nothing and honestly abstains on EVERY device. These declare
+         exactly the surfaces Zara resolves; they grant nothing. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.SET_ALARM" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="https" />
+        </intent>
+    </queries>
     <!-- Tier-3 lab companion call permission (signature): grantable only
          when both APKs share the lab keystore. Declaring it here is inert
          on ordinary builds; the bridge probes the companion at call time. -->
@@ -116,6 +149,19 @@
             <meta-data
                 android:name="android.accessibilityservice"
                 android:resource="@xml/zara_a11y_config" />
+        </service>
+        <!-- Passive notification collector: OS binds only after the user
+             grants Notification listener access in Settings (special
+             access, always explicit). No polling inside: entries are
+             appended as the system delivers them, read only when a
+             granted android.notifications.read job arrives. -->
+        <service
+            android:name=".ZaraNotifListener"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
         </service>
         <!-- Post-reboot resume prompt (opt-in marker file, no secrets).
              No background execution: the receiver only notifies, and only

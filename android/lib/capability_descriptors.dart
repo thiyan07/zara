@@ -33,6 +33,25 @@ const Map<String, String> _riskOf = {
   // Rung-2 pilot: advisory only (Core policy decides). Lab emulator only.
   'gui.screen.inspect': 'confirm',
   'gui.tap': 'high_risk',
+  'gui.set_text': 'high_risk',
+  'gui.scroll': 'high_risk',
+  'gui.back': 'high_risk',
+  // Find is an observation class exactly like screen inspect: read-only,
+  // never acts (the acting tools keep their own risk classes).
+  'gui.find': 'confirm',
+  // Wait is the same observation class (Stage 28): bounded read-only
+  // polling; a timeout is an honest matched:false, never a failure of
+  // the device.
+  'gui.wait': 'confirm',
+  'android.apps.list': 'safe',
+  // Stage 20: discovery is observation-class. Detection is never trust;
+  // both tools return statistics/lists only.
+  'android.observe': 'safe',
+  'android.storage.stats': 'safe',
+  // Notification read is an observation class like screen inspect:
+  // confirm risk + explicit user grant (Settings special access) +
+  // Core policy stay final. Contents scrubbed at capture in Kotlin.
+  'android.notifications.read': 'confirm',
   // Phase 1: states are safe reads; settings/app opens need user confirm.
   'system.battery.charging_time': 'safe',
   'system.wifi.state': 'safe',
@@ -66,12 +85,23 @@ const Map<String, List<String>> _requiresOf = {
   // AccessibilityService in Settings and the inspect call reports state.
   'gui.screen.inspect': [],
   'gui.tap': [],
+  'gui.set_text': [],
+  'gui.scroll': [],
+  'gui.back': [],
+  'gui.find': [],
+  'gui.wait': [],
+  'android.apps.list': [],
+  // Stage 20: no runtime permissions needed for observe; storage stats
+  // gates READ_MEDIA_* on the native side honestly (permission_needed).
+  'android.observe': [],
+  'android.storage.stats': [],
+  // Not a runtime permission: the user grants Notification listener
+  // access in Settings (special access); the availability probe reads
+  // the real OS registry (enabled_notification_listeners).
+  'android.notifications.read': [],
 };
 
-const _foregroundOf = {
-  'audio.capture.api',
-  'voice.input',
-};
+const _foregroundOf = {'audio.capture.api', 'voice.input'};
 
 /// Build describe documents for every truly-supported capability.
 /// [micPermission]/[notifPermission] drive honest availability; anything
@@ -97,7 +127,13 @@ List<Map<String, dynamic>> androidCapabilityDocs({
       permState = notifPermission ? null : 'denied';
     } else if (c.name == 'android.app.force_stop') {
       permState = forceStopGranted ? null : 'denied';
-    } else if (c.name == 'gui.screen.inspect' || c.name == 'gui.tap') {
+    } else if (c.name == 'gui.screen.inspect' ||
+        c.name == 'gui.tap' ||
+        c.name == 'gui.set_text' ||
+        c.name == 'gui.scroll' ||
+        c.name == 'gui.back' ||
+        c.name == 'gui.find' ||
+        c.name == 'gui.wait') {
       if (!a11yReady) {
         availability = 'unavailable';
         reason = 'accessibility service not enabled';
@@ -118,8 +154,7 @@ List<Map<String, dynamic>> androidCapabilityDocs({
       'platforms': ['android'],
       // files.transfer moves bytes through the Core relay (Stage 15);
       // everything else executes in the app process itself.
-      'execution':
-          c.name == 'files.transfer' ? 'core-mediated' : 'on-device',
+      'execution': c.name == 'files.transfer' ? 'core-mediated' : 'on-device',
       'requires_foreground': _foregroundOf.contains(c.name),
       'requires_network': false,
       'battery_sensitive': false,
@@ -211,6 +246,14 @@ List<String> _aliasesOf(String name) {
       return ['inspect screen'];
     case 'gui.tap':
       return ['tap'];
+    case 'gui.set_text':
+      return ['type text', 'enter text'];
+    case 'gui.scroll':
+      return ['scroll'];
+    case 'gui.find':
+      return ['find element', 'find on screen'];
+    case 'gui.wait':
+      return ['wait for element', 'wait until appears'];
     default:
       return [];
   }

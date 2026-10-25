@@ -25,10 +25,20 @@ policy/execution before anything runs.
 | `device_event` | agent→core | offline-queue sync + notifications |
 | `device_disconnect` | agent→core | graceful shutdown |
 
-## REST endpoints (all device endpoints need X-Device-Id/X-Device-Key)
+## REST endpoints (all device endpoints need X-Device-Id auth)
+
+Device calls authenticate with `X-Device-Id` + `X-Device-Key` (raw, one
+legacy mode) or, preferably, with Ed25519 challenge proofs
+(`X-Device-Id` + `X-Device-Nonce` + `X-Device-Proof` — proof = signature
+over `"METHOD path nonce sha256(body)"` — see docs/DEVICE_SECURITY.md;
+the raw key itself travels only once, on the single bootstrap challenge
+fetch). Production transport: HTTPS (docs/TRANSPORT_TLS.md).
 
 - `POST /v1/agent/enroll` (dev token) → pairing code
-- `POST /v1/agent/claim` → device key (once)
+- `POST /v1/agent/claim` → device key (once; may bind `pubkey`)
+- `POST /v1/agent/challenge` → `{nonce, next_nonce}` (proof mode; 409
+  when no pubkey is bound)
+- `POST /v1/agent/pubkey` → bind/replace Ed25519 key (raw-key only)
 - `POST /v1/agent/register|heartbeat|capabilities`
 - `POST /v1/agent/jobs/poll` → job or null (also refreshes presence)
 - `POST /v1/agent/jobs/result`, `POST /v1/agent/jobs/{id}/cancel`

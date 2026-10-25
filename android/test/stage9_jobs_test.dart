@@ -1,6 +1,18 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:zara_android/job_runner.dart';
 
+/// Minimal stand-in for a coded bridge-channel failure (mirrors
+/// A11yBridgeException's {code, message} shape without importing the
+/// Flutter-dependent bridge into runner tests).
+class _FakeBridgeError implements Exception {
+  final String code;
+  final String message;
+  final Map<String, dynamic> details;
+  _FakeBridgeError(this.code, this.message, [this.details = const {}]);
+  @override
+  String toString() => '_FakeBridgeError($code): $message';
+}
+
 DeviceJob job(String tool, [String id = 'job-1']) => DeviceJob(
     jobId: id, tool: tool, inputs: {}, timeoutS: 20, executionId: 'exec-1');
 
@@ -228,7 +240,7 @@ void main() {
                   'package': 'com.example',
                 };
               },
-          a11yTap: (pkg, nodeId) async => {
+          a11yTap: (pkg, nodeId, [options]) async => {
                 'package': pkg,
                 'stopped': 'n/a',
                 'applied': true,
@@ -273,7 +285,7 @@ void main() {
       final r = AndroidJobRunner(
         battery: () => {},
         network: () => {},
-        a11yTap: (pkg, nodeId) async {
+        a11yTap: (pkg, nodeId, [options]) async {
           called = true;
           return {'applied': true};
         },
@@ -305,25 +317,23 @@ void main() {
       final r = AndroidJobRunner(
         battery: () => {},
         network: () => {},
-        a11yTap: (pkg, nodeId) async {
+        a11yTap: (pkg, nodeId, [options]) async {
           called = true;
           return {'applied': true};
         },
       );
-      for (final bad in ['0', -1, 1.5]) {
+      for (final bad in ['0', -1, 1.5, 1.0]) {
         final out = await r.run(
             tapJob('dev.zara.lab.privtest', bad, 'job-tap-bad-$bad'));
-        // '0' is a String, -1 is negative: both refused before the gateway.
-        // 1.5 truncates to 1 and executes (num input): allowed through.
-        if (bad == 1.5) {
-          expect(out.ok, isTrue);
-        } else {
-          expect(out.ok, isFalse, reason: '$bad');
-          expect(out.error, contains('node_id'));
-        }
+        // Contract v1: node_id is an exact non-negative integer DFS index.
+        // Strings, negatives, and doubles (even integral ones like 1.0 —
+        // truncation could click the wrong node) are refused before the
+        // gateway.
+        expect(out.ok, isFalse, reason: '$bad');
+        expect(out.error, contains('node_id'));
       }
-      // Only the 1.5 case reached the gateway.
-      expect(called, isTrue);
+      // Nothing reached the gateway.
+      expect(called, isFalse);
     });
 
     test('unknown gui.* tools refused, never executed', () async {
@@ -334,6 +344,138 @@ void main() {
         expect(out.ok, isFalse, reason: t);
         expect(out.error, contains('refused'));
       }
+    });
+
+    group('contract v2 set_text/scroll', () {
+      AndroidJobRunner textRunner(
+              Future<Map<String, dynamic>> Function(
+                      String, int, String, Map<String, dynamic>?)
+                  fn) =>
+          AndroidJobRunner(
+            battery: () => {},
+            network: () => {},
+            a11ySetText: (pkg, nodeId, text, [options]) =>
+                fn(pkg, nodeId, text, options ?? const {}),
+          );
+
+      AndroidJobRunner scrollRunner(
+              Future<Map<String, dynamic>> Function(
+                      String, int, bool, Map<String, dynamic>?)
+                  fn) =>
+          AndroidJobRunner(
+            battery: () => {},
+            network: () => {},
+            a11yScroll: (pkg, nodeId, fwd, [options]) =>
+                fn(pkg, nodeId, fwd, options ?? const {}),
+          );
+
+      var textSeq = 0;
+      DeviceJob textJob(Map<String, dynamic> extra) => DeviceJob(
+          jobId: 'job-text-${textSeq++}',
+          tool: 'gui.set_text',
+          inputs: {
+            'target_package': 'dev.zara.zara_android',
+            'node_id': 4,
+            'text': 'hello lab',
+            ...extra,
+          },
+          timeoutS: 20,
+          executionId: 'exec-text');
+
+      var scrollSeq = 0;
+      DeviceJob scrollJob(Map<String, dynamic> extra) => DeviceJob(
+          jobId: 'job-scroll-${scrollSeq++}',
+          tool: 'gui.scroll',
+          inputs: {
+            'target_package': 'dev.zara.zara_android',
+            'node_id': 9,
+            ...extra,
+          },
+          timeoutS: 20,
+          executionId: 'exec-scroll');
+
+      test('set_text forwards text plus snapshot bindings', () async {
+        String? seenText;
+        Map? seenOpts;
+        final r = textRunner((pkg, nodeId, text, opts) async {
+          seenText = text;
+          seenOpts = opts;
+          return {
+            'applied': true,
+            'verify_state': 'text_matched',
+            'snapshot_id': 'eeee5678:6',
+            'contract_version': 2,
+          };
+        });
+        final out = await r.run(textJob({
+          'expected_snapshot_id': 'abcd1234:5',
+        }));
+        expect(out.ok, isTrue);
+        expect(seenText, equals('hello lab'));
+        expect(seenOpts!['expected_snapshot_id'], equals('abcd1234:5'));
+        expect(out.result['verify_state'], equals('text_matched'));
+        // Typed text never echoes back through the result.
+        expect('${out.result}', isNot(contains('hello lab')));
+      });
+
+      test('empty/oversize text refused without touching gateway',
+          () async {
+        var called = false;
+        final r = textRunner((pkg, nodeId, text, opts) async {
+          called = true;
+          return {'applied': true};
+        });
+        for (final bad in ['', 'x' * 501]) {
+          final out = await r.run(textJob({'text': bad}));
+          expect(out.ok, isFalse, reason: 'len=${bad.length}');
+          expect(out.error, contains('bad text'));
+        }
+        expect(called, isFalse);
+      });
+
+      test('non-editable target fails with evidence', () async {
+        final r = textRunner((pkg, nodeId, text, opts) async => {
+              'supported': false,
+              'applied': false,
+              'error': 'NOT_EDITABLE',
+              'snapshot_id': 'eeee5678:6',
+            });
+        final out = await r.run(textJob({}));
+        expect(out.ok, isFalse);
+        expect(out.error, contains('not editable'));
+        expect(out.result['snapshot_id'], equals('eeee5678:6'));
+      });
+
+      test('scroll forwards direction and bindings', () async {
+        bool? seenFwd;
+        final r = scrollRunner((pkg, nodeId, fwd, opts) async {
+          seenFwd = fwd;
+          return {
+            'applied': true,
+            'verify_state': 'requested (compare snapshots for movement)',
+            'snapshot_id': 'ffff1111:9',
+            'contract_version': 2,
+          };
+        });
+        var out = await r.run(scrollJob({}));
+        expect(out.ok, isTrue);
+        expect(seenFwd, isTrue);
+        out = await r.run(scrollJob({'direction': 'backward'}));
+        expect(out.ok, isTrue);
+        expect(seenFwd, isFalse);
+      });
+
+      test('scroll on non-scrollable node fails', () async {
+        final r = scrollRunner((pkg, nodeId, fwd, opts) async => {
+              'supported': false,
+              'applied': false,
+              'error': 'NOT_SCROLLABLE',
+              'snapshot_id': 'ffff1111:9',
+            });
+        final out = await r.run(scrollJob({}));
+        expect(out.ok, isFalse);
+        expect(out.error, contains('not scrollable'));
+      });
     });
 
     test('inspect with params returns Rung-3 snapshot shape', () async {
@@ -379,6 +521,145 @@ void main() {
       expect(out.result['reason'], equals('UNEXPECTED_PACKAGE'));
       expect(out.result['expected_package'], equals('wrong.package'));
       expect(out.result['actual_package'], equals('com.example'));
+    });
+
+    group('contract v1 snapshot-bound tap', () {
+      AndroidJobRunner tapRunner(
+          Future<Map<String, dynamic>> Function(
+                  String, int, Map<String, dynamic>?)
+              tap) =>
+          AndroidJobRunner(
+            battery: () => {},
+            network: () => {},
+            a11yTap: (pkg, nodeId, [options]) =>
+                tap(pkg, nodeId, options ?? const {}),
+          );
+
+      DeviceJob tapBoundJob(Map<String, dynamic> extra) => DeviceJob(
+          jobId: 'job-tap-bound',
+          tool: 'gui.tap',
+          inputs: {
+            'target_package': 'dev.zara.zara_android',
+            'node_id': 3,
+            ...extra,
+          },
+          timeoutS: 20,
+          executionId: 'exec-tap-bound');
+
+      test('snapshot bindings forwarded to the gateway', () async {
+        Map<String, dynamic>? seen;
+        final r = tapRunner((pkg, nodeId, opts) async {
+          seen = {'pkg': pkg, 'nodeId': nodeId, 'opts': opts};
+          return {'applied': true, 'package': pkg, 'verify_state': 'clicked'};
+        });
+        final out = await r.run(tapBoundJob({
+          'expected_snapshot_id': 'abcd1234:5',
+          'expected_package': 'dev.zara.zara_android',
+          'max_elements': 25,
+        }));
+        expect(out.ok, isTrue);
+        expect(seen!['pkg'], equals('dev.zara.zara_android'));
+        expect(seen!['nodeId'], equals(3));
+        final opts = seen!['opts'] as Map;
+        expect(opts['expected_snapshot_id'], equals('abcd1234:5'));
+        expect(opts['expected_package'],
+            equals('dev.zara.zara_android'));
+        expect(opts['max_elements'], equals(25));
+      });
+
+      test('stale snapshot refusal is a failure with evidence', () async {
+        final r = tapRunner((pkg, nodeId, opts) async => {
+              'supported': false,
+              'applied': false,
+              'error': 'STALE_SNAPSHOT',
+              'reason': 'screen structure changed since snapshot',
+              'snapshot_id': 'eeee5678:6',
+              'contract_version': 1,
+            });
+        final out = await r.run(tapBoundJob({
+          'expected_snapshot_id': 'abcd1234:5',
+        }));
+        expect(out.ok, isFalse);
+        expect(out.error, contains('stale snapshot'));
+        expect(out.error, contains('never executed'));
+        expect(out.result['error'], equals('STALE_SNAPSHOT'));
+        expect(out.result['snapshot_id'], equals('eeee5678:6'));
+      });
+
+      test('package-mismatch refusal is a failure, never success', () async {
+        final r = tapRunner((pkg, nodeId, opts) async => {
+              'supported': false,
+              'applied': false,
+              'error': 'UNEXPECTED_PACKAGE',
+              'expected_package': 'dev.zara.zara_android',
+              'actual_package': 'com.other',
+            });
+        final out = await r.run(tapBoundJob({
+          'expected_package': 'dev.zara.zara_android',
+        }));
+        expect(out.ok, isFalse);
+        expect(out.error, contains('foreground package changed'));
+      });
+
+      test('bridge channel error maps to structured refusal', () async {
+        final r = AndroidJobRunner(
+          battery: () => {},
+          network: () => {},
+          a11yTap: (pkg, nodeId, [options]) async =>
+              throw _FakeBridgeError('stale', 'STALE_SNAPSHOT: moved'),
+        );
+        final out = await r.run(tapBoundJob({
+          'expected_snapshot_id': 'abcd1234:5',
+        }));
+        expect(out.ok, isFalse);
+        expect(out.error, contains('stale snapshot'));
+        expect(out.result['bridge_code'], equals('stale'));
+      });
+
+      test('bridge error details merge into refusal evidence', () async {
+        final r = AndroidJobRunner(
+          battery: () => {},
+          network: () => {},
+          a11yTap: (pkg, nodeId, [options]) async =>
+              throw _FakeBridgeError('stale', 'STALE_SNAPSHOT: moved', {
+                'error': 'STALE_SNAPSHOT',
+                'expected_snapshot_id': 'abcd1234:5',
+                'snapshot_id': 'eeee5678:6',
+                'package': 'dev.zara.zara_android',
+              }),
+        );
+        final out = await r.run(tapBoundJob({
+          'expected_snapshot_id': 'abcd1234:5',
+        }));
+        expect(out.ok, isFalse);
+        // Fresh snapshot_id survives the channel-error path so the
+        // caller can re-inspect precisely.
+        expect(out.result['snapshot_id'], equals('eeee5678:6'));
+        expect(out.result['error'], equals('STALE_SNAPSHOT'));
+      });
+
+      test('non-applied tap without error code still fails', () async {
+        final r = tapRunner(
+            (pkg, nodeId, opts) async => {'applied': false});
+        final out = await r.run(tapBoundJob({}));
+        expect(out.ok, isFalse);
+        expect(out.error, contains('not applied'));
+      });
+
+      test('applied tap carries contract evidence through', () async {
+        final r = tapRunner((pkg, nodeId, opts) async => {
+              'applied': true,
+              'package': pkg,
+              'verify_state': 'clicked',
+              'snapshot_id': 'abcd1234:5',
+              'contract_version': 1,
+            });
+        final out = await r.run(tapBoundJob({}));
+        expect(out.ok, isTrue);
+        expect(out.result['applied'], isTrue);
+        expect(out.result['snapshot_id'], equals('abcd1234:5'));
+        expect(out.result['contract_version'], equals(1));
+      });
     });
 
     test('inspect with max_elements caps nodes', () async {

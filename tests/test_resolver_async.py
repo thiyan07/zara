@@ -136,13 +136,16 @@ def test_R01_safe_capability_resolve_submit_poll_success():
 def test_R02_confirm_parks_bound_runs_after_approve():
     stack = make_stack()
     dev = paired_android(stack)
-    res = stack["resolver"].resolve(INSPECT, dev)
+    # Stage 30: INSPECT auto-allows now; use TAP (still parks) to pin
+    # the park-then-run-after-approve lifecycle.
+    res = stack["resolver"].resolve(TAP, dev)
     assert res.status == "requires_approval"
     rec = stack["engine"].submit_async(
-        INSPECT, {}, res.device_id or dev, capability=INSPECT,
+        TAP, {"target_package": VICTIM}, res.device_id or dev,
+        capability=TAP,
         binding={"resolution_status": res.status})
     assert rec.state == ExecutionState.WAITING_FOR_PERMISSION
-    assert rec.capability == INSPECT
+    assert rec.capability == TAP
     poller = CadencePoller(stack["jobs"], dev)
     poller.start()
     try:

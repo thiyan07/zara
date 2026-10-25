@@ -109,8 +109,13 @@ class ToolRegistry:
         if exc:
             raise exc[0]
         if tool.verification == "output_schema":
-            out_errors = validate_against_schema(result, tool.output_schema,
-                                                 tool.max_input_bytes)
+            # Stage 27: the size bound applies to the result contract,
+            # not the input contract — an output-schema tool declares
+            # its own result budget (max_output_bytes; 0 delegates to
+            # max_input_bytes for small-result tools).
+            out_errors = validate_against_schema(
+                result, tool.output_schema,
+                tool.max_output_bytes or tool.max_input_bytes)
             if out_errors:
                 raise ValueError(f"tool {name} output failed verification: {out_errors}")
         return result

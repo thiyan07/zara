@@ -85,12 +85,28 @@ class ToolDefinition(BaseModel):
     verification: str = "none"  # none | output_schema | explicit
     supported_devices: list[str] = Field(default_factory=lambda: ["any"])
     reversible: bool = False
+    # Never-auto-approve class (core/policy.NEVER_AUTO_APPROVE_CAPS,
+    # Stage 29): standing grants never unlock this action; every use
+    # needs explicit per-use human approval. Belt-and-braces alongside
+    # the policy set — registry tests cross-check the two agree.
+    never_auto_approve: bool = False
+    # Stage 30 read-only relaxation (core/policy.
+    # READ_ONLY_AUTO_ALLOW_CAPS): policy allows this observation-only
+    # action without a prompt. Derived from membership, never
+    # hand-maintained; registry tests cross-check the two.
+    read_only_auto_allow: bool = False
     version: str = "1.0.0"
     # Per-tool input-envelope override (bytes of serialized inputs).
     # Default matches the validator's global bound; overrides exist ONLY
     # to mirror a handler's own documented contract (e.g. a patch tool
     # whose handler enforces its own larger cap). Never authority.
     max_input_bytes: int = Field(default=4096, gt=0, le=1048576)
+    # Per-tool OUTPUT-envelope override for tools verified by
+    # `output_schema` (the validator applies its serialized-size bound
+    # to result payloads as well; 0 = delegate to max_input_bytes).
+    # Exists for the same reason max_input_bytes does: mirror the
+    # handler's own documented result contract — never authority.
+    max_output_bytes: int = Field(default=0, ge=0, le=4194304)
     # Expected resource demand (description only, never scheduler weights).
     # Defaults to all-LOW = "no special demand"; existing tools need no
     # migration. Unknown dimensions/values rejected by the closed model.
@@ -202,6 +218,11 @@ class Mission(BaseModel):
     retries: int = 0
     max_retries: int = 3
     error: Optional[str] = None
+    # Resumable-plan envelope (Stage 24g). The deterministic plan that
+    # produced the steps — proposal payload + continuation bindings.
+    # None = not resumable; the mission itself remains authoritative
+    # and nothing here bypasses per-step authorization.
+    plan: Optional[dict] = None
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
 

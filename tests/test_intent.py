@@ -304,17 +304,21 @@ def test_clarify_open_it():
 
 # ---------- G. multi-step ----------
 
-def test_multi_valid_bounded_plan_no_execution():
+def test_multi_valid_bounded_plan_attempts_honestly():
     stack = make_stack()
     from core.resolver import CapabilityResolver
     svc = IntentTurnService(stack["fabric"],
                             CapabilityResolver(stack["fabric"]),
                             LocalIntentParser(), stack["audit"])
     out = svc.handle_utterance("check my battery then check my network")
+    # No devices paired: the plan is attempted step-by-step and stops
+    # honestly at step 1 (no execution, no invented success).
     assert out["executed"] is False
     assert out["proposal"]["steps"] and \
         len(out["proposal"]["steps"]) == 2
     assert "step 1" in out["message"].lower()
+    assert len(out["steps"]) == 1 and \
+        out["steps"][0]["status"] != "ok"
 
 
 def test_multi_too_many_steps():
@@ -750,3 +754,39 @@ def test_fuzz_hosted_garbage_safe():
             phone_ctx().known_capabilities or \
             p.capability in ("device.list", "assistant.help")
     assert hp.parse("battery", phone_ctx()).needs_clarification
+
+
+# ---------- assistant.status (mission/diagnostics summary, read-only) ----------
+
+def test_assistant_status_empty_state_honest():
+    stack = make_stack()
+    out = stack["intent"].handle_utterance("what are you working on", "user")
+    assert out["executed"] is False
+    assert out["message"].startswith("No missions are running right now.")
+
+
+def test_assistant_status_shows_active_and_recent_missions():
+    stack = make_stack()
+    from core.models import MissionState
+    m = stack["missions"].create(goal="Check the battery across devices")
+    stack["missions"].transition(m.id, MissionState.PLANNING)
+    stack["missions"].transition(m.id, MissionState.EXECUTING)
+    out = stack["intent"].handle_utterance("mission status", "user")
+    assert out["executed"] is False
+    assert "Check the battery across devices" in out["message"]
+    assert "[executing]" in out["message"]
+    stack["missions"].transition(m.id, MissionState.COMPLETED)
+    out2 = stack["intent"].handle_utterance("show current tasks", "user")
+    assert out2["executed"] is False
+    assert "[executing]" not in out2["message"]
+    assert "[done|completed] Check the battery across devices" \
+        in out2["message"]
+
+
+def test_assistant_status_never_executes():
+    stack = make_stack()
+    stack["missions"].create(goal="do something")
+    out = stack["intent"].handle_utterance("what's in progress", "user")
+    assert out["executed"] is False
+    for e in stack["audit"].query(200):
+        assert e["action"] not in ("exec", "dispatch_route"), e

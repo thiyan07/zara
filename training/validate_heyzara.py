@@ -190,6 +190,8 @@ def main():
     ap.add_argument("--feature-cache",
                     default=os.path.expanduser("~/.cache/zara-wake/oww"))
     ap.add_argument("--out", default="training/hey_zara_metrics.json")
+    ap.add_argument("--limitation",
+                    default="synthetic-only clips; NOT real-world accuracy")
     args = ap.parse_args()
 
     import onnxruntime as ort
@@ -221,7 +223,7 @@ def main():
         "n_pos": len(pos), "n_neg": len(neg),
         "neg_hours": round(neg_hours, 3),
         **best,
-        "limitation": "synthetic-only clips; NOT real-world accuracy",
+        "limitation": args.limitation,
     }
     with open(args.out, "w") as f:
         json.dump(metrics, f, indent=2)

@@ -73,6 +73,57 @@ Anything else → clarification. The parser maintains no independent
 capability universe (`build_context` derives names/schemas/labels from
 Fabric + registry).
 
+### 6.1 File & browser workflow aliases/extraction (`test_nl_workflow_routing.py`)
+
+- `filesystem.search`: `find/search (for) files "...[pattern]" ["..."|home|tmp]`.
+  Quoted pattern required; second quote = root path; `home`→`~`, `tmp`→`/tmp`.
+- `filesystem.edit`: phrased as `edit file: replace [A] with [B] in [C]`
+  replaces the FIRST (and only permitted) occurrence of `A` in scratch
+  file `C`. Missing pieces clarify with the exact phrasing example.
+- `filesystem.move`: `rename ["src"] to ["dst"]` (the `file|note` word
+  between `rename` and the quote is optional). Missing = clarify.
+- `browser.search`: `find on page ["term"]` — term required.
+- `browser.links` / `browser.form`: param-free
+  (`list|page|find links`, `read form|form fields|inspect form`).
+- `browser.download`: URL required; the file name comes from an explicit
+  quoted name or the URL's final path segment only when that segment is
+  itself non-sensitive — otherwise clarification (a sensitive URL tail
+  is never silently renamed into a download).
+- `filesystem.extract`: `extract/document info ["path"]` — quoted path
+  required; unsupported formats are honestly refused, never guessed.
+
+### 6.2 Universal-operator aliases/extraction (`test_universal_workflows.py`)
+
+- `android.apps.list`: `apps on my phone|the phone`, `phone apps` —
+  param-free, routes to an android-kind device. Discovery metadata is
+  never an authorization (the tool def and result note both say so).
+- `desktop.apps.list`: `desktop apps`, `apps on my computer|the
+  computer` — param-free, routes to a linux-kind device.
+- `desktop.app.open`: `launch/open desktop app "app_id"` — quoted app id
+  from `desktop.apps.list`; a bare trailing word is used only if it
+  looks like a bounded launcher id, otherwise clarification.
+- `gui.back`: `go back|go home [in <lab target>]` — `direction` comes
+  from the phrase (home beats back); the `target_package` must name a
+  real lab target (`dev.zara.zara_android` / `dev.zara.lab.privtest`);
+  a missing one clarifies — navigation is never fired into an unnamed
+  app (native guard refuses UNEXPECTED_PACKAGE anyway).
+- `system.app.open`: unchanged alias set (`open app` etc.); device now
+  returns focus verification fields.
+- `device.capabilities` (BUILTIN_LOCAL, answer-only): `device
+  capabilities`, `what can you do on my phone|laptop|the phone|the
+  laptop`. Resolves the device, then answers from fabricated truth via
+  `fabric.describe_device` (usable vs unavailable per descriptor, trust
+  honesty). Discovery, never an action: `executed` stays False, and an
+  unknown device is refused honestly instead of described with an
+  invented view. Builtin so it never routes to a device tool.
+  Covered by `test_mission_composition.py::test_D*`.
+- `android.notifications.read`: `read|check|show my notifications`,
+  `notifications on my phone`, `read notifications` — param-free
+  (optional `since_ms`/`limit` bounds); routes to an android-kind
+  device. The honest refusal when the user has not granted
+  Notification-listener access is the device result, not a parser
+  clamp; nothing is ever dismissed or acted on by this tool.
+
 ## 7. Device references
 
 my phone/phone/Vivo→android-kind, laptop/computer→linux-kind,
@@ -90,9 +141,57 @@ utterance, over-long plans. Deterministic and tested.
 ## 9. Multi-step intents
 
 Split on then/and-then/semicolons (≤8). Each step parsed; destructive or
-unmappable step → whole plan clarifies. The proposal DESCRIBES the plan;
-the turn service executes nothing multi-step (message lists steps, asks
-to proceed one at a time). No mini-agent, no recursion.
+unmappable step → whole plan clarifies. A fully-mapped plan EXECUTES
+step-by-step through `IntentTurnService._run_plan`: each step is
+independently resolved and run through the same pipeline as a
+single-step turn (resolver → policy → governor →
+`fabric.execute_on_device` → verification), tracked on the injected
+MissionEngine when present. One attempt per step, never auto-retried;
+the first approval hold, failure, or unresolvable step stops the plan
+and later steps never run speculatively. No mini-agent, no recursion.
+
+### 9.2 Typed step-result passing, progress, partial success
+(`test_mission_composition.py`)
+
+A step may bind values from an EARLIER step's validated result with
+`"fetch": {"<param>": {"from": <step index>, "key": "<result key>"}}`:
+- `from` must be an earlier step that SUCCEEDED; the key must exist in
+  that step's result dict. A missing source or key stops the plan with
+  a structured failure — values are never invented and there is no
+  speculative fallback.
+- Fetch is dataflow plumbing, not an authority: fetched values still
+  pass the target tool's registered input schema at execution (a type
+  mismatch fails the step honestly).
+- Bounded: ≤ `_PLAN_FETCH_MAX` (8) bindings per step; a malformed fetch
+  envelope refuses the plan before anything runs.
+- The turn result now carries structured `progress`
+  (`done/total/ran/remaining/statuses`) and `partial` (True when some
+  steps ran but the plan did not complete; the message says the earlier
+  steps were left as-is — nothing rolled back, nothing retried).
+- Missions are queryable over HTTP: `GET /v1/missions/{mid}` (404 for
+  unknown ids) alongside the existing list/create/transition routes;
+  all auth-required.
+- Structured submission surface: `POST /v1/intent/plan` executes a
+  typed multi-step plan (`steps[]` with `capability`, `parameters`,
+  `fetch`, `preferred_device`; bounded by the same MAX_STEPS/fetch
+  limits) through the SAME `_run_plan` chain — no second engine, no
+  parallel authority; the deterministic core stays final.
+
+### 9.1 Workflow pseudo-capabilities (`messaging.send`)
+
+Some real operations are not device tools and never flow to the resolver
+as tool names. `WORKFLOW_CAPS` (`messaging.send`) are added to the
+parser's grounded known set with a bounded schema, so the local parser
+can recognise the shape and propose them, but the turn service routes
+them to their owning workflow instead of executing them. The structural
+shapes are `send "<text>" to "<contact>"` and
+`message|tell|text "<contact>" [saying] "<text>"` (quoted payloads break
+substring aliases, so the shape is matched directly). Routing
+(`IntentTurnService._workflow_turn`) resolves a device that can act on
+the UI and asks the messaging workflow for its single bound approval;
+nothing is sent until the user approves, and an unavailable workflow
+answers honestly. Destination selection is the workflow's, not the
+parser's: the parser holds zero authority here, as everywhere.
 
 ## 10. Security model
 

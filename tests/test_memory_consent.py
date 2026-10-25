@@ -9,10 +9,14 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from fastapi.testclient import TestClient
 
+from core.app import build_stack, create_app
 from core.memory import MemoryStore, PersistentMemoryStore
 from core.memory_policy import MemoryService, classify_write
 from core.models import MemoryItem, utcnow
+
+OP = {"Authorization": "Bearer dev-token"}
 
 
 def _item(text, **kw):
@@ -47,6 +51,22 @@ def test_forget_persistent_store(tmp_path):
     assert all(m.id != kept.id for m in s2.all())
     assert s1.forget(kept.id) is False
     assert s1.forget("no-such-id") is False
+
+def test_forget_persistent_store_deletes_every_derived_surface(tmp_path):
+    """Stage 22 evidence: a forget leaves NO accessible copy anywhere
+    the store controls — recall (in-memory + embedding), export, and
+    the SQLite row itself (embedding column lives in the same row)."""
+    import sqlite3
+    db = str(tmp_path / "mem.db")
+    s = PersistentMemoryStore(db)
+    kept = s.remember(_item("user prefers dark mode everywhere"))
+    assert s.forget(kept.id) is True
+    assert s.recall("dark mode preference") == []
+    exported_ids = [m.id for m in s.export()["items"]]
+    assert kept.id not in exported_ids
+    row = sqlite3.connect(db).execute(
+        "SELECT id FROM memory WHERE id=?", (kept.id,)).fetchone()
+    assert row is None
 
 
 # ---------- confirm_candidate accept / reject ----------
@@ -199,3 +219,54 @@ def test_purge_keeps_superseded_persistent(tmp_path):
     assert svc.store.purge_expired() == 0
     fresh = PersistentMemoryStore(db)
     assert any(m.id == old_id for m in fresh.all())
+
+
+# ---------- documented export (zara-memory-export-1) ----------
+
+def test_export_shape_and_excluded_derived_data():
+    ms = MemoryStore()
+    kept = ms.remember(_item("user prefers dark mode everywhere"))
+    out = ms.export()
+    assert out["format"] == "zara-memory-export-1"
+    assert out["count"] == 1
+    row = out["items"][0]
+    for f in ("id", "text", "category", "source", "confidence",
+              "importance", "metadata", "created_at", "updated_at",
+              "expires_at"):
+        assert f in row, f
+    # derived embedding column is not exported
+    assert "embedding" not in row
+
+
+def test_export_reflects_deletion_and_persistence(tmp_path):
+    db = str(tmp_path / "mem.db")
+    s1 = PersistentMemoryStore(db)
+    a = s1.remember(_item("export survives restarts"))
+    b = s1.remember(_item("temporary note to forget"))
+    s1.forget(b.id)
+    # restart: reopen the same file
+    s2 = PersistentMemoryStore(db)
+    out = s2.export()
+    texts = [r["text"] for r in out["items"]]
+    assert "export survives restarts" in texts
+    assert "temporary note to forget" not in texts
+    assert out["count"] == 1
+
+
+def test_export_endpoint_live():
+    stack = build_stack()
+    client = TestClient(create_app(stack))
+    r = client.post("/v1/memory",
+                    json={"text": "endpoint export fixture note",
+                          "category": "notes", "importance": 0.9},
+                    headers=OP)
+    assert r.status_code == 200 and r.json()["stored"]
+    r2 = client.get("/v1/memory/export", headers=OP)
+    assert r2.status_code == 200
+    out = r2.json()
+    assert out["format"] == "zara-memory-export-1"
+    body = r2.text.lower()
+    # no secret-material in exports even if someone had tried to store it
+    assert "password" not in body and "apikey" not in body
+    for it in out["items"]:
+        assert "embedding" not in it

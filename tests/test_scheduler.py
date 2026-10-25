@@ -285,7 +285,14 @@ def test_S24_stack_scheduler_announces_and_audits():
     while not heard and _t.time() < deadline:
         _t.sleep(0.02)
     assert heard and heard[0].payload.get("job_id") == jid
+    # the audit row is written AFTER the bus publish (by design); poll
+    # for it instead of racing the write window
     rows = stack["audit"].query()
+    deadline = _t.time() + 5
+    while not any(r["actor"] == "scheduler" and r["action"] ==
+                  "timer_fired" for r in rows) and _t.time() < deadline:
+        _t.sleep(0.02)
+        rows = stack["audit"].query()
     assert any(r["actor"] == "scheduler" and r["action"] == "timer_fired"
                for r in rows), [(r["actor"], r["action"]) for r in rows][-5:]
 
@@ -405,7 +412,15 @@ def test_S41_due_timer_submits_one_safe_execution():
     jid = stack["sched"].schedule_once(
         "poll-battery", 0.02, {"exec": {"tool": "system.battery",
                                         "device_id": "cloud", "inputs": {}}})
-    assert _wait_for(lambda: len(stack["engine"]._records) == 1)
+    # _sched_fire creates the engine record BEFORE writing the
+    # dispatch_submitted audit row, so waiting on the record count can
+    # observe the record before the audit write lands (thread preemption
+    # under load). Wait on the evidence this test actually asserts.
+    def _submitted():
+        return any(r["actor"] == "scheduler" and
+                   r["action"] == "dispatch_submitted"
+                   for r in stack["audit"].query())
+    assert _wait_for(_submitted)
     recs = list(stack["engine"]._records.values())
     assert len(recs) == 1
     assert recs[0].binding.get("scheduled_job_id") == jid

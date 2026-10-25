@@ -92,9 +92,14 @@ class DeviceLifecycle {
         move(DeviceLifecycleState.revoked);
         return 'revoked';
       }
-      move(DeviceLifecycleState.error);
+      // Already in a safe state (revoked / logged-out / pairing / ...):
+      // repeated auth failures must be a NO-OP, and error is not
+      // reachable from every safe state (revoked -> error throws).
+      // Live crash recorded 2026-10-22: the thrown StateError escaped
+      // _tick and silently killed the poll loop — the device then
+      // looked present-but-frozen. Record, return, never throw.
       lastError = 'auth $statusCode';
-      return 'error';
+      return state;
     }
     if (statusCode == 404) return 'reregister';
     if (statusCode >= 500) {

@@ -335,6 +335,81 @@ def op_get_text(bus, req):
         return {"error": str(e)[:200]}
 
 
+# ---------------- read-batch (one spawn, N read-only ops) ----------------
+# Speed evidence (2026-10-20 benchmarks): a single spawn+connect dominates
+# one op (~40 ms) while the D-Bus work inside may be ~ms. The `multi` op
+# executes several READ-ONLY ops in ONE helper invocation: same ops, same
+# deadlines, same capping — state-changing ops (do_action / grab_focus /
+# set_text) are structurally excluded so batching can never reorder a
+# negative check before a write. Additive; every existing op is untouched.
+
+READ_DISPATCH = {"node": op_node, "tree": op_tree, "get_text": op_get_text}
+MAX_MULTI_OPS = 8
+_MULTI_OP_KEY = "multi"
+
+
+def op_apps(bus, req):
+    """Fast app-list read: registry children + Name ONLY (no tree walk).
+    Costs one roundtrip + one Name read per app (vs the full tree),
+    which is what bounded presence checks need after a launch."""
+    want = str(req.get("app_filter", "") or "").lower()
+    try:
+        max_apps = max(1, min(int(req.get("max_apps", 40)), 64))
+    except (TypeError, ValueError):
+        max_apps = 40
+    names, seen = [], 0
+    try:
+        children = _call(acc(bus, "org.a11y.atspi.Registry",
+                             "/org/a11y/atspi/accessible/root"),
+                         "GetChildren")
+    except Exception as e:
+        return {"apps": [], "registry_apps": 0, "error": str(e)[:160]}
+    for (bname, path) in children:
+        try:
+            nm = str(_call(props(bus, str(bname), str(path)), "Get",
+                           AI, "Name"))
+        except Exception:
+            continue
+        if want and want not in nm.lower():
+            continue
+        names.append(nm[:120])
+        if len(names) >= max_apps:
+            break
+    return {"apps": names, "registry_apps": len(children)}
+
+
+def op_multi(bus, req):
+    """Run N read-only child ops in one helper invocation. Each entry is
+    dispatched with the SAME validation and capping as a standalone
+    call; a child failure is recorded per-entry and never kills the
+    batch (deadline excepted)."""
+    ops = req.get("ops")
+    if not isinstance(ops, list) or not ops:
+        return {"results": [],
+                "error": "ops must be a non-empty list of read-only ops"}
+    if len(ops) > MAX_MULTI_OPS:
+        return {"results": [],
+                "error": "too many ops (%d > %d)"
+                         % (len(ops), MAX_MULTI_OPS)}
+    out = []
+    deadline = time.monotonic() + DEADLINE_S
+    for entry in ops:
+        if time.monotonic() > deadline:
+            out.append({"ok": False, "error": "batch deadline exceeded"})
+            continue
+        op_name = entry.get("op") if isinstance(entry, dict) else None
+        handler = READ_DISPATCH.get(op_name) if op_name else None
+        if handler is None:
+            out.append({"ok": False,
+                        "error": "unsupported child op (refused)"})
+            continue
+        try:
+            out.append({"ok": True, "result": handler(bus, entry)})
+        except Exception as e:  # noqa: BLE001 — per-entry, batch lives on
+            out.append({"ok": False, "error": str(e)[:200]})
+    return {"results": out}
+
+
 def bus_connect():
     try:
         sbus = dbus.SessionBus()
@@ -375,6 +450,10 @@ def main():
             res = op_set_text(bus, req)
         elif op == "get_text":
             res = op_get_text(bus, req)
+        elif op == "multi":
+            res = op_multi(bus, req)
+        elif op == "apps":
+            res = op_apps(bus, req)
         else:
             print(json.dumps({"ok": False, "error": "unknown op (refused)"}))
             return

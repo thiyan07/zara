@@ -159,6 +159,30 @@ def test_R_missing_telemetry_is_none_not_zero():
     assert d.last_telemetry_at is None
 
 
+def test_R_heartbeat_restores_online_after_stale_graceful_disconnect():
+    """A dying agent's disconnect can land after its successor's register
+    (both run during an agent restart). Heartbeats must then restore the
+    presence status — before the fix, status stayed 'offline' forever
+    while online=True, and every approval re-check failed closed
+    (observed live 2026-10-25)."""
+    m = DeviceManager()
+    d = m.register(DeviceState(device_id="d1", status="online",
+                               online=True))
+    assert d.status == "online"
+    m.mark_offline("d1")  # the late graceful disconnect
+    assert m.get("d1").status == "offline" and \
+        m.get("d1").online is False
+    d = m.heartbeat("d1")  # successor agent keeps heartbeating
+    assert d.status == "online" and d.online is True
+    from core.fabric import derive_presence
+    assert derive_presence(d.status, d.online, d.last_seen, 120.0) \
+        not in ("offline", "unknown", "stale")
+    # already-online heartbeats must not spam the event stream
+    before = d.status
+    m.heartbeat("d1")
+    assert m.get("d1").status == before
+
+
 def test_R_network_normalized_not_invented():
     m = DeviceManager()
     m.register(DeviceState(device_id="d1"))

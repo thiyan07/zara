@@ -198,7 +198,10 @@ def test_T5_submit_parks_without_approval_even_while_device_polls():
     poller = CadencePoller(stack["jobs"], dev)
     poller.start()
     try:
-        rec = stack["engine"].submit(INSPECT, {}, dev)
+        # Stage 30: INSPECT is read-only auto-allow now, so the
+        # never-pre-dispatch promise is pinned with a still-parking
+        # mutating tool (TAP on its RESTRICted lab allowlist).
+        rec = stack["engine"].submit(TAP, {"target_package": VICTIM}, dev)
         assert rec.state == ExecutionState.WAITING_FOR_PERMISSION
         time.sleep(0.8)  # > one full poll tick
         assert poller.poll_count >= 1

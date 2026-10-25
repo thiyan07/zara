@@ -233,9 +233,10 @@ def test_A07_expiry_terminal_and_bounded():
 def test_A08_cancel_before_claim():
     stack = make_stack()
     dev = paired_android(stack)
-    rec = stack["engine"].submit_async(INSPECT, {}, dev)
-    # Cancel before any poll tick: give the worker a moment to enqueue.
-    time.sleep(0.2)
+    rec = stack["engine"].submit_async(TAP, {"target_package": VICTIM}, dev)
+    # Stage 30: INSPECT is read-only auto-allow now, so a tool that still
+    # PARKS is used for the cancel-before-claim lifecycle (TAP). Cancelling
+    # while still parked means zero dispatch anywhere.
     stack["engine"].cancel(rec.id)
     fin = stack["engine"].get(rec.id)
     assert fin.state == ExecutionState.CANCELLED
@@ -328,8 +329,9 @@ def test_A14_confirm_tool_no_dispatch_before_approval():
     poller = CadencePoller(stack["jobs"], dev)
     poller.start()
     try:
-        rec = stack["engine"].submit_async(INSPECT, {}, dev)
-        # INSPECT is confirm-risk: parked, never dispatched pre-approval.
+        rec = stack["engine"].submit_async(TAP, {"target_package": VICTIM}, dev)
+        # Stage 30: use a still-parking tool (TAP); INSPECT is now
+        # read-only auto-allow and would dispatch directly.
         assert rec.state == ExecutionState.WAITING_FOR_PERMISSION
         time.sleep(0.8)
         assert poller.claim_time is None
@@ -422,8 +424,9 @@ def test_A19_http_submit_status_cancel_flow():
         poller.stop()
         poller.join(timeout=3)
     # Confirm tool parks → 202, then async-approve → running → success.
-    r2 = c.post("/v1/executions", json={"tool": INSPECT, "inputs": {},
-                                        "device_id": dev}, headers=OP)
+    r2 = c.post("/v1/executions", json={
+        "tool": TAP, "inputs": {"target_package": VICTIM},
+        "device_id": dev}, headers=OP)
     assert r2.status_code == 202, r2.text
     eid2 = r2.json()["id"]
     assert r2.json()["job_id"] is None  # no dispatch before approval

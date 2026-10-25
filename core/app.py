@@ -1,11 +1,14 @@
 """FastAPI gateway: REST + WebSocket. Device-token gate (Stage 2: per-device auth)."""
 from __future__ import annotations
+import hashlib
 import os
 import queue
 import threading
 import time
+import uuid
 from typing import Optional
-from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket
+from fastapi import (Depends, FastAPI, Header, HTTPException, Query,
+                     Request, WebSocket)
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
@@ -27,7 +30,7 @@ from .llm import LLMError, LLMErrorKind
 from .memory import MemoryStore, PersistentMemoryStore
 from .memory_policy import MemoryService
 from .missions import MissionEngine, MissionState
-from .models import DeviceKind, DeviceState, MemoryItem
+from .models import DeviceKind, DeviceState, MemoryItem, utcnow
 from .notifications import NotificationManager
 from .policy import PolicyEngine
 from .protocol import CapabilityUpdate, ExecutionResult, HeartbeatPayload
@@ -44,6 +47,13 @@ from .scheduler import Scheduler
 from .tools import ToolDefinition, ToolRegistry
 
 TOKEN = os.environ.get("ASSISTANT_TOKEN", "dev-token")
+
+# Server-side job long poll: max hold per request. Bounded below the
+# Android battery-saver poll gap (60 s) so a held poll can never delay
+# that device's other tick work by more than the deliberate cadence; and
+# below the 90 s drone proxy wait (invariant: proxy wait > poll gap —
+# tests/test_job_timing.py::test_T0).
+AGENT_JOB_LONGPOLL_MAX_S = 30.0
 
 
 class ChatIn(BaseModel):
@@ -160,6 +170,24 @@ class IntentTurnIn(BaseModel):
     who: str = "user"
 
 
+class PlanStepIn(BaseModel):
+    capability: str
+    parameters: dict = Field(default_factory=dict)
+    fetch: dict = Field(default_factory=dict)
+    preferred_device: str = ""
+
+
+class PlanIn(BaseModel):
+    """Typed multi-step plan submission. This is a structured input
+    surface for the SAME deterministic plan chain the NL path uses —
+    never a second engine: every step is independently resolved and run
+    through resolver -> policy -> approval -> fabric execution."""
+    utterance: str = ""
+    requester_device: str = ""
+    who: str = "user"
+    steps: list[PlanStepIn]
+
+
 class SessionCreateIn(BaseModel):
     device_id: str = ""
     who: str = "user"
@@ -182,6 +210,19 @@ class MissionIn(BaseModel):
     device_id: Optional[str] = None
 
 
+class MessagingSendIn(BaseModel):
+    snapshot: dict = {}
+    conversation: str = ""
+    text: str = ""
+    device_id: str = ""
+    mission_id: str = ""
+    who: str = "user"
+
+
+class MessagingApproveIn(BaseModel):
+    who: str = "user"
+
+
 class DispatchIn(BaseModel):
     tool: str
     inputs: dict = {}
@@ -196,6 +237,11 @@ class EnrollIn(BaseModel):
 
 class ClaimIn(BaseModel):
     pairing_code: str
+    pubkey: str = ""  # optional Ed25519 public key (hex) for challenge auth
+
+
+class PubkeyIn(BaseModel):
+    pubkey: str = ""  # Ed25519 public key (hex); empty unbinds
 
 
 class AgentRegisterIn(BaseModel):
@@ -305,6 +351,7 @@ def _make_embedder():
 
 def build_stack(memory_db: str = "", audit_db: str = ":memory:",
                 mission_db: str = "", fabric_db: str = "",
+                device_auth_db: str = "",
                 scheduler_db: str = ""):
     bus = EventBus()
     audit = AuditLog(audit_db)
@@ -312,6 +359,12 @@ def build_stack(memory_db: str = "", audit_db: str = ":memory:",
     registry = ToolRegistry()
     for definition, handler in BUILTINS:
         registry.register(definition, handler)
+    # Stage 20: universal connected-device awareness. Registry seeded
+    # here; a bounded background poller (ZARA_PERIPHERAL_POLL_S,
+    # default off for tests, 12 s typical for the hosted Core) keeps
+    # discovery fresh. Detection never grants trust or executes
+    # anything; it only updates the registry and emits events.
+    from .discovery import PeripheralRegistry, seed_registry
     jobs = JobQueue()
     register_device_proxies(registry, jobs)
     from .opencode_tools import OPENCODE_TOOLS as _OT
@@ -320,7 +373,19 @@ def build_stack(memory_db: str = "", audit_db: str = ":memory:",
     from .browser_tools import BROWSER_TOOLS as _BT
     for _d, _h in _BT:
         registry.register(_d, _h)
-    device_auth = DeviceAuthStore()
+    # Per-device credential persistence (ZARA_DEVICE_AUTH_DB): a paired
+    # device's stored key keeps verifying across a Core restart, so the
+    # secure-storage key on the device reconnects WITHOUT re-pairing.
+    # Empty = in-memory (tests / ephemeral servers).
+    if device_auth_db:
+        from .device_auth import PersistentDeviceAuthStore as _PDA
+        device_auth = _PDA(device_auth_db)
+    else:
+        device_auth = DeviceAuthStore()
+    # Single-use proof-of-possession challenges (memory only; a Core
+    # restart invalidates them and devices re-challenge or fall back).
+    from .device_auth import ChallengeStore as _CS
+    auth_challenges = _CS()
     events_log: list[dict] = []
     bus.subscribe("*", lambda ev: events_log.append(ev.model_dump()))
     engine = ExecutionEngine(registry, policy,
@@ -339,6 +404,19 @@ def build_stack(memory_db: str = "", audit_db: str = ":memory:",
     memory_service = MemoryService(memory)
     ctx = ContextManager()
     def _sched_fire(job: dict) -> None:
+        # Stage 24i first: a reminder job payload is handled by the
+        # ReminderService (notification delivery + recurring re-arm),
+        # NOT the exec announce/dispatch path below. The service keeps
+        # its own delivery ledger, so hook availability is never a
+        # correctness dependency (recovery re-delivers from the
+        # reminders table).
+        _payload0 = job.get("payload") or {}
+        if isinstance(_payload0.get("reminder"), dict):
+            try:
+                reminders.on_fire(job)
+            except Exception:  # noqa: BLE001 — hook kills nothing
+                pass
+            return
         # Announce + authorized dispatch requests. The timer itself never
         # executes anything: a fired job with an "exec" payload is offered
         # to the NORMAL engine submit path (policy re-decided, approvals
@@ -417,6 +495,15 @@ def build_stack(memory_db: str = "", audit_db: str = ":memory:",
             pass
     sched = Scheduler(on_fire=_sched_fire, db_path=scheduler_db)
     notifs = NotificationManager(on_event=lambda t, p: bus.publish(t, source="notifications", payload=p))
+    # Stage 24i: NL reminders on the EXISTING scheduler + notifications.
+    # ZARA_REMINDERS_DB names a file for restart persistence; unset =
+    # process-local (tests). The service re-delivers/le-arms from its
+    # own table at construction, so hook availability is never a
+    # correctness dependency.
+    from .reminders import ReminderService as _ReminderService
+    reminders = _ReminderService(
+        sched, notifs, audit,
+        db_path=_db_path("ZARA_REMINDERS_DB"))
     from .push import PushRegistry as _PushRegistry
     push = _PushRegistry()
     gov = ResourceGovernor()
@@ -571,15 +658,106 @@ def build_stack(memory_db: str = "", audit_db: str = ":memory:",
     # otherwise the deterministic local parser serves offline.
     from .intent import (CompositeIntentParser, HostedIntentParser,
                          IntentTurnService, LocalIntentParser)
+    from .call_flow import CallFlow, SmsFlow
+    from .otp_flow import OtpFlow
+    from .photo_flow import PhotoFlow
+    from .clipboard_flow import ClipboardFlow
+    from .calendar_flow import CalendarFlow
+    from .weather_flow import WeatherFlow
+    from .morning_brief import MorningBriefFlow
     _hosted = None
     try:
         if getattr(model, "name", "echo") not in ("echo",):
             _hosted = HostedIntentParser(model)
     except Exception:  # noqa: BLE001 — local-only fallback
         _hosted = None
+    # Mission-bound single-approval messaging: extends the existing
+    # execution/policy/audit stack (never a parallel one). The send ledger
+    # persists across restarts only when ZARA_MESSAGING_DB names a file.
+    from .messaging import (MessagingApprovalStore as _MsgApprovals,
+                            MessagingWorkflow as _MsgWorkflow,
+                            SendLedger as _SendLedger)
+    _msg_db = _os.environ.get("ZARA_MESSAGING_DB", "")
+    messaging = _MsgWorkflow(
+        fabric, missions=missions, audit=audit, resolver=resolver,
+        ledger=_SendLedger(path=_msg_db) if _msg_db else _SendLedger(),
+        approvals=_MsgApprovals())
     intent_service = IntentTurnService(
         fabric, resolver,
-        CompositeIntentParser(LocalIntentParser(), _hosted), audit)
+        CompositeIntentParser(LocalIntentParser(), _hosted), audit,
+        missions, messaging, reminders, CallFlow(
+            fabric, resolver, engine, memory_service, audit, devices),
+        SmsFlow(fabric, resolver, engine, memory_service, audit,
+                devices), OtpFlow(fabric, engine, audit),
+                PhotoFlow(fabric, engine, audit),
+                ClipboardFlow(fabric, engine, audit),
+                CalendarFlow(audit),
+                WeatherFlow(audit))
+    # P5 ⑮: the brief is composed FROM the two read flows above plus
+    # system_health — pass the live instances so sections reuse the
+    # exact tested reads (never a parallel implementation).
+    intent_service.morning_brief_flow = MorningBriefFlow(
+        audit, intent_service.calendar_flow,
+        intent_service.weather_flow, reminders=reminders)
+    # P6-b27: named recurring routines on the SAME scheduler +
+    # notifications as reminders (one live job each, audited), plus
+    # the weekly review — a read-only composite that reuses the
+    # calendar flow's tested week digest, conflicts_on_date, the
+    # reminder store, and the routine list. Nothing here executes.
+    from .routines import RoutineService as _RoutineService, \
+        RoutineFlow as _RoutineFlow
+    routines = _RoutineService(
+        sched, notifs, audit, db_path=_db_path("ZARA_ROUTINES_DB"))
+    intent_service.routines_flow = _RoutineFlow(routines)
+    from .weekly_review import WeeklyReviewFlow as _WeeklyReviewFlow
+    intent_service.weekly_review_flow = _WeeklyReviewFlow(
+        audit, intent_service.calendar_flow, reminders=reminders,
+        routines=routines)
+    # P6-b28: chat ledgers (water/expenses/grocery/meals/habits/
+    # medication) — the user's own diary in one additive sqlite table.
+    # Writes are data-only (deterministic parse, audited, no
+    # execution authority); the weekly review's chat-logs line reads
+    # the SAME service so the totals can never drift.
+    from .ledgers import LedgerService as _LedgerService, \
+        LedgerFlow as _LedgerFlow
+    ledgers = _LedgerService(audit,
+                             db_path=_db_path("ZARA_LEDGERS_DB"))
+    intent_service.ledger_flow = _LedgerFlow(ledgers)
+    intent_service.weekly_review_flow.ledgers = ledgers
+    # P6-b29: capture routing (GTD bridge: capture → file → buckets)
+    # + the READ-ONLY mail wire (dormant until ZARA_IMAP_* config;
+    # never marks \Seen, never drafts — user rule).
+    from .capture import CaptureStore as _CaptureStore, \
+        CaptureFlow as _CaptureFlow
+    capture = _CaptureStore(audit,
+                            db_path=_db_path("ZARA_CAPTURE_DB"))
+    intent_service.capture_flow = _CaptureFlow(capture)
+    intent_service.weekly_review_flow.capture = capture
+    # batch-32 (2026-10-26): habit chains adopt the uhabits streak
+    # design (marks on days, scheduled-day runs, honest closed-chain
+    # reporting); persist in their own WAL sqlite so restarts keep
+    # the chains (start_core.sh exports ZARA_HABITS_DB).
+    from .habits import HabitService as _HabitService, \
+        HabitsFlow as _HabitsFlow
+    habits = _HabitService(audit,
+                           db_path=_db_path("ZARA_HABITS_DB"))
+    intent_service.habits_flow = _HabitsFlow(habits)
+    intent_service.weekly_review_flow.habits = habits
+    from .mail_wire import MailWire as _MailWire, MailFlow as _MailFlow
+    intent_service.mail_flow = _MailFlow(_MailWire(audit))
+    # P6-b30: the meeting scheduler — proposes CalendarFlow's tested
+    # free windows, books ONLY on an explicit pick, and every booking
+    # still goes through engine.submit + the CONFIRM approval.
+    from .schedule_flow import ScheduleFlow as _ScheduleFlow
+    intent_service.schedule_flow = _ScheduleFlow(
+        engine, intent_service.calendar_flow, devices, audit)
+    loop.intent_fastpath = intent_service.conversational_fastpath
+    # Stage 24h: mission-bound record adoption. When a mission-bound
+    # execution reaches SUCCEEDED, the parked plan adopts the outcome
+    # immediately (bookkeeping only) so a Core restart never loses the
+    # fact that the approved step ran. Records stay in-memory; the
+    # mission store persists.
+    engine.set_mission_adopt(intent_service.adopt_mission_record)
     # Stage 19: persistent conversation sessions (context only; the
     # resolver + policy/governor/execution stay authoritative). DB path
     # from ZARA_SESSION_DB; memory mode when unset (tests).
@@ -602,17 +780,115 @@ def build_stack(memory_db: str = "", audit_db: str = ":memory:",
     delegation = _DelegationStore(_delegation_path or ":memory:")
     _configure_deleg(delegation)
     _recover_deleg(delegation)
+    peripherals = PeripheralRegistry(
+        on_event=lambda t, p, b: bus.publish(
+            t, source="peripherals", payload=b))
+    seed_registry(peripherals)
+
+    class _PeripheralPoller:
+        """Bounded polling loop for host discovery. Runs only when
+        ZARA_PERIPHERAL_POLL_S > 0; daemon thread, quiet errors."""
+        def __init__(self, interval_s: float) -> None:
+            self.interval = max(2.0, interval_s)
+            self._stop = threading.Event()
+            self._t = threading.Thread(target=self._loop, daemon=True)
+
+        def _loop(self) -> None:
+            while not self._stop.is_set():
+                refresh_host(peripherals)
+                self._stop.wait(self.interval)
+
+        def start(self) -> None:
+            self._t.start()
+
+        def stop(self) -> None:
+            self._stop.set()
+            self._t.join(timeout=2.0)
+
+    _poll_s = 0.0
+    try:
+        _poll_s = float(_os.environ.get("ZARA_PERIPHERAL_POLL_S", "0"))
+    except ValueError:
+        _poll_s = 0.0
+    poller = None
+    if _poll_s > 0:
+        poller = _PeripheralPoller(_poll_s)
+        poller.start()
+    # ---- Stage 21: cross-device file-transfer missions ----
+    from .transfer_missions import FileTransferMissionRunner
+    from .transfer_state import set_runner
+
+    def _tm_execute(tool, inputs, device_id, mission_id=""):
+        """The production funnel: every hop goes through the same
+        ExecutionEngine.submit the natural-language path uses (policy
+        re-decided per hop, approval parking surfaced, fabric
+        dispatch, audit). Bytes never ride this call — hops stay
+        under the input-size envelope by design."""
+        from .execution import ExecutionState
+        rec = engine.submit(tool, inputs, device_id=device_id,
+                            who="user",
+                            mission_id=mission_id or None)
+        if rec.state == ExecutionState.WAITING_FOR_PERMISSION:
+            return {"ok": False, "parked": True, "exec_id": rec.id,
+                    "error": rec.error or "approval required"}
+        if rec.state == ExecutionState.FAILED:
+            return {"ok": False, "error": rec.error or "failed",
+                    "detail": rec.result if isinstance(
+                        rec.result, dict) else {}}
+        if rec.state not in (ExecutionState.COMPLETED,
+                             ExecutionState.RUNNING,
+                             ExecutionState.PENDING):
+            return {"ok": False, "error": rec.error or "no result"}
+        out = rec.result if isinstance(rec.result, dict) else {}
+        return out
+
+    def _tm_resolve(hint: str):
+        hint = (hint or "").strip().lower()
+        try:
+            devs = devices.list()
+        except Exception:
+            return None, False
+        for d in devs:
+            did = (d.device_id or "").lower()
+            if hint and (did == hint or hint in did):
+                return d, d.status == "online"
+        want = {"laptop": "LINUX", "phone": "ANDROID"}.get(hint)
+        if not want:
+            return None, False
+        for d in devs:
+            if d.kind.value == want:
+                return d, d.status == "online" or d.online
+        return None, False
+
+    def _tm_audit(action, target, detail=""):
+        audit.record("system", action, target,
+                     f"{detail}"[:280])
+        bus.publish("transfer_mission_" + action.split("_")[-1],
+                    source="transfer-missions", payload={
+                        "mission_id": target, "detail": detail})
+
+    runner = FileTransferMissionRunner(
+        missions, xfer, bus=bus, execute=_tm_execute,
+        resolve_device=_tm_resolve, audit=_tm_audit)
+    set_runner(runner)
+
     return {"bus": bus, "audit": audit, "policy": policy, "registry": registry,
+            "auth_challenges": auth_challenges,
             "engine": engine, "missions": missions, "devices": devices,
             "memory": memory, "memory_service": memory_service,
             "ctx": ctx, "sched": sched, "notifs": notifs,
+            "reminders": reminders,
             "gov": gov, "model": model, "events_log": events_log,
             "jobs": jobs, "device_auth": device_auth, "router": router,
             "sessions": sessions, "tracer": tracer, "loop": loop,
             "voice": voice, "wake": wake, "limits": limits, "push": push,
             "fabric": fabric, "xfer": xfer, "resolver": resolver,
             "intent": intent_service, "session": session_service,
-            "delegation": delegation}
+            "messaging": messaging,
+            "delegation": delegation, "peripherals": peripherals,
+            "peripheral_poller": poller,
+            "transfer_runner": runner}
+
 
 def create_app(stack=None) -> FastAPI:
     s = stack or build_stack()
@@ -630,6 +906,34 @@ def create_app(stack=None) -> FastAPI:
         _max_body = int(os.environ.get("ZARA_MAX_BODY_BYTES", "5242880"))
     except ValueError:
         _max_body = 5242880
+
+    # Insecure-transport rejection (production). When ZARA_REQUIRE_HTTPS=1,
+    # any non-loopback plain-HTTP connection is refused: Core explicitly
+    # refuses to downgrade. HTTPS (direct or via a local TLS-terminating
+    # proxy announcing x-forwarded-proto: https) is required; loopback
+    # http stays allowed for same-host development clients. Signature
+    # proofs protect device identity, never wire confidentiality — that
+    # is TLS's job (docs/TRANSPORT_TLS.md).
+    _require_https = os.environ.get("ZARA_REQUIRE_HTTPS", "0") == "1"
+
+    @app.middleware("http")
+    async def strict_transport(request, call_next):
+        if _require_https:
+            host = request.client.host if request.client else ""
+            loopback = host in ("127.0.0.1", "::1", "localhost", "testclient")
+            scheme = request.url.scheme
+            fwd = request.headers.get("x-forwarded-proto", "")
+            secure = scheme == "https" or (
+                loopback and fwd == "") or fwd == "https"
+            # A spoofable forwarded-proto header flagging non-HTTPS is a
+            # downgrade attempt — reject rather than trust it.
+            if not secure or (fwd and fwd != "https"):
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": "insecure transport refused: "
+                                       "TLS required (ZARA_REQUIRE_HTTPS=1);"
+                                       " see docs/TRANSPORT_TLS.md"})
+        return await call_next(request)
 
     @app.middleware("http")
     async def body_limit(request, call_next):
@@ -709,7 +1013,13 @@ def create_app(stack=None) -> FastAPI:
 
     @app.post("/v1/exec")
     def exec_tool(body: ExecIn, _=Depends(auth)):
-        tool = s["registry"].get(body.tool)
+        try:
+            tool = s["registry"].get(body.tool)
+        except KeyError:
+            s["audit"].record("api", "exec_reject", body.tool,
+                              "unknown tool"[:300])
+            raise HTTPException(status_code=404,
+                                detail=f"unknown tool: {body.tool}"[:200])
         dev = None
         try:
             dev = s["devices"].get(body.device_id)
@@ -983,9 +1293,36 @@ def create_app(stack=None) -> FastAPI:
     def list_missions(_=Depends(auth)):
         return [m.model_dump() for m in s["missions"].list()]
 
+    @app.get("/v1/missions/{mid}")
+    def get_mission(mid: str, _=Depends(auth)):
+        try:
+            return s["missions"].get(mid).model_dump()
+        except KeyError:
+            raise HTTPException(status_code=404,
+                                detail=f"unknown mission: {mid}")
+
     @app.post("/v1/missions/{mid}/transition")
     def mission_transition(mid: str, to: MissionState, _=Depends(auth)):
         return s["missions"].transition(mid, to).model_dump()
+
+    # ---- Plan continuation (Stage 24g) ----
+
+    @app.post("/v1/missions/{mid}/continue")
+    def continue_mission(mid: str, _=Depends(auth)):
+        """Continue a plan parked at WAITING_FOR_PERMISSION. Authority
+        stays exactly where it was: the continuation re-enters the
+        same per-step pipeline (resolver -> policy -> governor ->
+        fabric.execute -> verification), the held step is never
+        re-executed (its real execution record is inspected first),
+        and a mid-continuation approval parks the mission again."""
+        out = s["intent"].resume_plan(mid, "api")
+        code = 404 if "No mission with reference" in (out.get("message")
+                                                     or "") else 200
+        s["audit"].record("api", "mission_continue", mid,
+                          str(out.get("executed", False)))
+        if code != 200:
+            raise HTTPException(status_code=code, detail=out["message"])
+        return out
 
     @app.post("/v1/devices")
     def register_device(dev: DeviceState, _=Depends(auth)):
@@ -1273,9 +1610,11 @@ def create_app(stack=None) -> FastAPI:
 
     @app.post("/v1/intent/turn")
     def intent_turn(body: IntentTurnIn, _=Depends(auth)):
-        """Full intent turn: parse -> resolve -> message, executing ONLY
-        safe resolved intents through the existing fabric execution path.
-        Approval-gated or blocked intents return honest messages."""
+        """Full intent turn: parse -> resolve -> message, executing safe
+        resolved intents through the existing fabric execution path.
+        Multi-step plans run step-by-step with per-step authorization;
+        approval-gated or blocked steps stop the plan with an honest
+        message (later steps never run speculatively)."""
         if not isinstance(body.utterance, str) or \
                 len(body.utterance) > 2000:
             raise HTTPException(status_code=400,
@@ -1284,6 +1623,90 @@ def create_app(stack=None) -> FastAPI:
             body.utterance[:2000], body.who or "user",
             body.requester_device or "")
         return out
+
+    @app.post("/v1/intent/plan")
+    def intent_plan(body: PlanIn, _=Depends(auth)):
+        """Execute a STRUCTURED multi-step plan through the deterministic
+        chain the NL path uses: per-step resolve -> policy -> approval
+        holds -> fabric execution + verification, tracked as ONE mission.
+        Typed result bindings ("fetch") let a step consume validated
+        values from an earlier step's result; the registry schema and the
+        per-step determinstic checks remain final. Bounded by the same
+        MAX_STEPS / fetch limits as parsed plans."""
+        from core.intent import (MAX_STEPS, MAX_UTTERANCE,
+                                 IntentRejected, IntentProposal,
+                                 build_context)
+        steps = [st.model_dump() for st in (body.steps or [])]
+        if not steps:
+            raise HTTPException(status_code=400,
+                                detail="plan needs at least one step")
+        if len(steps) > MAX_STEPS:
+            raise HTTPException(status_code=400,
+                                detail=f"plan too long (max {MAX_STEPS})")
+        proposal = IntentProposal(
+            request_id=uuid.uuid4().hex[:12],
+            utterance=(body.utterance or "structured plan")[:MAX_UTTERANCE],
+            capability=steps[0]["capability"],
+            preferred_device=steps[0].get("preferred_device", ""),
+            steps=steps, confidence=0.9, needs_clarification=False,
+            source="structured")
+        try:
+            proposal.validate_proposal()
+        except IntentRejected as e:
+            raise HTTPException(status_code=400,
+                                detail=f"plan rejected: {e}") from e
+        ctx = build_context(s["fabric"], body.requester_device or "")
+        return s["intent"]._run_plan(
+            proposal, ctx, body.who or "user", body.requester_device or "")
+
+    # ---- Mission-bound single-approval messaging ----
+
+    @app.post("/v1/messaging/send")
+    def messaging_send(body: MessagingSendIn, _=Depends(auth)):
+        """Present ONE approval for the whole send sequence. Read-only:
+        executes nothing. The approval binds mission, recipient, exact
+        text, device, and the action sequence; any change invalidates it.
+        `snapshot` is optional: when supplied, the conversation is
+        pre-verified; when absent, it is resolved from a fresh snapshot
+        inside the approved execution (still one approval)."""
+        if not isinstance(body.conversation, str) or not body.conversation:
+            raise HTTPException(status_code=400,
+                                detail="conversation is required")
+        if not isinstance(body.text, str) or not body.text.strip():
+            raise HTTPException(status_code=400, detail="text is required")
+        return s["messaging"].request_send(
+            snapshot=body.snapshot if isinstance(body.snapshot, dict) else {},
+            conversation=body.conversation[:200], text=body.text[:500],
+            device_id=body.device_id[:128], mission_id=body.mission_id[:64],
+            who=body.who or "user")
+
+    @app.post("/v1/messaging/approvals/{approval_id}/approve")
+    def messaging_approve(approval_id: str, body: MessagingApproveIn,
+                          _=Depends(auth)):
+        """Approve and execute ONLY the bound plan: open conversation ->
+        compose -> send -> verify, each through the existing fabric path.
+        Reports succeeded / uncertain / failed / blocked / stale /
+        cancelled / duplicate — never a fake success, never an auto-retry
+        after a potentially-successful send."""
+        return s["messaging"].approve(approval_id, body.who or "user")
+
+    @app.post("/v1/messaging/approvals/{approval_id}/cancel")
+    def messaging_cancel(approval_id: str, _=Depends(auth)):
+        return s["messaging"].cancel(approval_id)
+
+    @app.get("/v1/messaging/approvals/{approval_id}")
+    def messaging_status(approval_id: str, _=Depends(auth)):
+        out = s["messaging"].status(approval_id)
+        if out.get("status") == "missing":
+            raise HTTPException(status_code=404, detail="unknown approval")
+        return out
+
+    @app.get("/v1/messaging/approvals")
+    def messaging_pending(_=Depends(auth)):
+        """Redacted pending messaging approvals (companion surface):
+        never plaintext, never the binding fingerprint; bounded list."""
+        pend = s["messaging"].approvals.list_pending()
+        return {"approvals": pend, "count": len(pend)}
 
     # ---- Stage 19: persistent conversation sessions (context only) ----
 
@@ -1404,9 +1827,95 @@ def create_app(stack=None) -> FastAPI:
                  "score": sc}
                 for m, sc in s["memory"].recall(q, top_k)]
 
+    @app.get("/v1/memory/export")
+    def export_memory(_=Depends(auth)):
+        """Documented complete export of ordinary memory:
+        `{"format": "zara-memory-export-1", "exported_at": <utc iso>,
+        "items": [ {id, category, text, source, confidence, importance,
+        metadata, created_at, updated_at, expires_at} ... sorted ] }.
+        Secrets/refused credentials never appear (they never enter RAG
+        memory); embeddings are derived data, excluded by design; a
+        forgotten item is gone from every later export. This file is
+        the user-visible truth of what Zara remembers."""
+        out = s["memory"].export()
+        out["exported_at"] = utcnow().isoformat()
+        return out
+
     @app.get("/v1/events")
     def events(type: Optional[str] = None, limit: int = 50, _=Depends(auth)):
         return [e.model_dump() for e in s["bus"].history(type, limit)]
+
+    # ---- Stage 20: connected-peripheral awareness (read-only) ----
+
+    @app.get("/v1/peripherals")
+    def peripherals_list(state: str = "present", _=Depends(auth)):
+        reg = s["peripherals"]
+        if state not in ("present", "removed", "all"):
+            return {"error": "state must be present/removed/all"}
+        return {"devices": [d.to_public() for d in reg.list(
+            None if state == "all" else state)],
+            "trust_note": "detection is not trust"}
+
+    @app.post("/v1/peripherals/refresh")
+    def peripherals_refresh(_=Depends(auth)):
+        from .discovery import refresh_host
+        diff, meta = refresh_host(s["peripherals"])
+        return {"diff": diff, "meta": meta}
+
+    @app.get("/v1/peripherals/events")
+    def peripherals_events(limit: int = 50, _=Depends(auth)):
+        return s["peripherals"].events(limit=limit)
+
+    # ---- Stage 21: cross-device file-transfer missions -------------
+    _tmr = s.get("transfer_runner")
+
+    @app.post("/v1/transfer-missions", status_code=201)
+    def transfer_missions_start(body: dict, _=Depends(auth)):
+        from .transfer_missions import MissionSpecError as _MSE
+        if _tmr is None:
+            return {"error": "transfer missions not wired in this build"}
+        spec = body.get("spec") if isinstance(body, dict) else None
+        if spec is not None and not isinstance(spec, dict):
+            from fastapi import HTTPException
+            raise HTTPException(400, "spec must be an object")
+        try:
+            return _tmr.start(spec)
+        except _MSE as e:
+            from fastapi import HTTPException
+            raise HTTPException(400, str(e)[:300])
+
+    @app.get("/v1/transfer-missions")
+    def transfer_missions_list(_=Depends(auth)):
+        try:
+            from .builtin_tools import transfer_status
+            return transfer_status({}, {})
+        except Exception as e:  # noqa: BLE001 — status is read-only
+            return {"error": str(e)[:200]}
+
+    @app.get("/v1/transfer-missions/{mission_id}")
+    def transfer_mission_get(mission_id: str, _=Depends(auth)):
+        try:
+            return _tmr._missions.get(mission_id).model_dump(mode="json")
+        except KeyError:
+            return {"error": "unknown mission"}
+
+    @app.post("/v1/transfer-missions/{mission_id}/resume")
+    def transfer_mission_resume(mission_id: str, _=Depends(auth),
+                                body: dict | None = None):
+        if _tmr is None:
+            return {"error": "transfer missions not wired in this build"}
+        patch = (body or {}).get("spec_patch")
+        if patch is not None and not isinstance(patch, dict):
+            from fastapi import HTTPException
+            raise HTTPException(400, "spec_patch must be an object")
+        return _tmr.resume(mission_id, spec_patch=patch)
+
+    @app.post("/v1/transfer-missions/{mission_id}/cancel")
+    def transfer_mission_cancel(mission_id: str, _=Depends(auth)):
+        if _tmr is None:
+            return {"error": "transfer missions not wired in this build"}
+        return _tmr.cancel(mission_id)
+
 
     @app.get("/v1/audit")
     def audit(limit: int = 50, _=Depends(auth)):
@@ -1713,13 +2222,118 @@ def create_app(stack=None) -> FastAPI:
 
     # ---- Stage 2: device protocol (additive) ----
 
-    async def agent_auth(x_device_id: Optional[str] = Header(None),
-                        x_device_key: Optional[str] = Header(None)):
-        if not x_device_id or not x_device_key:
-            raise HTTPException(status_code=401, detail="device credentials required")
+    async def agent_auth(request: Request,
+                         x_device_id: Optional[str] = Header(None),
+                         x_device_key: Optional[str] = Header(None),
+                         x_device_nonce: Optional[str] = Header(None),
+                         x_device_proof: Optional[str] = Header(None)):
+        """Two additive modes, same trust outcome:
+        - raw key (unchanged default): X-Device-Id + X-Device-Key,
+        - challenge proof (replay-resistant): X-Device-Id + a one-time
+          server nonce + an Ed25519 signature from the device's
+          registered key over the canonical message
+          v2: "{METHOD} {path} {nonce} {sha256_hex(body)}"
+          v1 (compat fallback): "{METHOD} {path} {nonce}"
+          The body hash binds the proof to exact request bytes; the path
+          excludes any query string. The raw key itself never travels on
+          these calls. Mixing both credential styles in one request is
+          refused (ambiguous, not weaker)."""
+        if not x_device_id:
+            raise HTTPException(status_code=401,
+                                detail="device credentials required")
+        if x_device_proof and x_device_key:
+            raise HTTPException(
+                status_code=401, detail="ambiguous device credentials: "
+                "send either X-Device-Key or a challenge proof, not both")
+        if x_device_proof or x_device_nonce:
+            if not s["device_auth"].challenge_ready(x_device_id):
+                raise HTTPException(
+                    status_code=403,
+                    detail="challenge auth unavailable for this device "
+                           "(no signing key bound): use X-Device-Key once, "
+                           "then POST /v1/agent/pubkey")
+            if not (x_device_proof and x_device_nonce):
+                raise HTTPException(status_code=401,
+                                    detail="challenge proof incomplete")
+            if not s["auth_challenges"].consume(x_device_id,
+                                                x_device_nonce):
+                raise HTTPException(
+                    status_code=401,
+                    detail="challenge expired, used, or unknown: request "
+                           "a fresh one (POST /v1/agent/challenge)")
+            # Consume happens BEFORE proof verification: fail-closed —
+            # a bad proof still burns the nonce, so an attacker (or a
+            # buggy client) can never retry the same one.
+            raw_body = await request.body()
+            body_sha = hashlib.sha256(raw_body).hexdigest()
+            device_auth = s["device_auth"]
+            msg_v2 = f"{request.method} {request.url.path} " \
+                     f"{x_device_nonce} {body_sha}"
+            msg_v1 = f"{request.method} {request.url.path} {x_device_nonce}"
+            verified = (device_auth.verify_challenge(
+                            x_device_id, x_device_nonce, x_device_proof,
+                            msg_v2)
+                        or device_auth.verify_challenge(
+                            x_device_id, x_device_nonce, x_device_proof,
+                            msg_v1))
+            if not verified:
+                raise HTTPException(
+                    status_code=403, detail="invalid challenge proof")
+            return x_device_id
+        if not x_device_key:
+            raise HTTPException(status_code=401,
+                                detail="device credentials required")
         if not s["device_auth"].verify(x_device_id, x_device_key):
-            raise HTTPException(status_code=403, detail="invalid/revoked device identity")
+            raise HTTPException(status_code=403,
+                                detail="invalid/revoked device identity")
         return x_device_id
+
+    @app.post("/v1/agent/challenge")
+    def agent_challenge(device_id: str = Depends(agent_auth)):
+        """Mint ONE single-use auth challenge (the nonce consumed by this
+        request's own proof) plus a chained SPARE the device can use to
+        fetch the NEXT challenge by proof — so the raw device key needs
+        to travel exactly once per process lifetime (or again only after
+        expiry/revocation/restart). Returns {"nonce", "next_nonce"}; the
+        calls sign f"{METHOD} {path} {nonce} {sha256(body)}"
+        (v2 canonical; "{METHOD} {path} {nonce}" v1 still accepted for
+        compatibility). Path binding scoping plus the body-hash binding
+        (v2) make each nonce valid for exactly one request shape."""
+        if not s["device_auth"].challenge_ready(device_id):
+            raise HTTPException(
+                status_code=409,
+                detail="no signing key bound for challenge auth: "
+                       "POST /v1/agent/pubkey first")
+        nonce = s["auth_challenges"].mint(device_id)
+        s["audit"].record("device", "auth_challenge", device_id, "")
+        return {"device_id": device_id, "nonce": nonce,
+                "next_nonce": s["auth_challenges"].mint(device_id),
+                "ttl_s": s["auth_challenges"].TTL_S,
+                "message_format":
+                    "{METHOD} {path} {nonce} {body_sha256_hex}"}
+
+    @app.post("/v1/agent/pubkey")
+    def agent_pubkey(device_id: str = Depends(agent_auth),
+                     x_device_key: Optional[str] = Header(None),
+                     body: PubkeyIn = None):
+        """Bind (or upgrade to) the device's Ed25519 challenge-signing
+        key. Raw-key auth is REQUIRED for this binding — a proof cannot
+        prove an unregistered key — so possession of the secret device
+        key authorizes the binding, exactly like every raw-key request."""
+        if device_id and x_device_key is None:
+            raise HTTPException(
+                status_code=401,
+                detail="pubkey binding requires raw-key auth (the "
+                       "parameter proves possession of the device key)")
+        try:
+            ok = s["device_auth"].set_pubkey(device_id, body.pubkey or "")
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        if not ok:
+            raise HTTPException(status_code=403,
+                                detail="unknown/revoked/expired device")
+        s["audit"].record("device", "pubkey_bound", device_id, "")
+        return {"device_id": device_id, "challenge_auth": bool(body.pubkey)}
 
     @app.post("/v1/agent/enroll")
     def enroll(body: EnrollIn, _=Depends(auth)):
@@ -1735,7 +2349,8 @@ def create_app(stack=None) -> FastAPI:
     def claim(body: ClaimIn):
         """Device step: exchanges pairing code for a device key (once)."""
         try:
-            device_id, key = s["device_auth"].claim(body.pairing_code)
+            device_id, key = s["device_auth"].claim(body.pairing_code,
+                                                    pubkey=body.pubkey)
         except ValueError as e:
             raise HTTPException(status_code=403, detail=str(e))
         # Stage 14: a FRESH credential is an explicit re-pair — it lifts
@@ -1816,12 +2431,21 @@ def create_app(stack=None) -> FastAPI:
         return {"capabilities": d.capabilities}
 
     @app.post("/v1/agent/jobs/poll")
-    def agent_poll(device_id: str = Depends(agent_auth)):
+    def agent_poll(device_id: str = Depends(agent_auth),
+                   wait_secs: float = Query(default=0.0, ge=0.0,
+                                            le=AGENT_JOB_LONGPOLL_MAX_S)):
+        """Optional bounded server-side long poll (opt-in via wait_secs;
+        default 0 keeps the previous always-instant contract). Devices
+        that pass wait_secs get sub-second claim dispatch while idle
+        request rate stays ~1 per wait window (battery-neutral)."""
         try:
             s["devices"].heartbeat(device_id)  # poll counts as presence
         except KeyError:
             raise HTTPException(status_code=404, detail="device not registered")
-        job = s["jobs"].poll(device_id)
+        if wait_secs > 0:
+            job = s["jobs"].wait_for_job(device_id, wait_secs)
+        else:
+            job = s["jobs"].poll(device_id)
         if job is None:
             return {"job": None}
         # Linearize revoke vs claim: revoke may land between agent_auth
@@ -2287,6 +2911,7 @@ def _stack_from_env():
     return build_stack(memory_db=_db_path("ZARA_MEMORY_DB"),
                        audit_db=_db_path("ZARA_AUDIT_DB", ":memory:"),
                        mission_db=_db_path("ZARA_MISSION_DB"),
+                       device_auth_db=_db_path("ZARA_DEVICE_AUTH_DB"),
                        scheduler_db=_db_path("ZARA_SCHEDULER_DB"))
 
 

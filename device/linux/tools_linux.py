@@ -11,9 +11,13 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
+import time
+from typing import Callable, Optional
 from pathlib import Path
 from core.models import PermissionLevel, RiskLevel, ToolDefinition
+from core.policy import NEVER_AUTO_APPROVE_CAPS
 
 try:
     from core.device_tools import APP_OPEN_TARGETS
@@ -54,7 +58,12 @@ def _def(name: str, desc: str, schema: dict, caps: list[str], cost: float,
                           success_criteria="structured result returned",
                           failure_behavior="fail", verification="none",
                           supported_devices=["linux"], reversible=True,
-                          version="2.0.0")
+                          version="2.0.0",
+                          # Never-auto tagging mirrors the core _def:
+                          # policy set membership is the single source.
+                          never_auto_approve=(
+                              name.split(":", 1)[-1]
+                              in NEVER_AUTO_APPROVE_CAPS))
 
 # ---------- handlers ----------
 
@@ -62,6 +71,92 @@ def _def(name: str, desc: str, schema: dict, caps: list[str], cost: float,
 # `system.info` (supported_devices=["any"]) is the authority for that name;
 # device-specific detail is exposed via system.battery/network/processes.read.
 # This keeps one unambiguous owner per tool name.
+FS_CHECKSUM_CAP = 512 * 1024 * 1024      # 512 MB honest prefix cap
+
+
+def hash_file_prefix(real: str, algo: str,
+                     size_cap: int = FS_CHECKSUM_CAP) -> dict:
+    """P5 ㉒: the chunked walk — sha/sha1/md5 over at most `size_cap`
+    bytes; a cap-stop makes the digest an honest PREFIX (the caller
+    is told compare-unsafety). Pagecache hashing is hundreds of
+    MB/s, so the 91 s device slot never binds below the cap."""
+    import hashlib as _hashlib
+    h = _hashlib.new(algo)
+    hashed = 0
+    stopped = ""
+    with open(real, "rb") as f:
+        while True:
+            # read exactly up to the cap boundary: the digest then
+            # EQUALS the first `size_cap` bytes (bytes_hashed never
+            # overshoots into an unstated region)
+            chunk = f.read(min(1024 * 1024, size_cap - hashed))
+            if not chunk:
+                break
+            hashed += len(chunk)
+            h.update(chunk)
+            if hashed >= size_cap:
+                stopped = "size cap"
+                break
+    return {"digest": h.hexdigest(), "bytes_hashed": hashed,
+            "stopped": stopped}
+
+
+def fs_checksum(inputs: dict, ctx: dict) -> dict:
+    """P5 ㉒ "sha256 of my file": chunked hashlib digest of ONE
+    device-scoped file. Digest only — file content never leaves the
+    laptop. Honest cap: if the size cap stops the read, the digest
+    is a PREFIX digest and says so (compare-unsafe beyond the cap).
+    Symlink-to-sensitive paths are refused by _fs_path like every
+    filesystem read surface."""
+    algo = (inputs.get("algo") or "sha256").strip().lower()
+    if algo not in ("sha256", "sha512", "sha1", "md5"):
+        raise ValueError(
+            f"unsupported digest '{str(algo)[:20]}' — use sha256 "
+            "(default), sha512, sha1, or md5 (name it explicitly)")
+    path = (inputs.get("path") or "").strip()
+    if not path:
+        raise ValueError("path required")
+    real = _fs_path(path, allow_external=True)
+    try:
+        hashed_run = hash_file_prefix(real, algo)
+    except OSError as e:
+        raise ValueError(f"cannot read {str(path)[:120]}: {e}") from e
+    if hashed_run["bytes_hashed"] == 0:
+        raise ValueError(f"could not read bytes from {str(path)[:120]}")
+    return {"path": real, "algo": algo,
+            "digest": hashed_run["digest"],
+            "bytes_hashed": hashed_run["bytes_hashed"],
+            "stopped": hashed_run["stopped"],
+            "detail": ("PREFIX digest — stopped at the 512 MB size "
+                       "cap; compare full files with the same cap "
+                       "only" if hashed_run["stopped"] else
+                       f"full file ({hashed_run['bytes_hashed']} "
+                       "bytes hashed)")}
+
+
+def system_health(inputs: dict, ctx: dict) -> dict:
+    """P5 ⑬ (2026-10-23): the laptop executes the health reading;
+    the single behavior source is core/builtin_tools.py."""
+    from core.builtin_tools import system_health as _h
+    return _h(inputs, ctx)
+
+
+def system_top(inputs: dict, ctx: dict) -> dict:
+    """P5 ⑲ (2026-10-24): the laptop executes the process snapshot
+    (its /proc is the truth); single behavior source in
+    core/builtin_tools.py."""
+    from core.builtin_tools import system_top as _h
+    return _h(inputs, ctx)
+
+
+def system_connectivity(inputs: dict, ctx: dict) -> dict:
+    """P5 ⑳ (2026-10-24): the laptop executes the layered probes
+    (its NIC/resolver/network are the truth); single behavior source
+    in core/builtin_tools.py."""
+    from core.builtin_tools import system_connectivity as _h
+    return _h(inputs, ctx)
+
+
 def system_battery(inputs: dict, ctx: dict) -> dict:
     base = Path("/sys/class/power_supply")
     out: dict = {"present": False}
@@ -400,6 +495,334 @@ def filesystem_metadata(inputs: dict, ctx: dict) -> dict:
             "is_dir": os.path.isdir(path)}
 
 
+# ---------- file workflows (find / edit / rename) ----------
+# All stay inside the existing boundaries: search reads under already-
+# allowed roots only; edit/move act only on scratch-dir files via the
+# same dir_fd + O_NOFOLLOW discipline as write/delete. Nothing here
+# widens what the agent may see or touch.
+
+SEARCH_MAX_RESULTS = 200
+SEARCH_MAX_ENTRIES = 5000
+SEARCH_MAX_DEPTH = 6
+
+
+def filesystem_search(inputs: dict, ctx: dict) -> dict:
+    """Bounded read-only filename search under an allowed root.
+
+    - fnmatch glob (case-insensitive): no regex, no arbitrary code.
+    - Hidden entries (dot-first) are never enumerated, so private state
+      (caches, .ssh, .gnupg) is never listed; SENSITIVE_HINTS matches are
+      filtered even where a plain filename would otherwise hit.
+    - The walk never follows symlinks, so neither the traversal nor any
+      match can be redirected out of the allowed roots.
+    - Unreadable directories are counted honestly (``skipped``) instead
+      of failing the whole search with a guessed result.
+    """
+    import fnmatch as _fn
+    pattern = inputs.get("pattern", "")
+    if not isinstance(pattern, str) or not pattern.strip():
+        raise ValueError("pattern is required")
+    pattern = pattern.strip()
+    if len(pattern) > 200 or "\n" in pattern or "\x00" in pattern:
+        raise ValueError("pattern must be one short line")
+    root = _scoped(inputs.get("path") or HOME)
+    try:
+        limit = min(max(int(inputs.get("max_results", 50)), 1),
+                    SEARCH_MAX_RESULTS)
+    except (TypeError, ValueError):
+        limit = 50
+    hits: list = []
+    scanned = 0
+    skipped = 0
+    unreadable = 0
+    truncated = False
+
+    def _count_unreadable(err):
+        nonlocal unreadable
+        unreadable += 1
+
+    for dirpath, dirnames, filenames in os.walk(
+            root, followlinks=False, onerror=_count_unreadable):
+        # Never enumerate/enter hidden state; never descend deeper than
+        # the bound (pruned in place, so the walk itself stays bounded).
+        dirnames[:] = [d for d in sorted(dirnames)
+                       if not d.startswith(".")]
+        if dirpath[len(root):].count(os.sep) >= SEARCH_MAX_DEPTH:
+            dirnames[:] = []
+        for name in sorted(filenames):
+            if scanned >= SEARCH_MAX_ENTRIES:
+                truncated = True
+                break
+            scanned += 1
+            if name.startswith("."):
+                skipped += 1
+                continue
+            full = os.path.join(dirpath, name)
+            if not _fn.fnmatch(name.lower(), pattern.lower()):
+                continue
+            if any(p.search(full) for p in SENSITIVE_HINTS):
+                skipped += 1
+                continue
+            try:
+                size = os.stat(full, follow_symlinks=False).st_size
+            except OSError:
+                size = None
+            hits.append({"path": full[:300], "size": size})
+            if len(hits) >= limit:
+                truncated = True
+                break
+        if truncated or scanned >= SEARCH_MAX_ENTRIES:
+            truncated = truncated or scanned >= SEARCH_MAX_ENTRIES
+            break
+    return {"root": root, "pattern": pattern, "matches": hits,
+            "count": len(hits), "scanned": scanned, "skipped": skipped,
+            "unreadable_dirs": unreadable, "truncated": truncated}
+
+
+def _scratch_open_rd(name: str, pfd: int) -> bytes:
+    """Read a scratch file through a NOFOLLOW fd (swap-safe)."""
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=pfd)
+    with os.fdopen(fd, "rb") as f:
+        return f.read(SCRATCH_MAX_BYTES + 1)
+
+
+EXTRACT_MAX_BYTES = 200_000
+_EXTRACT_KINDS = {".txt": "text", ".md": "text", ".json": "json",
+                  ".csv": "csv"}
+
+
+def filesystem_extract(inputs: dict, ctx: dict) -> dict:
+    """Extract STRUCTURED information from one supported document.
+
+    Read-only, scoped (HOME/tmp), capped (EXTRACT_MAX_BYTES). Supported
+    formats: .txt/.md (text stats + head), .json (parse + top-level
+    keys or list length), .csv (header, row count, first rows capped).
+    Anything else is reported honestly as `supported: False` with the
+    reason — never guessed content. Parse errors are surfaced as
+    `error`, not silently swallowed. The extract describes the file; it
+    never becomes authority and never leaks a sensitive-name file
+    (`_scoped` refuses those before any read).
+    """
+    path = inputs.get("path", "")
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("path is required")
+    path = _scoped(path)
+    ext = os.path.splitext(path)[1].lower()
+    kind = _EXTRACT_KINDS.get(ext)
+    st = os.stat(path)
+    size = st.st_size
+    out: dict = {"path": path, "size": size, "kind": kind}
+    if st.st_mode & 0o170000 != 0o100000:  # regular file only
+        out.update(supported=False, error="path is not a regular file")
+        return out
+    if kind is None:
+        out.update(supported=False,
+                   error=f"unsupported format for extraction: "
+                         f"{ext or '(no extension)'}; supported: "
+                         + ", ".join(sorted(_EXTRACT_KINDS)))
+        return out
+    if size > EXTRACT_MAX_BYTES:
+        out.update(supported=False,
+                   error=f"file exceeds the {EXTRACT_MAX_BYTES}-byte "
+                         f"extraction cap")
+        return out
+    try:
+        with open(path, "rb") as f:
+            data = f.read(EXTRACT_MAX_BYTES + 1)
+    except OSError as e:
+        out.update(supported=False, error=str(e))
+        return out
+    if len(data) != size:
+        out.update(supported=False, error="file changed while reading")
+        return out
+    text = data.decode("utf-8", errors="replace")
+    if kind == "text":
+        lines = text.splitlines()
+        out.update(supported=True,
+                   lines=len(lines),
+                   words=len(text.split()),
+                   preview="\n".join(lines[:20])[:1000])
+        return out
+    if kind == "json":
+        import json as _json
+        try:
+            parsed = _json.loads(text)
+        except ValueError as e:
+            # A broken document is a FAILURE, not a plausible guess.
+            raise ValueError(f"invalid JSON in {path}: {str(e)[:200]}")
+        if isinstance(parsed, dict):
+            out.update(supported=True, top_keys=sorted(parsed.keys())[:50],
+                       value_type="object")
+        elif isinstance(parsed, list):
+            out.update(supported=True, list_length=len(parsed),
+                       value_type="array")
+        else:
+            out.update(supported=True, value_type=type(parsed).__name__)
+        return out
+    # csv: header + count of data rows + a capped preview (std lib).
+    import csv as _csv
+    import io as _io
+    reader = _csv.reader(_io.StringIO(text))
+    rows = list(reader)
+    if not rows:
+        out.update(supported=True, header=[], data_rows=0, preview=[])
+        return out
+    out.update(supported=True, header=[c.strip()[:40] for c in rows[0]
+                                       and rows[0]][:40],
+               data_rows=max(0, len(rows) - 1),
+               preview=[r[:10] for r in rows[1:6]])
+    return out
+
+
+def filesystem_edit(inputs: dict, ctx: dict) -> dict:
+    """Replace ONE unambiguous substring in an existing scratch file.
+
+    Design (never guesses, never partial):
+    - Refuses when the search text is missing, occurs more than once
+      (ambiguous → clarify, never first-or-any), or the result would
+      exceed the cap.
+    - The ORIGINAL is preserved first: `<name>.bak` is written
+      exclusively (O_EXCL). An existing .bak is a refusal — a second
+      edit must delete the old backup explicitly first, so consecutive
+      edits can never destroy the only pre-edit copy.
+    - New content lands via a same-directory temp file + os.replace
+      (atomic; a crash leaves either the old or the new file, never a
+      partial mix).
+    - VERIFY: the final file is re-read through a NOFOLLOW fd and must
+      be byte-equal to the intended result. Anything else is reported
+      as replaced=False with the discrepancy — never silently 'ok'.
+    """
+    import stat as _stat
+    name = _scratch_name(inputs.get("name", ""))
+    old = inputs.get("old", "")
+    new = inputs.get("new", "")
+    if not isinstance(old, str) or not isinstance(new, str):
+        raise ValueError("search/replace text must be strings")
+    if not old:
+        raise ValueError("search text is required")
+    old_b = old.encode("utf-8")
+    new_b = new.encode("utf-8")
+    if len(new_b) > SCRATCH_MAX_BYTES:
+        raise ValueError(f"replacement exceeds {SCRATCH_MAX_BYTES} bytes")
+    backup_name = name + ".bak"
+    pfd, base = _scratch_dir_fd()
+    try:
+        try:
+            content = _scratch_open_rd(name, pfd)
+        except FileNotFoundError as e:
+            raise ValueError(f"no such scratch file: {name}") from e
+        if len(content) > SCRATCH_MAX_BYTES:
+            raise ValueError(
+                f"file exceeds the {SCRATCH_MAX_BYTES}-byte scratch cap")
+        occurrences = content.count(old_b)
+        if occurrences == 0:
+            raise ValueError(f"search text not found in {name}")
+        if occurrences > 1:
+            raise ValueError(f"search text occurs {occurrences} times in "
+                             f"{name}: clarify which one to change")
+        updated = content.replace(old_b, new_b, 1)
+        if len(updated) > SCRATCH_MAX_BYTES:
+            raise ValueError(
+                f"edit result exceeds the {SCRATCH_MAX_BYTES}-byte cap")
+        backup_path = None
+        if inputs.get("backup", True):
+            # O_EXCL: never overwrite an existing backup (pre-edit
+            # evidence); overwriting it would destroy the only pre-edit
+            # copy of the file.
+            exists_bak = True
+            try:
+                os.stat(backup_name, dir_fd=pfd, follow_symlinks=False)
+            except FileNotFoundError:
+                exists_bak = False
+            if exists_bak:
+                raise PermissionError(
+                    f"backup already exists: {backup_name} — remove or "
+                    f"rename it first (the pre-edit copy is not replaced)")
+            bfd = os.open(backup_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                          | os.O_NOFOLLOW, 0o600, dir_fd=pfd)
+            with os.fdopen(bfd, "wb") as f:
+                f.write(content)
+            backup_path = os.path.join(base, backup_name)
+        tmp_name = f"{name}.{os.urandom(4).hex()}.tmp"
+        tfd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                      | os.O_NOFOLLOW, 0o600, dir_fd=pfd)
+        with os.fdopen(tfd, "wb") as f:
+            f.write(updated)
+        try:
+            os.replace(tmp_name, name, src_dir_fd=pfd, dst_dir_fd=pfd)
+        finally:
+            try:
+                os.unlink(tmp_name, dir_fd=pfd)
+            except FileNotFoundError:
+                pass
+        # Verify the outcome by reading the final state back.
+        final = _scratch_open_rd(name, pfd)
+        st = os.stat(name, dir_fd=pfd, follow_symlinks=False)
+        file_is_file = _stat.S_ISREG(st.st_mode)
+    finally:
+        os.close(pfd)
+    verified = file_is_file and final == updated
+    return {"path": os.path.join(base, name), "replaced": verified,
+            "backup": backup_path, "bytes": len(updated),
+            "verified": verified,
+            "detail": "" if verified else "editorial verification failed: "
+                       "final content differs from the intended result"}
+
+
+def filesystem_move(inputs: dict, ctx: dict) -> dict:
+    """Rename one scratch file within the scratch dir (atomic rename).
+
+    - Conflict-safe: an existing destination returns a structured
+      ``conflict: exists`` result instead of overwriting; `overwrite`
+      confirms an intentional replacement explicitly.
+    - Symlinks are never renamed through, replaced, or created: a
+      symlink source is refused, a symlink destination is refused even
+      with overwrite (renaming over a link is not the intent).
+    - VERIFY: after the rename the source must be absent and the
+      destination must be a regular file. Any mismatch is reported as
+      moved=False with the discrepancy.
+    """
+    import stat as _stat
+    src = _scratch_name(inputs.get("src", ""))
+    dst = _scratch_name(inputs.get("dst", ""))
+    if src == dst:
+        raise ValueError("source and destination must differ")
+    overwrite = bool(inputs.get("overwrite", False))
+    pfd, base = _scratch_dir_fd()
+    try:
+        try:
+            s_st = os.stat(src, dir_fd=pfd, follow_symlinks=False)
+        except FileNotFoundError:
+            raise ValueError(f"no such scratch file: {src}")
+        if not _stat.S_ISREG(s_st.st_mode) or \
+                _stat.S_ISLNK(s_st.st_mode):
+            raise PermissionError(f"only regular files are moved: {src}")
+        try:
+            d_st = os.stat(dst, dir_fd=pfd, follow_symlinks=False)
+            exists, is_link = True, _stat.S_ISLNK(d_st.st_mode)
+        except FileNotFoundError:
+            exists, is_link = False, False
+        if exists and is_link:
+            raise PermissionError(
+                f"destination is a symlink: {dst} — refused")
+        if exists and not overwrite:
+            return {"moved": False, "conflict": "exists", "src": src,
+                    "dst": dst,
+                    "detail": f"{dst} already exists — nothing was "
+                              f"changed; choose a different name or "
+                              f"confirm overwrite"}
+        os.rename(src, dst, src_dir_fd=pfd, dst_dir_fd=pfd)
+    finally:
+        os.close(pfd)
+    gone = not os.path.lexists(os.path.join(base, src))
+    landed = os.path.isfile(os.path.join(base, dst))
+    verified = gone and landed
+    return {"moved": verified, "src": os.path.join(base, src),
+            "dst": os.path.join(base, dst), "verified": verified,
+            "detail": "" if verified
+            else "rename verification failed: endpoints do not match"}
+
+
 READONLY_ALLOW = {
     "ls": None, "df": None, "free": None, "uptime": None, "uname": None,
     "whoami": None, "date": None, "hostname": None, "ps": None,
@@ -623,6 +1046,244 @@ def system_app_open(inputs: dict, ctx: dict) -> dict:
     except Exception as e:
         return {"supported": True, "error": f"launch failed: {e}"}
 
+
+# ---------- Universal operator: desktop app discovery + launch ----------
+
+_APP_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_APPS_LIMIT = 200
+_APP_NAME_CAP = 80
+
+
+def _desktop_data_dirs() -> list:
+    """Application data dirs (xdg), most-authoritative first. Never shell."""
+    dirs = []
+    xdg = os.environ.get("XDG_DATA_DIRS", "")
+    for d in (xdg.split(":") if xdg else ["/usr/local/share", "/usr/share"]):
+        d = d.strip()
+        if d and not d.startswith("~"):
+            dirs.append(os.path.join(d, "applications"))
+    home = os.path.expanduser("~")
+    dirs.append(os.path.join(home, ".local", "share", "applications"))
+    out, seen = [], set()
+    for d in dirs:
+        if d in seen:
+            continue
+        seen.add(d)
+        out.append(d)
+    return out
+
+
+def _parse_desktop_entry(path) -> list:
+    """Minimal .desktop reader: returns app rows, or [] if not a launchable
+    application (Type≠Application, Hidden/NoDisplay, or missing Name).
+    Exec values are deliberately never returned (untrusted shell args)."""
+    rows = []
+    try:
+        # Cap the read: .desktop files are small, but never trust size.
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read(32 * 1024)
+    except OSError:
+        return rows
+    name, app_type = None, None
+    hidden = no_display = False
+    try_in_desktop = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("["):
+            try_in_desktop = line.lower().strip("[]") == "desktop entry"
+            continue
+        if not try_in_desktop or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip().lower()
+        val = val.strip()
+        if key == "name" and not name:
+            name = val[:_APP_NAME_CAP] or None
+        elif key == "type" and app_type is None:
+            app_type = val
+        elif key == "hidden" and val.lower() in ("true", "1"):
+            hidden = True
+        elif key == "nodisplay" and val.lower() in ("true", "1"):
+            no_display = True
+    if (app_type is not None and app_type.lower() == "application"
+            and name and not hidden and not no_display):
+        base = os.path.basename(str(path))
+        rows.append({"app_id": base[:-8], "label": name})
+    return rows
+
+
+def desktop_apps_list(inputs: dict, ctx: dict) -> dict:
+    """Launchable desktop applications (freedesktop .desktop entries):
+    app_id + user-visible label, capped, deterministic. Read-only
+    metadata — NEVER an authorization to open or automate anything."""
+    seen = {}
+    truncated = False
+    for d in _desktop_data_dirs():
+        try:
+            entries = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for fname in entries:
+            if not fname.endswith(".desktop") or len(fname) < 16:
+                continue
+            if len(seen) >= _APPS_LIMIT:
+                truncated = True
+                break
+            path = os.path.join(d, fname)
+            if os.path.islink(path) or not os.path.isfile(path):
+                continue
+            for row in _parse_desktop_entry(path):
+                if row["app_id"] not in seen:
+                    seen[row["app_id"]] = row
+        if truncated:
+            break
+    apps = sorted(seen.values(), key=lambda row: row["app_id"])
+    return {"supported": True, "apps": apps, "count": len(apps),
+            "truncated": truncated,
+            "note": "discovery metadata only; not an authorization to "
+                    "open or automate any app"}
+
+
+def _desktop_app_ids() -> set | None:
+    """Known .desktop app ids, or None when nothing readable."""
+    ids = set()
+    for d in _desktop_data_dirs():
+        try:
+            for fname in os.listdir(d):
+                if fname.endswith(".desktop"):
+                    ids.add(fname[:-8])
+        except OSError:
+            continue
+    return ids or None
+
+
+def _app_matches_name(app_id: str, nm: str) -> bool:
+    """Deterministic match between a .desktop app id and an a11y
+    registry application name (pure; unit target). Word-bounded and
+    dot-segment based — never free-substring, so 'thing' cannot match
+    'Something Else'. Legal shapes: id equals the name; an id word
+    equals a full name word ('firefox', 'gnome-calculator'); the last
+    dot segment of the id equals/prefixes/suffixes the space- and
+    hyphen-stripped name ('org.gnome.TextEditor' → 'Text Editor')."""
+    aid = str(app_id or "").lower().strip()
+    n = str(nm or "").lower().strip()
+    if not aid or not n:
+        return False
+    if aid == n:
+        return True
+    name_words = [w for w in re.split(r"[\s\-_.]+", n) if w]
+    id_words = [w for w in re.split(r"[\s\-_.]+", aid) if w]
+    if any(w in name_words for w in id_words):
+        return True
+    if "." in aid:
+        suffix = aid.rsplit(".", 1)[-1].replace("-", "")
+        if len(suffix) >= 3:
+            stripped = n.replace(" ", "").replace("-", "")
+            return (suffix == stripped or stripped.startswith(suffix)
+                    or stripped.endswith(suffix))
+    return False
+
+
+def _atspi_apps(app_filter: str = "") -> dict:
+    """Fast a11y registry app list (one cheap read op). Raises
+    RuntimeError honestly when the bus is unreachable — an action's
+    verification layer must never endanger its actuation decision."""
+    return _atspi_call({"op": "apps", "app_filter": app_filter,
+                        "max_apps": 40})
+
+
+def desktop_app_open(inputs: dict, ctx: dict) -> dict:
+    """Launch one desktop application by .desktop app id via gtk-launch
+    (no shell), detached. Verified honestly on BOTH session types:
+    X11 by a new wmctrl window id in the bounded re-read; Wayland by
+    the application appearing as a NEW entry in the a11y registry
+    (`apps` read op — cheap, native, bounded); when verification is
+    impossible the result says 'requested', never 'verified'.
+    Selecting a launcher from the machine's own menu is a state change:
+    CONFIRM per Core policy."""
+    app_id = str(inputs.get("app_id", "")).strip()
+    if not _APP_ID_RE.fullmatch(app_id):
+        return {"supported": True, "applied": False,
+                "error": "bad app_id (need an id from desktop.apps.list)"}
+    known = _desktop_app_ids()
+    if known is None:
+        return {"supported": False, "applied": False,
+                "error": "no readable .desktop entries (cannot verify "
+                         "the launcher exists)"}
+    if app_id not in known:
+        return {"supported": True, "applied": False,
+                "error": "app not installed (not applied)"}
+    if _run_quiet(["gtk-launch", "--help"], timeout=5) is None:
+        return {"supported": False, "applied": False,
+                "error": "gtk-launch unavailable (no app-launch binary)"}
+    wayland = desktop_session({}, ctx).get("session") == "wayland"
+    before = None
+    before_names = None
+    if wayland:
+        # a11y registry app list BEFORE the launch — verification later
+        # requires a NEW entry (same freshness shape as the X11 diff)
+        try:
+            names = _atspi_apps()
+            before_names = set(str(v) for v in names.get("apps", [])
+                               if v)
+        except RuntimeError:
+            before_names = None  # a11y down -> honest "requested" later
+    else:
+        ids = _wmctrl_ids()
+        before = len(ids) if ids is not None else None
+    try:
+        subprocess.Popen(["gtk-launch", app_id],
+                         stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except Exception as e:
+        return {"supported": True, "applied": False,
+                "error": f"launch failed: {str(e)[:200]}"}
+    # Bounded X11 verification: a NEW window in the re-read is real
+    # appearance evidence.
+    if not wayland:
+        import time
+        for _ in range(5):
+            time.sleep(0.4)
+            after = _wmctrl_ids()
+            if after is not None and len(after) > before:
+                return {"supported": True, "applied": True,
+                        "app_id": app_id,
+                        "verify_state": "verified (a new window appeared)"}
+        if _wmctrl_ids() is None:
+            return {"supported": True, "applied": True, "app_id": app_id,
+                    "verify_state": "requested (window list unreadable)"}
+        return {"supported": True, "applied": True, "app_id": app_id,
+                "verify_state": "requested (no new window within "
+                                "bounds; app may be single-instance)"}
+    # Bounded Wayland verification: a NEW a11y registry app entry whose
+    # name matches the launcher id is real appearance evidence.
+    import time
+    if before_names is None:
+        return {"supported": True, "applied": True, "app_id": app_id,
+                "verify_state": "requested (a11y verification "
+                                "unavailable; launch was dispatched)"}
+    for _ in range(3):
+        time.sleep(0.6)
+        try:
+            names = _atspi_apps()
+        except RuntimeError:
+            break  # verification layer vanished mid-check -> honest
+        fresh = set(str(v) for v in names.get("apps", []) if v)
+        for nm in sorted(fresh - before_names):
+            if _app_matches_name(app_id, nm):
+                return {"supported": True, "applied": True,
+                        "app_id": app_id,
+                        "verify_state":
+                        "verified (new a11y-registry app entry "
+                        "matches the launcher)",
+                        "app_name": nm}
+        before_names |= fresh
+    return {"supported": True, "applied": True, "app_id": app_id,
+            "verify_state": "requested (no matching registry entry "
+                            "within bounds; launch was dispatched)"}
+
+
 def try_open_settings(name: str, *cmd_attempts: list) -> dict:
     """Try multiple commands to open a settings panel."""
     for cmd in cmd_attempts:
@@ -825,14 +1486,125 @@ def desktop_session(inputs: dict, ctx: dict) -> dict:
             "wayland_display": wayland or None}
 
 
-def desktop_window_active(inputs: dict, ctx: dict) -> dict:
-    """Active-window title via X11 (xdotool). Wayland deliberately reports
-    unsupported: no probe without a foreign-toplevel helper, and titles
-    are never guessed."""
+def desktop_window_list(inputs: dict, ctx: dict) -> dict:
+    """List X11 windows via wmctrl (id + title). Wayland deliberately
+    reports unsupported (no foreign-toplevel helper on this path).
+    Titles are untrusted data and may be sensitive."""
     if desktop_session({}, ctx).get("session") == "wayland":
         return {"supported": False,
-                "error": "no Wayland active-window probe "
+                "error": "no Wayland window list "
                          "(needs a foreign-toplevel helper)"}
+    r = _run_quiet(["wmctrl", "-l"])
+    if r is None:
+        return {"supported": False,
+                "error": "wmctrl unavailable (X11 window list)"}
+    if r.returncode != 0:
+        return {"supported": True, "windows": [],
+                "error": (r.stderr or "wmctrl refused").strip()[:200]}
+    windows = []
+    for line in (r.stdout or "").splitlines()[:100]:
+        parts = line.split(None, 3)
+        if len(parts) < 3 or not parts[0].startswith("0x"):
+            continue
+        windows.append({"window_id": parts[0][:18],
+                        "title": (parts[3] if len(parts) > 3 else "")
+                        [:200] or None})
+    return {"supported": True, "windows": windows,
+            "note": "window titles may be sensitive; treat as untrusted"}
+
+
+def _wmctrl_ids() -> set | None:
+    """Current X11 window ids via wmctrl, or None when unreadable."""
+    r = _run_quiet(["wmctrl", "-l"])
+    if r is None or r.returncode != 0:
+        return None
+    ids = set()
+    for line in (r.stdout or "").splitlines()[:200]:
+        wid = line.split(None, 1)[0] if line.split() else ""
+        if wid.startswith("0x"):
+            ids.add(wid.lower())
+    return ids
+
+
+def desktop_window_action(inputs: dict, ctx: dict) -> dict:
+    """Act on one X11 window by id (focus/minimize/close), verified by
+    re-reading state. Wayland refuses honestly. Close is graceful
+    (wmctrl -i -c), never kill -9. Verification evidence (not the click
+    return) decides the verdict."""
+    if desktop_session({}, ctx).get("session") == "wayland":
+        return {"supported": False, "applied": False,
+                "error": "no Wayland window control "
+                         "(needs a foreign-toplevel helper)"}
+    wid = str(inputs.get("window_id", "")).strip().lower()
+    action = str(inputs.get("action", "")).strip().lower()
+    if not re.fullmatch(r"0x[0-9a-f]{1,16}", wid):
+        return {"supported": True, "applied": False,
+                "error": "bad window_id (need an id from desktop.window.list, "
+                         "e.g. 0x01200003)"}
+    if action not in ("focus", "minimize", "close"):
+        return {"supported": True, "applied": False,
+                "error": "unknown action (focus, minimize, or close)"}
+    before = _wmctrl_ids()
+    if before is not None and wid not in before:
+        return {"supported": True, "applied": False,
+                "error": "window not present (not applied)"}
+    cmd = {"focus": ["xdotool", "windowactivate", wid],
+           "minimize": ["xdotool", "windowminimize", wid],
+           "close": ["wmctrl", "-i", "-c", wid]}[action]
+    r = _run_quiet(cmd)
+    if r is None:
+        return {"supported": False, "applied": False,
+                "error": "window control binary unavailable"}
+    if r.returncode != 0:
+        return {"supported": True, "applied": False,
+                "error": (r.stderr or f"{action} refused").strip()[:200]}
+    after = _wmctrl_ids()
+    if action == "close":
+        if after is not None and wid not in after:
+            return {"supported": True, "applied": True,
+                    "verify_state": "closed (absent from window list)"}
+        return {"supported": True, "applied": False,
+                "error": "close unverified (window still listed)"}
+    if action == "focus":
+        a = _run_quiet(["xdotool", "getactivewindow"])
+        if a is not None and a.returncode == 0:
+            try:
+                active = int((a.stdout or "").strip())
+                if int(wid, 16) == active:
+                    return {"supported": True, "applied": True,
+                            "verify_state": "focused (active window matches)"}
+            except ValueError:
+                pass
+        if after is not None and wid in after:
+            return {"supported": True, "applied": True,
+                    "verify_state": "requested (window present; "
+                                    "active-window match unconfirmed)"}
+        return {"supported": True, "applied": False,
+                "error": "focus unverified"}
+    if after is not None and wid in after:
+        return {"supported": True, "applied": True,
+                "verify_state": "requested (window present)"}
+    return {"supported": True, "applied": False,
+            "error": "minimize unverified (window vanished)"}
+
+
+def desktop_window_active(inputs: dict, ctx: dict) -> dict:
+    """Active-window title via X11 (xdotool). Wayland deliberately reports
+    unsupported: names the concrete, live-verified denials instead of a
+    vague helper complaint (2026-10-19, stock Ubuntu GNOME/Wayland):
+    - org.gnome.Shell.Eval -> (false, '') (unsafe-mode gated off),
+    - org.gnome.Shell.Introspect.GetWindows -> AccessDenied (portal
+      gate denies non-portal callers),
+    - no ext-foreign-toplevel protocol export in this compositor.
+    Titles are never guessed; enabling Shell unsafe-mode is refused by
+    design."""
+    if desktop_session({}, ctx).get("session") == "wayland":
+        return {"supported": False,
+                "error": "no Wayland active-window probe: GNOME Shell "
+                         "Eval and Introspect are security-gated and "
+                         "this compositor exports no "
+                         "foreign-toplevel protocol (requires a "
+                         "user-designed helper, never unsafe mode)"}
     r = _run_quiet(["xdotool", "getactivewindow", "getwindowname"])
     if r is None:
         return {"supported": False,
@@ -943,6 +1715,9 @@ _SNAPSHOTS: dict = {}
 _snap_counter = 0
 _ATSPI_PY = None  # None=unprobed, False=unavailable, else interpreter path
 
+_ATSPI_READ_OPS = frozenset(("node", "tree", "get_text", "apps"))
+_ATSPI_BATCH_MAX = 8
+
 
 def _atspi_python():
     """Interpreter with dbus bindings for the probe helper. Probed once,
@@ -986,6 +1761,30 @@ def _atspi_call(req: dict, timeout: int = ATSPY_TIMEOUT_S) -> dict:
     if not isinstance(env, dict) or not env.get("ok"):
         raise RuntimeError(str((env or {}).get("error", "a11y failed"))[:300])
     return env.get("result") or {}
+
+
+def _atspi_batch(reqs: list, timeout: int = ATSPY_TIMEOUT_S) -> list:
+    """N READ-ONLY a11y ops in ONE helper spawn (operation 'multi').
+
+    Same ops, same validation, same capping as standalone calls; the
+    probe structurally refuses state-changing children, and this side
+    reassesses that independently — an unrecognised or write-op entry
+    fails the whole batch here, before the child ever sees it (never a
+    reordered write)."""
+    if not isinstance(reqs, list) or not reqs:
+        raise RuntimeError("batch must be a non-empty op list")
+    if len(reqs) > _ATSPI_BATCH_MAX:
+        raise RuntimeError("too many batch ops (%d > %d)"
+                           % (len(reqs), _ATSPI_BATCH_MAX))
+    for r in reqs:
+        if not isinstance(r, dict) or r.get("op") not in _ATSPI_READ_OPS:
+            raise RuntimeError("batch children must be read-only ops "
+                               "(node/tree/get_text)")
+    res = _atspi_call({"op": "multi", "ops": reqs}, timeout)
+    out = res.get("results")
+    if not isinstance(out, list) or len(out) != len(reqs):
+        raise RuntimeError("batch result shape mismatch")
+    return out
 
 
 def _snapshot_put(app, app_bus, app_path, nodes) -> str:
@@ -1218,8 +2017,1162 @@ def desktop_type(inputs: dict, ctx: dict) -> dict:
             "verify": "desktop.a11y.inspect"}
 
 
+# ---------------- Stage 20: removable storage + file ops ----------------
+
+def _removable_mounts() -> list[dict]:
+    """Mounted roots of removable block devices via lsblk (read-only).
+    Returns [{mountpoint, device, fs, model, size_bytes, ro}]."""
+    txt = _run_quiet(["lsblk", "-J", "-b", "-o", "NAME,RM,RO,SIZE,TYPE,"
+                     "MOUNTPOINTS,MOUNTPOINT,FSTYPE,SERIAL,MODEL"])
+    out: list[dict] = []
+    if txt.returncode != 0 or not txt.stdout:
+        return out
+    import json as _json
+    try:
+        data = _json.loads(txt.stdout).get("blockdevices") or []
+    except ValueError:
+        return out
+
+    def walk(nodes):
+        for n in nodes:
+            if n.get("type") == "disk" and n.get("rm"):
+                mounts = []
+                for m in (n.get("mountpoints") or []):
+                    if isinstance(m, list):
+                        mounts += [x for x in m if x]
+                if n.get("mountpoint"):
+                    mounts.append(n["mountpoint"])
+                for child in (n.get("children") or []):
+                    for m in (child.get("mountpoints") or []):
+                        if isinstance(m, list):
+                            mounts += [x for x in m if x]
+                    if child.get("mountpoint"):
+                        mounts.append(child["mountpoint"])
+                mounts = sorted({m for m in mounts if m and m != "[SWAP]"})
+                for m in mounts:
+                    out.append({
+                        "mountpoint": m, "device":
+                            "/dev/" + "".join(n["name"].split()[-1:]),
+                        "fs": n.get("fstype") or "unknown",
+                        "model": (n.get("model") or "").strip(),
+                        "size_bytes": int(n.get("size") or 0),
+                        "ro": bool(n.get("ro")),
+                    })
+            walk(n.get("children") or [])
+
+    walk(data)
+    return out
+
+
+def _fs_roots() -> tuple[str, ...]:
+    """Allowed filesystem roots: user HOME, /tmp, plus mounted
+    REMOVABLE media only (pendrives/MTP mounts appear when plugged).
+    Internal system areas are never writable through these tools."""
+    return tuple(ALLOWED_ROOTS) + tuple(
+        os.path.realpath(m["mountpoint"]) for m in _removable_mounts())
+
+
+def _fs_path(path: str, *, allow_external: bool = False) -> str:
+    real = os.path.realpath(os.path.expanduser(path))
+    if allow_external:
+        rem = tuple(os.path.realpath(m["mountpoint"])
+                    for m in _removable_mounts())
+        in_rem = any(real == r or real.startswith(r + os.sep) for r in rem)
+        in_std = any(real == r or real.startswith(r + os.sep)
+                     for r in ALLOWED_ROOTS)
+        if not (in_std or in_rem):
+            raise PermissionError(f"outside allowed roots: {path}")
+        if in_std and not in_rem and any(
+                p.search(real) for p in SENSITIVE_HINTS):
+            raise PermissionError(f"sensitive path refused: {path}")
+    else:
+        real = _scoped(real)
+    return real
+
+
+def storage_volumes(inputs: dict, ctx: dict) -> dict:
+    """Mounted removable volumes with usage numbers. Read-only."""
+    import shutil as _sh
+    vols = []
+    for m in _removable_mounts():
+        mp = m["mountpoint"]
+        try:
+            du = _sh.disk_usage(mp)
+            readwrite = _rw_probe(mp)
+            vols.append({
+                "mountpoint": mp, "device": m["device"],
+                "filesystem": m["fs"], "model": m["model"],
+                "total_bytes": du.total, "used_bytes": du.used,
+                "free_bytes": du.free,
+                "total_h": _fmt_size(du.total),
+                "used_h": _fmt_size(du.used),
+                "free_h": _fmt_size(du.free),
+                "read_only": m["ro"] or not readwrite,
+            })
+        except OSError as e:
+            vols.append({"mountpoint": mp, "error": str(e)[:120]})
+    return {"volumes": vols,
+            "detail": "" if vols else "no removable volumes mounted"}
+
+
+def _rw_probe(mp: str) -> bool:
+    """Non-destructive writability probe: attempt to create ONE
+    uniquely-named zero byte file, then delete it. Never flushes a
+    queue of data; a mounted-RO volume stays untouched logically."""
+    import uuid as _uuid
+    probe = os.path.join(mp, f".zara-rw-probe-{_uuid.uuid4().hex}")
+    try:
+        with open(probe, "xb"):
+            pass
+        os.unlink(probe)
+        return True
+    except OSError:
+        try:
+            os.unlink(probe)
+        except OSError:
+            pass
+        return False
+
+
+def storage_capacity(inputs: dict, ctx: dict) -> dict:
+    import shutil as _sh
+    mp = _fs_path(inputs.get("mount") or inputs.get("path") or "",
+                  allow_external=True)
+    du = _sh.disk_usage(mp)
+    return {"mountpoint": mp, "total_bytes": du.total,
+            "used_bytes": du.used, "free_bytes": du.free}
+
+def storage_stats(inputs: dict, ctx: dict) -> dict:
+    """Removable-volume media statistics (videos/audio/images/documents/
+    other): bounded, cancellable, memory-safe. Scans a mount root or a
+    subfolder below it."""
+    from core.storage_scan import scan_tree
+    root = inputs.get("mount") or inputs.get("path") or ""
+    real = _fs_path(root, allow_external=True)
+    out = scan_tree(real, max_entries=min(
+        200_000, max(100, int(inputs.get("max_entries", 200_000)))))
+    out.pop("unreadable", None)   # keep the count; drop raw dir list
+    out.pop("huge_dirs", None)
+    return out
+
+
+def storage_scan(inputs: dict, ctx: dict) -> dict:
+    """P5 ⑰ "where did my disk go": top level-1 children of a home or
+    allowed path by subtree size (dust/gdu/dua semantics, stdlib
+    re-implementation): apparent-size aggregation, symlinks never
+    followed, hard links deduped within a bounded window, bounded by
+    a time/entry budget — partial walks report floors, never totals.
+    Read-only."""
+    from core.storage_scan import scan_dir_usage
+    path = (inputs.get("path") or "").strip()
+    real = _fs_path(path or "~", allow_external=True)
+    top_n = min(20, max(1, int(inputs.get("top_n", 8))))
+    budget = min(30.0, max(0.5, float(
+        inputs.get("budget_seconds", 4.0))))
+    out = scan_dir_usage(real, top_n=top_n, budget_s=budget)
+    if "detail" not in out:
+        n = len(out["items"])
+        out["detail"] = (f"top {n} under {real} by subtree size "
+                         f"(apparent size, bounded scan)") if n \
+            else f"nothing under {real}"
+    return out
+
+
+def storage_find(inputs: dict, ctx: dict) -> dict:
+    """P5 ㉑ "which files are over X" / "my biggest files": the
+    FILE-level lens of the disk breakdown. House scope (_fs_path),
+    apparent size, bounded walk with floor semantics. Read-only."""
+    from core.storage_scan import find_big_files
+    path = (inputs.get("path") or "").strip()
+    real = _fs_path(path or "~", allow_external=True)
+    top_n = min(50, max(1, int(inputs.get("top_n", 10))))
+    min_bytes = int(inputs.get("min_bytes", 0))
+    budget = min(30.0, max(1.0, float(inputs.get("budget_seconds", 6.0))))
+    out = find_big_files(real, min_bytes=min_bytes, top_n=top_n,
+                         budget_s=budget)
+    if "detail" not in out:
+        n = len(out["items"])
+        out["detail"] = (f"top {n} file(s) under {real} by apparent "
+                         f"size (bounded scan)") if n \
+            else (f"no files of that size under {real}")
+    return out
+
+
+def storage_growth(inputs: dict, ctx: dict) -> dict:
+    """P5 ㉓ \"what grew on my disk\": the laptop executes the scan +
+    ledger diff; single behavior source in core/storage_scan.py
+    (this wrapper only makes the _fs_path scope decision). The
+    ledger file is assistant-internal state on this host."""
+    from core.storage_scan import storage_growth as _h
+    path = (inputs.get("path") or "").strip()
+    real = _fs_path(path or "~", allow_external=True)
+    top_n = min(20, max(1, int(inputs.get("top_n", 10))))
+    budget = min(30.0, max(1.0, float(inputs.get("budget_seconds", 30.0))))
+    return _h(real, top_n=top_n, budget_s=budget)
+
+
+def storage_copy(inputs: dict, ctx: dict) -> dict:
+    """Copy a file (or directory tree) between allowed roots and
+    removable mounts: destination validation FIRST, capacity pre-check,
+    conflict policy (default ask -> structured result, never
+    overwrites), sha256 verify, bounded. A failed/unverified copy
+    leaves the destination partial file REMOVED — never reported as
+    success."""
+    import hashlib as _hashlib
+    import shutil as _sh
+    import uuid as _uuid
+    src = _fs_path(inputs.get("src") or "", allow_external=True)
+    dst = inputs.get("dst") or ""
+    on_conflict = inputs.get("on_conflict", "ask")
+    if on_conflict not in ("ask", "rename"):
+        raise ValueError("on_conflict must be 'ask' or 'rename'")
+    dtree = fs_copy_tree
+    dst_real = _fs_path(dst, allow_external=True)   # validates dst FIRST
+    dst_dir = os.path.dirname(dst_real)
+    if os.path.isdir(src):
+        return dtree(inputs, src, dst, on_conflict)
+    if not os.path.isfile(src):
+        raise FileNotFoundError(src)
+    os.makedirs(dst_dir, exist_ok=True)
+    # capacity pre-check on destination
+    du = _sh.disk_usage(dst_dir)
+    src_size = os.path.getsize(src)
+    if du.free < src_size:
+        return {"copied": False, "verified": False, "stage": "capacity",
+                "needed_bytes": src_size, "free_bytes": du.free,
+                "detail": "destination has less free space than the "
+                          "source needs — nothing was written"}
+    name = os.path.basename(dst_real)
+    if os.path.lexists(dst_real):
+        if on_conflict == "ask":
+            return {"copied": False, "verified": False,
+                    "stage": "conflict", "conflict": "exists",
+                    "dst": dst_real,
+                    "detail": "destination exists — rerun with "
+                              "on_conflict='rename' to auto-rename"}
+        b, ext = os.path.splitext(name)
+        i = 2
+        while os.path.lexists(os.path.join(dst_dir, f"{b} ({i}){ext}")):
+            i += 1
+        name = f"{b} ({i}){ext}"
+        dst_real = os.path.join(dst_dir, name)
+    tmp = os.path.join(dst_dir, f".zara-copy-{_uuid.uuid4().hex}")
+    renamed = name != os.path.basename(inputs.get("dst") or "")
+    try:
+        with open(src, "rb") as fsrc, open(tmp, "wb") as fdst:
+            _sh.copyfileobj(fsrc, fdst, 1024 * 1024)
+        # verify: sha256 streamed from both sides
+        h_src, h_tmp = _hashlib.sha256(), _hashlib.sha256()
+        with open(src, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h_src.update(chunk)
+        with open(tmp, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h_tmp.update(chunk)
+        verified = h_src.hexdigest() == h_tmp.hexdigest()
+        if not verified:
+            os.unlink(tmp)
+            return {"copied": True, "verified": False, "stage": "verify",
+                    "detail": "sha256 mismatch — partial file removed",
+                    "src": src, "dst": dst_real}
+        os.rename(tmp, dst_real)
+        return {"copied": True, "verified": True, "stage": "done",
+                "src": src, "dst": dst_real,
+                "renamed_to": name if renamed else None,
+                "size": src_size}
+    finally:
+        if os.path.lexists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def fs_copy_tree(inputs, src, dst, on_conflict):
+    """Directory copy: file-by-file through filesystem_copy semantics,
+    per-file verification, abort-on-first-unverified. Source never
+    touched. Result carries a per-file manifest (paths only)."""
+    import shutil as _sh
+    dst_real = _fs_path(dst, allow_external=True)
+    du = _sh.disk_usage(os.path.dirname(dst_real) or dst_real)
+    total = 0
+    for r, _d, files in os.walk(src):
+        for fn in files:
+            total += os.path.getsize(os.path.join(r, fn))
+    if total > du.free:
+        return {"copied": False, "verified": False, "stage": "capacity",
+                "needed_bytes": total, "free_bytes": du.free,
+                "detail": "destination free space below tree size — "
+                          "nothing was written"}
+    copied, manifest = 0, []
+    for r, dirs, files in os.walk(src):
+        rel = os.path.relpath(r, src)
+        target = os.path.join(dst, rel)
+        os.makedirs(_fs_path(target, allow_external=True),
+                    exist_ok=True)
+        for fn in files:
+            c = filesystem_copy({"src": os.path.join(r, fn),
+                                 "dst": os.path.join(target, fn),
+                                 "on_conflict": on_conflict}, ctx)
+            if not (c.get("copied") and c.get("verified")):
+                return {"copied": False, "verified": False,
+                        "stage": c.get("stage", "verify"),
+                        "detail": f"aborted after {copied} files: "
+                                  f"{c.get('detail', '')}",
+                        "manifest": manifest, "src": src, "dst": dst}
+            manifest.append(c["dst"])
+            copied += 1
+    return {"copied": True, "verified": True, "stage": "done",
+            "files": copied, "bytes": total, "manifest": manifest,
+            "src": src, "dst": dst}
+
+
+def storage_move(inputs2: dict, ctx: dict) -> dict:
+    """Cross-filesystem safe move: copy + verify THEN delete source
+    (only after a verified copy). Same-fs moves rename directly.
+    Never deletes on a failed or unverified copy."""
+    import shutil as _sh
+    src = _fs_path(inputs2.get("src") or "", allow_external=True)
+    dst = _fs_path(inputs2.get("dst") or "", allow_external=True)
+    if not os.path.lexists(src):
+        raise FileNotFoundError(src)
+    if dst == src:
+        raise ValueError("source and destination must differ")
+    same_fs = os.stat(src).st_dev == os.stat(
+        os.path.dirname(dst) or dst).st_dev
+    if same_fs:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if os.path.lexists(dst) and inputs2.get("on_conflict") != "rename":
+            return {"moved": False, "conflict": "exists", "src": src,
+                    "dst": dst}
+        if os.path.lexists(dst):
+            b, ext = os.path.splitext(dst)
+            i = 2
+            while os.path.lexists(f"{b} ({i}){ext}"):
+                i += 1
+            dst = f"{b} ({i}){ext}"
+        os.rename(src, dst)
+        return {"moved": os.path.lexists(dst) and
+                not os.path.lexists(src), "src": src, "dst": dst,
+                "verified": True}
+    copied = filesystem_copy({"src": src, "dst": dst,
+                              "on_conflict": inputs2.get(
+                                  "on_conflict", "ask")}, ctx)
+    if not (copied.get("copied") and copied.get("verified")):
+        return {"moved": False, "stage": copied.get("stage", "verify"),
+                "detail": "copy did not verify — source preserved, "
+                          "nothing deleted", "src": src,
+                "result": copied}
+    # verified copy in place: now delete source
+    if os.path.isdir(src):
+        _sh.rmtree(src)
+    else:
+        os.unlink(src)
+    return {"moved": not os.path.lexists(src), "src": src,
+            "dst": copied.get("dst"), "verified": True,
+            "renamed_to": copied.get("renamed_to")}
+
+
+def storage_mkdir(inputs: dict, ctx: dict) -> dict:
+    p = _fs_path(inputs.get("path") or "", allow_external=True)
+    os.makedirs(p, exist_ok=True)
+    return {"created": os.path.isdir(p), "path": p}
+
+
+def storage_delete(inputs: dict, ctx: dict) -> dict:
+    """Delete a file or bounded directory within allowed roots.
+    Requires `confirm: true` explicitly in the SAME call; refuses
+    otherwise (no defaults), requires the path to be inside allowed
+    roots or mounted removable media, and protects against root-level
+    asks on internal roots."""
+    import shutil as _sh
+    if not inputs.get("confirm"):
+        return {"deleted": False, "stage": "confirmation_required",
+                "detail": "deletion needs explicit confirm:true — "
+                          "nothing deleted"}
+    p = _fs_path(inputs.get("path") or "", allow_external=True)
+    real_roots = (os.path.realpath(HOME), "/tmp")
+    in_std = any(p == r or p.startswith(r + os.sep) for r in real_roots)
+    if in_std and p in real_roots or p == "/tmp":
+        raise PermissionError("refusing to delete an allowed root itself")
+    if not os.path.lexists(p):
+        raise FileNotFoundError(p)
+    if os.path.isdir(p):
+        n = 0
+        for r, _d, files in os.walk(p):
+            n += len(files)
+            if n > 100_000:
+                raise PermissionError(
+                    "directory too large for a single delete — "
+                    "refused (delete in smaller batches)")
+        _sh.rmtree(p)
+        ok = not os.path.lexists(p)
+    else:
+        os.unlink(p)
+        ok = not os.path.lexists(p)
+    return {"deleted": ok, "path": p, "verified": ok}
+
+
+# ---- Stage 21: agent-side relay send/fetch (bytes never pass through
+# Core tool envelopes; the relay enforces digests + recipient ack) ----
+
+_XFER_MAX = 5 * 1024 * 1024   # relay single-transfer ceiling (must match core)
+
+
+def storage_xfer_send(inputs: dict, ctx: dict) -> dict:
+    """Send a file within this agent's allowed roots/removable mounts
+    to another enrolled device via the Core relay. Digest computed
+    locally; each chunk is digest-enforced server-side; bounded wait
+    for the recipient's ack. >5 MiB is refused with the precise
+    limitation (relay design), never partially sent."""
+    agent = ctx.get("agent")
+    if agent is None:
+        return {"verified": False, "error": "agent transport context "
+                "absent (tool must run inside the device agent)"}
+    recipient = inputs.get("recipient_device") or ""
+    if not recipient:
+        return {"verified": False, "error": "recipient_device required"}
+    src = _fs_path(inputs.get("src") or "", allow_external=True)
+    if not os.path.isfile(src):
+        return {"verified": False, "error": f"no such file: {src}"}
+    size = os.path.getsize(src)
+    if size <= 0 or size > _XFER_MAX:
+        return {"verified": False, "error":
+                f"relay ceiling {size}B not within 1..{_XFER_MAX} — "
+                "nothing sent", "size": size}
+    with open(src, "rb") as f:
+        data = f.read()
+    import hashlib as _hl
+    digest = _hl.sha256(data).hexdigest()
+    try:
+        rec = agent.xfer_request(recipient, os.path.basename(src), data)
+        tid = rec.get("transfer_id") or ""
+        if not tid:
+            return {"verified": False, "error":
+                    f"relay refused: {rec.get('error', 'no record')[:150]}"
+                    if isinstance(rec, dict) else "relay refused"}
+        out = agent.xfer_upload(tid, data)
+    except Exception as e:  # noqa: BLE001 — network/relay errors per-item
+        return {"verified": False, "error": str(e)[:180],
+                "detail": "source untouched"}
+    # bounded ack wait (recipient fetch typically lands over long-poll)
+    deadline = time.time() + float(inputs.get("ack_wait_s", 45.0))
+    acked = False
+    state = ""
+    while time.time() < deadline:
+        try:
+            rec = ctx.get("_xfer_probe") or agent  # test hook or default
+            r = agent._authed_request("GET",
+                                      f"/v1/agent/xfer/{tid}", None)
+            state = (r or {}).get("state", "")
+            if state == "succeeded":
+                acked = True
+                break
+            if state in ("cancelled", "expired", "failed", "rejected"):
+                break
+        except Exception:
+            state = ""
+        time.sleep(1.5)
+    return {"uploaded": True, "acked": acked, "verified": True,
+            "sha256": digest, "size": size, "transfer_id": tid,
+            "status": ("delivered" if acked else
+                       "sent_awaiting_fetch"), "relay_state": state}
+
+
+def storage_xfer_fetch(inputs: dict, ctx: dict) -> dict:
+    """Stage-15 fetch, then write the verified bytes into a
+    destination directory (allowed roots or removable mounts).
+    Conflict policy: auto-rename, never overwrite. Digest double-check
+    after write; a mismatch removes the partial file and reports."""
+    agent = ctx.get("agent")
+    if agent is None:
+        return {"verified": False, "error": "agent transport context "
+                "absent"}
+    tid = inputs.get("transfer_id") or ""
+    dst_dir = _fs_path(inputs.get("dst_dir") or "", allow_external=True)
+    try:
+        payload, ack = agent.xfer_download(tid)
+    except Exception as e:  # noqa: BLE001
+        return {"verified": False, "error": str(e)[:200]}
+    import hashlib as _hl
+    digest = _hl.sha256(payload).hexdigest()
+    name = inputs.get("filename") or ""
+    if not name or os.path.basename(name) != name:
+        # derive from the recipient's pending list (no device-scoped
+        # single-record GET exists; the old operator-path GET always
+        # 404s here and silently fell back to "relay-<id>" names)
+        try:
+            for r in agent.xfer_pending().get("to_download", []):
+                if r.get("transfer_id") == tid:
+                    name = (r.get("filename") or "") or name
+                    break
+        except Exception:
+            name = f"relay-{tid[-8:]}"
+    if not name or os.path.basename(name) != name:
+        name = f"relay-{tid[-8:]}"
+    dst = os.path.join(dst_dir, name)
+    i = 2
+    while os.path.lexists(dst):
+        b, ext = os.path.splitext(name)
+        dst = os.path.join(dst_dir, f"{b} ({i}){ext}")
+        i += 1
+    tmp = os.path.join(dst_dir, f".zara-fetch-{os.getpid()}")
+    ok = False
+    try:
+        with open(tmp, "wb") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        # verify the written bytes independently
+        with open(tmp, "rb") as f:
+            h = _hl.sha256()
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        if h.hexdigest() != digest:
+            os.unlink(tmp)
+            return {"verified": False, "error": "post-write digest "
+                    "mismatch — partial file removed"}
+        os.rename(tmp, dst)
+        ok = True
+    except OSError as e:
+        try:
+            if os.path.lexists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+        return {"verified": False, "error": f"write failed: {e}"[:180]}
+    return {"verified": ok, "dst": dst, "sha256": digest,
+            "size": len(payload)}
+
+
+# ---- Stage 21: interactive display config (supported interfaces
+# only; preview is read-only, apply is confirm-gated and verified) ----
+
+def display_preview_config(inputs: dict, ctx: dict) -> dict:
+    from . import display_linux as _dl
+    mode = (inputs or {}).get("mode", "")
+    if not mode:
+        desc = _dl.describe_config()
+        return {"ok": bool(desc.get("available")), **desc}
+    out = _dl.preview_config(mode)
+    return out
+
+
+def display_set_config(inputs: dict, ctx: dict) -> dict:
+    from . import display_linux as _dl
+    mode = (inputs or {}).get("mode", "")
+    confirm = bool((inputs or {}).get("confirm", False))
+    out = _dl.apply_config(mode, confirm=confirm)
+    return out
+
+
+def display_stream_status(inputs: dict, ctx: dict) -> dict:
+    from . import display_linux as _dl
+    from . import pipewire_linux as _pw
+    from .screencast_linux import engine
+    out = _dl.stream_status()
+    out["screencast_session"] = engine().status()
+    ok, why = _pw.gst_available()
+    out["pipewire_media"] = {"usable": ok, "reason": why,
+                             "transport": "sd-bus fd + gst pipewiresrc"}
+    return out
+
+
+def display_cast_start(inputs: dict, ctx: dict) -> dict:
+    from .screencast_linux import engine
+    confirm = bool((inputs or {}).get("confirm", False))
+    return engine().start(confirm=confirm)
+
+
+def display_cast_stop(inputs: dict, ctx: dict) -> dict:
+    from .screencast_linux import engine
+    return engine().stop()
+
+
+def bluetooth_devices(inputs: dict, ctx: dict) -> dict:
+    from .discovery_linux import _bluetooth_items
+    items, meta = _bluetooth_items()
+    return {"devices": items, "adapter": meta,
+            "note": "read-only listing; pairing/connect are separate "
+                    "confirm-gated operations and require paired state"}
+
+
+_BT_HOOK: Optional[Callable] = None   # test hook: fake btctl runner
+
+
+def bluetooth_connect(inputs: dict, ctx: dict) -> dict:
+    from .discovery_linux import _session_bus_env
+    mac = (inputs or {}).get("mac", "").strip().upper().replace(
+        "-", ":")
+    confirm = bool((inputs or {}).get("confirm", False))
+    if not confirm:
+        return {"ok": False, "error": "explicit confirm=true required "
+                "to change a bluetooth device connection state"}
+    if not re.fullmatch(r"[0-9A-F]{2}(?::[0-9A-F]{2}){5}", mac or ""):
+        return {"ok": False, "error": "mac must be a device address the "
+                "bluetooth.devices listing reported (xx:xx:…)"
+                if mac else "mac parameter required",
+                "nothing_changed": True}
+    if not shutil.which("bluetoothctl"):
+        return {"ok": False, "error": "bluetoothctl absent — bluetooth "
+                "control unavailable on this host"}
+
+    def bt_run(argv, timeout=8.0):
+        if _BT_HOOK is not None:
+            return _BT_HOOK(argv)
+        try:
+            r = subprocess.run(argv, capture_output=True,
+                               timeout=timeout, text=True,
+                               errors="replace", check=False,
+                               env=_session_bus_env() or None)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return r.stdout if r.returncode == 0 else None
+
+    info = bt_run(["bluetoothctl", "info", mac]) or ""
+    if not re.search(r"^\s*Name:", info, re.M):
+        return {"ok": False, "error": f"device {mac} is not a known "
+                "registered device; nothing was changed",
+                "note": "discovery of NEW devices is unsupported on the "
+                        "operate path — use the OS bluetooth UI to "
+                        "pair once"}
+    if not re.search(r"^\s*Paired: yes", info, re.M):
+        return {"ok": False, "error": f"device {mac} is not paired — "
+                "connecting requires pairing first, which needs an "
+                "interactive agent and is unsupported here",
+                "nothing_changed": True}
+    if re.search(r"^\s*Blocked: yes", info, re.M):
+        return {"ok": False, "error": f"device {mac} is blocked; "
+                "unblocking must be done in the OS UI",
+                "nothing_changed": True}
+    if re.search(r"^\s*Connected: yes", info, re.M):
+        return {"ok": True, "verified": True, "detail": f"device {mac} "
+                "was already connected; no change made"}
+    connect_desc = bt_run(["bluetoothctl", "connect", mac])
+    verify = bt_run(["bluetoothctl", "info", mac]) or ""
+    connected = bool(re.search(r"^\s*Connected: yes", verify, re.M))
+    return {"ok": connected, "verified": connected,
+            "detail": ("connected and verified by re-read" if connected
+                       else "connection attempt did not verify: "
+                       f"{(connect_desc or 'refused')[:120]} — no "
+                       "success claim")}
+
+
+def audio_sinks(inputs: dict, ctx: dict) -> dict:
+    from .audio_linux import audio_status
+    return audio_status()
+
+
+def network_discover(inputs: dict, ctx: dict) -> dict:
+    from .netdisco_linux import discover
+    raw = (inputs or {}).get("services")
+    services = [str(s) for s in raw] if isinstance(raw, list) else None
+    return discover(services=services, timeout_=2.0)
+
+
+def display_receivers(inputs: dict, ctx: dict) -> dict:
+    """Receiver discovery through the same bounded mDNS engine; every
+    record stays an unverified advertisement and creating a stream
+    remains unavailable (consent portal + receiver protocol stack)."""
+    from .netdisco_linux import discover
+    out = discover(timeout_=2.0,
+                   services=["_airplay._tcp", "_raop._tcp",
+                             "_googlecast._tcp", "_DIAL-service._tcp",
+                             "_spotify-connect._tcp"])
+    return {**out,
+            "operation_note": "receivers are advertised identities "
+            "only; establishing a stream requires user consent and a "
+            "receiver protocol stack — neither runs automatically"}
+
+
+def audio_set_output(inputs: dict, ctx: dict) -> dict:
+    from .audio_linux import set_output
+    raw = (inputs or {}).get("sink_id")
+    confirm = bool((inputs or {}).get("confirm", False))
+    try:
+        sid = int(raw)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "sink_id must be an integer id "
+                "from audio.sinks", "nothing_changed": True}
+    return set_output(sid, confirm=confirm)
+
+
+# Stage 31-P2 (2026-10-20): laptop system control — P2a volume/mute/
+# brightness, P2b MPRIS playback. All in device/linux/syscontrol_linux.py;
+# every SET is re-read-verified on-device (see the module's discipline).
+# The confirm contract matches audio.set_output: confirm=False refuses
+# without changing anything.
+
+def volume_set(inputs: dict, ctx: dict) -> dict:
+    from .syscontrol_linux import volume_set as _h
+    return _h(inputs, ctx)
+
+
+def mute_set(inputs: dict, ctx: dict) -> dict:
+    from .syscontrol_linux import mute_set as _h
+    return _h(inputs, ctx)
+
+
+def brightness_read(inputs: dict, ctx: dict) -> dict:
+    from .syscontrol_linux import _read_brightness
+    return _read_brightness()
+
+
+def brightness_set(inputs: dict, ctx: dict) -> dict:
+    from .syscontrol_linux import brightness_set as _h
+    return _h(inputs, ctx)
+
+
+def now_playing(inputs: dict, ctx: dict) -> dict:
+    from .syscontrol_linux import now_playing as _h
+    return _h(inputs, ctx)
+
+
+def calendar_event_remove(inputs: dict, ctx: dict) -> dict:
+    """P5 feature-hunt ⑧ (2026-10-23): the laptop executes the
+    calendar removal; the single behavior source is
+    core/builtin_tools.py (the same function the core-local tests
+    pin)."""
+    import os as _os
+    from core.builtin_tools import calendar_event_remove as _h
+    if not _os.environ.get("ZARA_ICS_PATH"):
+        return {"ok": False, "committed": False,
+                "detail": "no calendar configured on the laptop — set "
+                          "ZARA_ICS_PATH once and ask again"}
+    return _h(inputs, ctx)
+
+
+def calendar_event_move(inputs: dict, ctx: dict) -> dict:
+    """P5 feature-hunt ⑯ (2026-10-23): the laptop executes the calendar
+    move; the single behavior source is core/builtin_tools.py (the
+    same function the core-local tests pin)."""
+    import os as _os
+    from core.builtin_tools import calendar_event_move as _h
+    if not _os.environ.get("ZARA_ICS_PATH"):
+        return {"ok": False, "committed": False,
+                "detail": "no calendar configured on the laptop — set "
+                          "ZARA_ICS_PATH once and ask again"}
+    return _h(inputs, ctx)
+
+
+def calendar_event_add(inputs: dict, ctx: dict) -> dict:
+    """P5 feature-hunt ⑥ (2026-10-23): the laptop executes the calendar
+    append; the single behavior source is core/builtin_tools.py (the
+    same function the core-local tests pin)."""
+    import os as _os
+    from core.builtin_tools import calendar_event_add as _h
+    # The agent reads its OWN env — the deployment sets ZARA_ICS_PATH for
+    # both the core and the agent (start_core.sh exports it once).
+    if not _os.environ.get("ZARA_ICS_PATH"):
+        return {"ok": False, "committed": False,
+                "detail": "no calendar configured on the laptop — set "
+                          "ZARA_ICS_PATH once and ask again"}
+    return _h(inputs, ctx)
+
+
+def playback_control(inputs: dict, ctx: dict) -> dict:
+    from .syscontrol_linux import playback_control as _h
+    return _h(inputs, ctx)
+
+
+
+# tip: `import time` is available at module scope (stdlib import).
+
+
 LINUX_TOOLS: list[tuple[ToolDefinition, object]] = [
-    (_def("system.battery", "Linux battery state", {"type": "object", "properties": {}},
+    (_def("storage.volumes", "List mounted removable volumes with usage and "
+          "read/write state. Read-only.", {"type": "object", "properties": {}},
+          ["storage.read"], 0.05, PermissionLevel.PUBLIC, RiskLevel.SAFE),
+     storage_volumes),
+    (_def("storage.capacity", "Free/used/total space of a mounted removable "
+          "volume or allowed path. Read-only.",
+          {"type": "object", "required": ["mount"],
+           "properties": {"mount": {"type": "string"}}},
+          ["storage.read"], 0.02, PermissionLevel.PUBLIC, RiskLevel.SAFE),
+     storage_capacity),
+    (_def("storage.stats", "Media-category statistics of removable storage "
+          "(videos/audio/images/documents/other) without loading file names "
+          "into memory. Read-only.",
+          {"type": "object", "required": ["mount"],
+           "properties": {"mount": {"type": "string"},
+                          "max_entries": {"type": "integer"}}},
+          ["storage.read"], 0.4, PermissionLevel.RESTRICTED,
+          RiskLevel.SAFE, timeout=90.0),
+     storage_stats),
+    (_def("storage.scan", "Top level-1 directories of a home/allowed "
+          "path by subtree size (apparent size; symlinks never "
+          "followed; hard links deduped within a bounded window); "
+          "bounded by a time/entry budget — partial walks are floors "
+          "and say so. Read-only.",
+          {"type": "object", "properties": {
+              "path": {"type": "string"},
+              "top_n": {"type": "integer"},
+              "budget_seconds": {"type": "number"}}},
+          ["storage.read"], 0.6, PermissionLevel.PUBLIC,
+          RiskLevel.SAFE, timeout=91.0),
+     storage_scan),
+    (_def("storage.find", "P5 ㉑ \"which files are over 1 GB\" / \"my "
+          "biggest files\": rank FILE paths under a home/allowed "
+          "path by apparent size with an optional size floor; "
+          "apparent size; symlinks never followed; hard links "
+          "deduped within a bounded window; bounded walk — partials "
+          "are floors and say so. Paths are returned (bounded to "
+          "top_n). Read-only.",
+          {"type": "object", "properties": {
+              "path": {"type": "string"},
+              "min_bytes": {"type": "integer"},
+              "top_n": {"type": "integer"},
+              "budget_seconds": {"type": "number"}}},
+          ["storage.read"], 0.6, PermissionLevel.PUBLIC,
+          RiskLevel.SAFE, timeout=91.0),
+     storage_find),
+    (_def("storage.growth", "P5 ㉓ \"what grew on my disk\": the "
+          "current folder breakdown is diffed against the last "
+          "saved assistant-internal baseline for the same root, "
+          "then saved as the new baseline. Grown/shrunk/new/gone "
+          "rows are byte deltas matched by name; a diff over a "
+          "PARTIAL scan is refused (floors delta to noise); NO "
+          "baseline means an honest first run that saves one. "
+          "Aggregate level-1 sizes only are persisted — no file "
+          "paths, no content. Read-only toward user data.",
+          {"type": "object", "properties": {
+              "path": {"type": "string"},
+              "top_n": {"type": "integer"},
+              "budget_seconds": {"type": "number"}}},
+          ["storage.read"], 0.6, PermissionLevel.PUBLIC,
+          RiskLevel.SAFE, timeout=91.0),
+     storage_growth),
+    (_def("fs.checksum", "P5 ㉒ chunked digest of one device-scoped "
+          "file (sha256 default; sha1/md5/sha512 named explicitly). "
+          "The DIGEST is returned — never file content; bytes hashed "
+          "are counted. Read-only.",
+          {"type": "object", "required": ["path"],
+           "properties": {"path": {"type": "string"},
+                          "algo": {"type": "string"}}},
+          ["filesystem.read"], 0.6, PermissionLevel.RESTRICTED,
+          RiskLevel.SAFE, timeout=91.0),
+     fs_checksum),
+    (_def("storage.copy", "Copy a file or directory between allowed roots "
+          "and mounted removable media. Verified (sha256); conflicts ask "
+          "first; never overwrites without an explicit policy.",
+          {"type": "object", "required": ["src", "dst"],
+           "properties": {"src": {"type": "string"},
+                          "dst": {"type": "string"},
+                          "on_conflict": {"type": "string",
+                                          "enum": ["ask", "rename"]}}},
+          ["filesystem.write"], 0.2, PermissionLevel.CONFIRM,
+          RiskLevel.CONFIRM, timeout=120.0),
+     storage_copy),
+    (_def("storage.move", "Move a file/directory within allowed roots or "
+          "removable media: copy+verify then delete source only after a "
+          "verified copy; conflicts ask.",
+          {"type": "object", "required": ["src", "dst"],
+           "properties": {"src": {"type": "string"},
+                          "dst": {"type": "string"},
+                          "on_conflict": {"type": "string",
+                                          "enum": ["ask", "rename"]}}},
+          ["filesystem.write"], 0.25, PermissionLevel.CONFIRM,
+          RiskLevel.CONFIRM, timeout=120.0),
+     storage_move),
+    (_def("storage.mkdir", "Create a folder under allowed roots or "
+          "mounted removable media.",
+          {"type": "object", "required": ["path"],
+           "properties": {"path": {"type": "string"}}},
+          ["filesystem.write"], 0.05, PermissionLevel.CONFIRM,
+          RiskLevel.CONFIRM),
+     storage_mkdir),
+    (_def("storage.delete", "Delete a file/folder inside allowed roots or "
+          "mounted removable media. Requires explicit confirm in the same "
+          "call; large trees refused.",
+          {"type": "object", "required": ["path", "confirm"],
+           "properties": {"path": {"type": "string"},
+                          "confirm": {"type": "boolean"}}},
+          ["filesystem.write"], 0.15, PermissionLevel.CONFIRM,
+          RiskLevel.CONFIRM),
+     storage_delete),
+    (_def("storage.xfer_send", "Send a file within this device's allowed "
+          "roots or removable mounts to another enrolled device through "
+          "the Core relay (chunked, digest-enforced; 5 MiB ceiling).",
+          {"type": "object", "required": ["src", "recipient_device"],
+           "properties": {"src": {"type": "string"},
+                          "recipient_device": {"type": "string"},
+                          "ack_wait_s": {"type": "number"}}},
+          ["files.relay"], 0.3, PermissionLevel.CONFIRM,
+          RiskLevel.CONFIRM, timeout=120.0),
+     storage_xfer_send),
+    (_def("calendar.event.add", "Append one NEW event to a configured "
+          "ZARA_ICS_PATH calendar (summary + start required; optional "
+          "end, description, location, calendar selector). Duplicate "
+          "title+start refused; write atomic; re-parse verified. A "
+          "WRITE TO OPERATOR DATA: never auto-approved.",
+          {"type": "object", "required": ["summary", "dtstart"],
+           "properties": {"summary": {"type": "string", "maxLength": 120},
+                          "dtstart": {"type": "string",
+                                      "pattern": r"^20\d{6}(T\d{6}Z?)?$"},
+                          "dtend": {"type": "string",
+                                    "pattern": r"^20\d{6}(T\d{6}Z?)?$"},
+                          "description": {"type": "string",
+                                          "maxLength": 500},
+                          "location": {"type": "string", "maxLength": 120},
+                          "calendar": {"type": "string", "maxLength": 60},
+                          "confirm": {"type": "boolean"}}},
+          ["calendar.write"], 0.05, PermissionLevel.CONFIRM,
+          RiskLevel.CONFIRM),
+     calendar_event_add),
+    (_def("calendar.event.remove", "Remove exactly ONE matched VEVENT "
+          "from a configured ZARA_ICS_PATH calendar (uid, or summary "
+          "with an optional dtstart/date pin). Ambiguous titles "
+          "refuse with candidates; a repeating parent removes the "
+          "whole series and reports it; atomic; re-parse verified.",
+          {"type": "object", "required": [],
+           "properties": {"uid": {"type": "string", "maxLength": 200},
+                          "summary": {"type": "string",
+                                      "maxLength": 120},
+                          "dtstart": {"type": "string",
+                                      "pattern": r"^20\d{6}(T\d{6})?$"},
+                          "calendar": {"type": "string",
+                                       "maxLength": 60},
+                          "confirm": {"type": "boolean"}}},
+          ["calendar.write"], 0.05, PermissionLevel.CONFIRM,
+          RiskLevel.CONFIRM),
+     calendar_event_remove),
+    (_def("calendar.event.move", "Move ONE matched VEVENT's start on "
+          "a configured ZARA_ICS_PATH calendar (uid, or summary with "
+          "an optional dtstart/date pin). new_start/full pin, "
+          "new_date keeps the time-of-day, new_clock keeps the date; "
+          "all-day and timed kinds never mix; duration preserved; "
+          "collisions refuse; atomic; re-parse verified.",
+          {"type": "object", "required": [],
+           "properties": {"uid": {"type": "string", "maxLength": 200},
+                          "summary": {"type": "string",
+                                      "maxLength": 120},
+                          "dtstart": {"type": "string",
+                                      "pattern": r"^20\d{6}(T\d{6})?$"},
+                          "new_start": {"type": "string",
+                                        "pattern":
+                                        r"^20\d{6}(T\d{6}Z?)?$"},
+                          "new_date": {"type": "string",
+                                       "pattern": r"^20\d{6}$"},
+                          "new_clock": {"type": "string",
+                                        "maxLength": 8},
+                          "new_end": {"type": "string",
+                                      "pattern":
+                                      r"^20\d{6}(T\d{6}Z?)?$"},
+                          "calendar": {"type": "string",
+                                       "maxLength": 60},
+                          "confirm": {"type": "boolean"}}},
+          ["calendar.write"], 0.05, PermissionLevel.CONFIRM,
+          RiskLevel.CONFIRM),
+     calendar_event_move),
+    (_def("storage.xfer_fetch", "Fetch a completed relay transfer and "
+          "write the digest-verified bytes into a destination directory "
+          "(auto-rename on conflict; never overwrites).",
+          {"type": "object", "required": ["transfer_id", "dst_dir"],
+           "properties": {"transfer_id": {"type": "string"},
+                          "dst_dir": {"type": "string"},
+                          "filename": {"type": "string"}}},
+          ["files.relay"], 0.2, PermissionLevel.CONFIRM,
+          RiskLevel.CONFIRM, timeout=120.0),
+     storage_xfer_fetch),
+    (_def("display.preview_config", "Read-only display-layout report, or "
+          "a compute-only preview of one layout change (never "
+          "executes anything).",
+          {"type": "object",
+           "properties": {"mode": {"type": "string"}}},
+          ["display.config"], 0.05, PermissionLevel.PUBLIC,
+          RiskLevel.SAFE),
+     display_preview_config),
+    (_def("display.set_config", "Apply one display layout change "
+          "(single|extend_right|duplicate) after an explicit "
+          "operator confirm; verified by re-reading geometry.",
+          {"type": "object",
+           "required": ["mode", "confirm"],
+           "properties": {"mode": {"type": "string"},
+                          "confirm": {"type": "boolean"}}},
+          ["display.config"], 0.2, PermissionLevel.CONFIRM,
+          RiskLevel.CONFIRM),
+     display_set_config),
+    (_def("display.stream_status", "Read-only screen-casting status: "
+          "portal/Mutter availability, receiver-honesty ledger, and "
+          "the current consent-driven session-lifecycle state. The "
+          "media streaming operation itself stays unavailable in this "
+          "build (exact reason reported).",
+          {"type": "object", "properties": {}},
+          ["display.config"], 0.05, PermissionLevel.PUBLIC,
+          RiskLevel.SAFE, timeout=90.0),
+     display_stream_status),
+    (_def("display.cast_start", "Start a consent-driven screen-sharing "
+          "lifecycle through the real XDG ScreenCast portal: creates a "
+          "portal session, shows the actual desktop source-selection "
+          "consent dialog, and on consent reports the selected sources "
+          "plus this build's exact media limitation, then verifies "
+          "teardown. Never captures frames; never bypasses consent; "
+          "requires confirm.",
+          {"type": "object", "required": ["confirm"],
+           "properties": {"confirm": {"type": "boolean"}}},
+          ["display.config"], 0.2, PermissionLevel.CONFIRM,
+          RiskLevel.CONFIRM, timeout=90.0),
+     display_cast_start),
+    (_def("display.cast_stop", "Stop screen-sharing session state and "
+          "verify the portal session is really closed (Closed signal "
+          "or verified object absence). Idempotent.",
+          {"type": "object", "properties": {"confirm": {"type": "boolean"}}},
+          ["display.config"], 0.1, PermissionLevel.PUBLIC,
+          RiskLevel.SAFE, timeout=90.0),
+     display_cast_stop),
+    (_def("bluetooth.devices", "List registered bluetooth peripherals "
+          "with their own advertised services (read-only; never "
+          "pairs/scan/connect).",
+          {"type": "object", "properties": {}},
+          ["bluetooth.observe"], 0.05, PermissionLevel.PUBLIC,
+          RiskLevel.SAFE, timeout=90.0),
+     bluetooth_devices),
+    (_def("bluetooth.connect", "Connect an ALREADY-PAIRED bluetooth "
+          "device after an explicit operator confirm; verified by "
+          "re-reading the adapter state. Pairing of new devices "
+          "requires an interactive agent and is unsupported here.",
+          {"type": "object", "required": ["mac", "confirm"],
+           "properties": {"mac": {"type": "string"},
+                          "confirm": {"type": "boolean"}}},
+          ["bluetooth.control"], 0.2, PermissionLevel.CONFIRM,
+          RiskLevel.CONFIRM, timeout=90.0),
+     bluetooth_connect),
+    (_def("audio.sinks", "Read-only desktop audio routing report "
+          "(PipeWire wpctl): devices, sinks, sources, streams and the "
+          "current default output.",
+          {"type": "object", "properties": {}},
+          ["audio.observe"], 0.05, PermissionLevel.PUBLIC,
+          RiskLevel.SAFE, timeout=90.0),
+     audio_sinks),
+    (_def("audio.set_output", "Route the default desktop audio output "
+          "to a sink id from audio.sinks after an explicit operator "
+          "confirm; verified by re-reading the default marker.",
+          {"type": "object", "required": ["sink_id", "confirm"],
+           "properties": {"sink_id": {"type": "integer"},
+                          "confirm": {"type": "boolean"}}},
+          ["audio.routing"], 0.2, PermissionLevel.CONFIRM,
+          RiskLevel.CONFIRM, timeout=90.0),
+     audio_set_output),
+    (_def("audio.volume.set", "Set the desktop volume (the default audio "
+          "output) to `level` (0-100) or adjust by `delta` (volume "
+          "points, e.g. 10 = +10). Requires confirm=true; VERIFIED by "
+          "re-reading the volume after the change. Nothing is invented: "
+          "'applied' means the re-read shows the requested state.",
+          {"type": "object",
+           "oneOf": [{"required": ["level", "confirm"]},
+                     {"required": ["delta", "confirm"]}],
+           "properties": {"level": {"type": "number", "minimum": 0,
+                                    "maximum": 100},
+                          "delta": {"type": "number", "minimum": -100,
+                                    "maximum": 100},
+                          "confirm": {"type": "boolean"}}},
+          ["audio.volume"], 0.08, PermissionLevel.CONFIRM,
+          RiskLevel.CONFIRM, timeout=90.0),
+     volume_set),
+    (_def("audio.mute.set", "Mute or unmute the desktop default audio "
+          "output (mode: on/off/toggle). Requires confirm=true; "
+          "VERIFIED by re-reading the MUTED state after the change.",
+          {"type": "object", "required": ["mode", "confirm"],
+           "properties": {"mode": {"type": "string",
+                                   "enum": ["on", "off", "toggle"]},
+                          "confirm": {"type": "boolean"}}},
+          ["audio.volume"], 0.08, PermissionLevel.CONFIRM,
+          RiskLevel.CONFIRM, timeout=90.0),
+     mute_set),
+    (_def("display.brightness", "Read the laptop backlight level "
+          "(sysfs API). Read-only: honest availability report — "
+          "'no sysfs backlight device' on machines whose panel is "
+          "controlled another way.",
+          {"type": "object", "properties": {}},
+          ["display.brightness"], 0.03, PermissionLevel.PUBLIC,
+          RiskLevel.SAFE, timeout=15.0),
+     brightness_read),
+    (_def("display.brightness.set", "Set the laptop backlight to pct "
+          "(1-100). Requires confirm=true; VERIFIED by re-reading the "
+          "brightness file after the write. A permission-refused write "
+          "is reported plainly — nothing is faked.",
+          {"type": "object", "required": ["pct", "confirm"],
+           "properties": {"pct": {"type": "number", "minimum": 1,
+                                  "maximum": 100},
+                          "confirm": {"type": "boolean"}}},
+          ["display.brightness"], 0.15, PermissionLevel.CONFIRM,
+          RiskLevel.CONFIRM, timeout=15.0),
+     brightness_set),
+    (_def("media.now_playing", "Read-only MPRIS report: every player "
+          "that advertised the standard desktop interface on the user "
+          "session bus, with its PlaybackStatus. Honest empty answer "
+          "when nothing is playing — never fabricated.",
+          {"type": "object", "properties": {}},
+          ["media.playback"], 0.03, PermissionLevel.PUBLIC,
+          RiskLevel.SAFE, timeout=15.0),
+     now_playing),
+    (_def("media.playback", "Desktop media transport for ANY local "
+          "player that exports the standard MPRIS interface (browser, "
+          "music player, ...): play/pause/play_pause/stop verify by "
+          "re-reading PlaybackStatus; next/previous are declared "
+          "'sent' honestly (a track-id change is not verifiable "
+          "through the status alone). Requires confirm=true.",
+          {"type": "object", "required": ["action", "confirm"],
+           "properties": {"action": {"type": "string",
+                                     "enum": ["play_pause", "play",
+                                              "pause", "next",
+                                              "previous", "stop"]},
+                          "confirm": {"type": "boolean"}}},
+          ["media.playback"], 0.08, PermissionLevel.CONFIRM,
+          RiskLevel.CONFIRM, timeout=15.0),
+     playback_control),
+    (_def("network.discover", "One bounded mDNS/DNS-SD discovery pass "
+          "for ADVERTISED services on the local network (std lib "
+          "legacy-unicast probe; .local domain only; no port scan; "
+          "results are unverified device claims, never trust).",
+          {"type": "object",
+           "properties": {"services": {"type": "array",
+                                       "items": {"type": "string"}}}},
+          ["network.discover"], 0.05, PermissionLevel.PUBLIC,
+          RiskLevel.SAFE, timeout=90.0),
+     network_discover),
+    (_def("display.receivers", "Bounded mDNS discovery of advertised "
+          "screen-receiver services (AirPlay/GCast/DIAL/RAOP). "
+          "Records are unverified claims; stream creation stays "
+          "unavailable (portal consent + receiver protocol stack).",
+          {"type": "object", "properties": {}},
+          ["display.config"], 0.05, PermissionLevel.PUBLIC,
+          RiskLevel.SAFE, timeout=90.0),
+     display_receivers),
+    (_def("system.health", "Instantaneous read-only laptop health: "
+          "disk free/used percent, RAM total/available/used "
+          "percent, 1/5/15-minute load, cores, uptime days. Plain "
+          "facts from /proc and statvfs.",
+          {"type": "object", "properties": {}}, ["system.health"],
+          0.01, PermissionLevel.PUBLIC, RiskLevel.SAFE),
+     system_health),
+    (_def("system.top", "P5 ⑲ \"what's slowing my laptop\": ONE "
+          "non-interactive process snapshot ranked over a short "
+          "sampling window — per-process CPU delta (of total system "
+          "cpu) and resident memory (RSS); names from cmdline (first "
+          "arg, basename, bounded — full command lines deliberately "
+          "NOT kept: a terminal's argv can embed secret tokens); "
+          "kernel threads shown bracketed; vanished entries skipped "
+          "AND counted. Read-only.",
+          {"type": "object", "properties": {
+              "sort": {"type": "string", "enum": ["cpu", "memory"]},
+              "top_n": {"type": "integer"}}},
+          ["system.health"], 0.1, PermissionLevel.PUBLIC,
+          RiskLevel.SAFE, timeout=90.0),
+     system_top),
+    (_def("system.connectivity", "P5 ⑳ \"is my internet actually "
+          "working\": bounded layered probes beyond NIC-up state — "
+          "keyless DNS resolution, raw TCP to allowlisted public "
+          "relay endpoints, and an end-to-end HTTP(S) 204 check "
+          "(DNS+TCP+TLS+HTTP; catches captive portals and proxies). "
+          "Descriptive verdicts, measured latencies, bounded waits; "
+          "read-only.",
+          {"type": "object", "properties": {}},
+          ["system.health"], 0.05, PermissionLevel.PUBLIC,
+          RiskLevel.SAFE, timeout=90.0),
+     system_connectivity),
+    (_def("system.battery", "Linux battery state",
+          {"type": "object", "properties": {}},
           ["system.battery"], 0.01), system_battery),
     (_def("system.battery.charging_time", "Estimated time to full charge based on "
           "recent charging history. Returns null if unavailable or not charging. "
@@ -1300,10 +3253,46 @@ LINUX_TOOLS: list[tuple[ToolDefinition, object]] = [
     (_def("desktop.session", "Graphical session type from the environment.",
           {"type": "object", "properties": {}}, ["desktop.session"], 0.01,
           PermissionLevel.PUBLIC, RiskLevel.SAFE), desktop_session),
+    (_def("desktop.apps.list", "Launchable desktop applications "
+          "(.desktop app_id + label, capped). Read-only discovery "
+          "metadata — never an authorization. Linux-only.",
+          {"type": "object", "properties": {}}, ["desktop.apps.list"],
+          0.01, PermissionLevel.PUBLIC, RiskLevel.SAFE),
+     desktop_apps_list),
+    (_def("desktop.app.open", "Launch one installed desktop application "
+          "by .desktop app_id via gtk-launch (detached, no shell). "
+          "Verified by X11 window re-read; Wayland reports requested "
+          "honestly. Linux-only.",
+          {"type": "object", "required": ["app_id"],
+           "additionalProperties": False,
+           "properties": {"app_id": {
+               "type": "string", "minLength": 1, "maxLength": 128,
+               "description": "app_id from desktop.apps.list"}}},
+          ["desktop.app.open"], 0.1,
+          PermissionLevel.CONFIRM, RiskLevel.CONFIRM),
+     desktop_app_open),
     (_def("desktop.window.active", "Active-window title via X11 probe.",
           {"type": "object", "properties": {}}, ["desktop.window.active"],
           0.01, PermissionLevel.RESTRICTED, RiskLevel.SAFE),
      desktop_window_active),
+    (_def("desktop.window.list", "X11 window ids + titles via wmctrl. "
+          "Read-only; titles are untrusted. Linux-only.",
+          {"type": "object", "properties": {}}, ["desktop.window.list"],
+          0.01, PermissionLevel.RESTRICTED, RiskLevel.SAFE),
+     desktop_window_list),
+    (_def("desktop.window.action", "Focus, minimize, or gracefully close "
+          "one X11 window by id, verified by re-reading state. Close is "
+          "graceful (wmctrl -i -c), never forced. Linux-only.",
+          {"type": "object", "required": ["window_id", "action"],
+           "additionalProperties": False,
+           "properties": {"window_id": {
+               "type": "string", "pattern": r"^0x[0-9a-fA-F]{1,16}$",
+               "description": "window id from desktop.window.list"},
+               "action": {"type": "string",
+                          "enum": ["focus", "minimize", "close"]}}},
+          ["desktop.window.action"], 0.1,
+          PermissionLevel.CONFIRM, RiskLevel.HIGH_RISK),
+     desktop_window_action),
     (_def("desktop.screenshot", "Bounded screenshot to the scratch dir.",
           {"type": "object", "properties": {}}, ["desktop.screenshot"],
           0.05, PermissionLevel.RESTRICTED, RiskLevel.CONFIRM),
@@ -1371,12 +3360,51 @@ LINUX_TOOLS: list[tuple[ToolDefinition, object]] = [
            "properties": {"name": {"type": "string"}}},
           ["filesystem.write"], 0.02,
           perm=PermissionLevel.CONFIRM, risk=RiskLevel.CONFIRM), filesystem_delete),
+    (_def("filesystem.search",
+          "Find files by name inside an allowed root (read-only, bounded)",
+          {"type": "object", "required": ["pattern"],
+           "properties": {"pattern": {"type": "string"},
+                          "path": {"type": "string"},
+                          "max_results": {"type": "integer"}}},
+          ["filesystem.search"], 0.05), filesystem_search),
+    (_def("filesystem.edit",
+          "Replace one unambiguous substring in a scratch file "
+          "(atomic, backed up, verified by re-read)",
+          {"type": "object", "required": ["name", "old", "new"],
+           "properties": {"name": {"type": "string"},
+                          "old": {"type": "string"},
+                          "new": {"type": "string"},
+                          "backup": {"type": "boolean"}}},
+          ["filesystem.write"], 0.05,
+          perm=PermissionLevel.CONFIRM, risk=RiskLevel.CONFIRM), filesystem_edit),
+    (_def("filesystem.extract",
+          "Structured extract from one supported document (txt/md, "
+          "json, csv); unsupported formats reported honestly",
+          {"type": "object", "required": ["path"],
+           "properties": {"path": {"type": "string"}}},
+          ["filesystem.extract"], 0.04), filesystem_extract),
+    (_def("filesystem.move",
+          "Rename a scratch file within the scratch dir "
+          "(atomic, conflict-safe, verified by re-check)",
+          {"type": "object", "required": ["src", "dst"],
+           "properties": {"src": {"type": "string"},
+                          "dst": {"type": "string"},
+                          "overwrite": {"type": "boolean"}}},
+          ["filesystem.write"], 0.03,
+          perm=PermissionLevel.CONFIRM, risk=RiskLevel.CONFIRM), filesystem_move),
     (_def("shell.safe_readonly", "Allowlisted read-only commands, no shell",
           {"type": "object", "required": ["command"],
            "properties": {"command": {"type": "string"}}},
           ["terminal.safe"], 0.05,
           perm=PermissionLevel.CONFIRM, risk=RiskLevel.CONFIRM), shell_safe_readonly),
 ]
+
+# Stage 25: document intelligence + consent-based clipboard.
+from .docs_linux import DOC_TOOLS
+from .clipboard_linux import CLIPBOARD_TOOLS
+# Stage 28: host-side Android inventory (detection only, adb-backed).
+from .android_adb_linux import ANDROID_ADB_TOOLS
+LINUX_TOOLS += DOC_TOOLS + CLIPBOARD_TOOLS + ANDROID_ADB_TOOLS
 
 #: Capabilities the Linux agent advertises — derived from implemented tools.
 LINUX_CAPABILITIES = sorted({c for d, _ in LINUX_TOOLS for c in d.required_capabilities})

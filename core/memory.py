@@ -155,6 +155,28 @@ class MemoryStore:
         with self._lock:
             return self._items.pop(item_id, None) is not None
 
+    # Export/discovery contract (zara-memory-export-1, documented in
+    # docs/ACCEPTANCE_REPORT.md and the endpoint docstring): everything
+    # the store controls for THIS category boundary — no embeddings
+    # (derived data, huge, not user-meaningful beyond retrieval), no
+    # secrets (never stored), no credentials. Supersession provenance
+    # lives in metadata["supersedes"] when a correction was recorded.
+    EXPORT_FORMAT = "zara-memory-export-1"
+
+    def export(self) -> dict:
+        """Full user-facing export of ordinary memory in a stable,
+        documented JSON shape. Derived stores (embedding column) are
+        excluded by design; deletion removes them together with the
+        row, so a deleted item can never appear in a later export."""
+        with self._lock:
+            items = sorted(self._items.values(),
+                           key=lambda it: (it.created_at, it.id))
+            return {
+                "format": self.EXPORT_FORMAT,
+                "count": len(items),
+                "items": [it.model_dump(exclude={"embedding"}) for it in items],
+            }
+
     def set_pinned(self, item_id: str, pinned: bool) -> bool:
         """Mark/unmark a row as user-retained. Pinned rows are exempt
         from every automatic deletion (sweeps and purges); explicit

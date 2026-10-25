@@ -7,6 +7,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.hardware.display.DisplayManager
+import android.hardware.usb.UsbConstants
+import android.hardware.usb.UsbManager
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioFormat
@@ -16,8 +19,14 @@ import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.net.Uri
 import android.os.BatteryManager
 import android.os.Build
+import android.os.Environment
+import android.os.StatFs
+import android.os.storage.StorageManager
+import android.os.storage.StorageVolume
+import android.provider.MediaStore
 import androidx.core.content.ContextCompat
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -39,6 +48,65 @@ import io.flutter.plugin.common.MethodChannel
  * Audio honesty: capture returns real PCM-or-error; a dataclass/wiring
  * success is NEVER reported as human-heard or voice-detected.
  */
+/**
+ * Stage 31-P3 phase B (P3a): a LABELED self-test media session inside
+ * the app. Honest scope: it exists ONLY to exercise the production
+ * targeted-control path end-to-end on a device where every app played
+ * through (YouTube stops audio when it leaves the foreground), the
+ * transport -> state callback loop is OUR session, and the verdict
+ * observation is the real one. It is never a claim about other apps'
+ * sessions, and it lives only while explicitly created (release on
+ * demand + on app death).
+ */
+object MediaSelftest {
+    private var session: android.media.session.MediaSession? = null
+
+    fun start(context: android.content.Context): Map<String, Any?> {
+        release()
+        val s = android.media.session.MediaSession(context, "zara-selftest")
+        s.setCallback(object : android.media.session.MediaSession.Callback() {
+            override fun onPause() {
+                android.util.Log.d("ZaraMediaObs",
+                    "session onPause -> PAUSED")
+                s.setPlaybackState(setStateBuilder(
+                    android.media.session.PlaybackState.STATE_PAUSED))
+            }
+            override fun onPlay() {
+                s.setPlaybackState(setStateBuilder(
+                    android.media.session.PlaybackState.STATE_PLAYING))
+            }
+            override fun onStop() {
+                s.setPlaybackState(setStateBuilder(
+                    android.media.session.PlaybackState.STATE_STOPPED))
+            }
+        })
+        s.setPlaybackState(setStateBuilder(
+            android.media.session.PlaybackState.STATE_PLAYING))
+        s.isActive = true
+        session = s
+        return mapOf("supported" to true, "created" to true,
+            "package" to context.packageName)
+    }
+
+    fun release(): Map<String, Any?> {
+        try {
+            session?.release()
+        } catch (_: Exception) {
+        }
+        session = null
+        return mapOf("supported" to true, "released" to true)
+    }
+
+    private fun setStateBuilder(state: Int):
+        android.media.session.PlaybackState =
+        android.media.session.PlaybackState.Builder()
+            .setActions(android.media.session.PlaybackState.ACTION_PLAY
+                or android.media.session.PlaybackState.ACTION_PAUSE
+                or android.media.session.PlaybackState.ACTION_STOP)
+            .setState(state, 0, 1.0f)
+            .build()
+}
+
 class DeviceBridge(
     private val context: Context,
     private val requestPermission:
@@ -127,7 +195,27 @@ class DeviceBridge(
                             call.arguments as? Map<String, Any?>, result)
                     "a11yTap" -> a11yTap(
                         call.argument<String>("package"),
-                        call.argument<Any>("node_id"), result)
+                        call.argument<Any>("node_id"),
+                        call.arguments as? Map<String, Any?>, result)
+                    "a11ySetText" -> a11ySetText(
+                        call.argument<String>("package"),
+                        call.argument<Any>("node_id"),
+                        call.argument<String>("text"),
+                        call.arguments as? Map<String, Any?>, result)
+                    "a11yScroll" -> a11yScroll(
+                        call.argument<String>("package"),
+                        call.argument<Any>("node_id"),
+                        call.arguments as? Map<String, Any?>, result)
+                    "a11yFind" -> a11yFind(
+                        call.argument<String>("package"),
+                        call.arguments as? Map<String, Any?>, result)
+                    "a11yNavigate" -> a11yNavigate(
+                        call.argument<String>("direction"),
+                        call.argument<String>("package"),
+                        call.arguments as? Map<String, Any?>, result)
+                    "appList" -> appList(call.argument<Int>("limit"), result)
+                    "notifList" -> notifList(
+                        call.arguments as? Map<String, Any?>, result)
                     "a11yProbe" -> result.success(a11yProbe())
                     "getWifiState" -> result.success(wifiState())
                     "getBluetoothState" -> result.success(bluetoothState())
@@ -151,6 +239,116 @@ class DeviceBridge(
                         call.argument<Boolean>("enabled"), result)
                     "privCompanionProbe" ->
                         result.success(privCompanionProbe())
+                    "getObservedDevices" -> result.success(observedDevices())
+                    "getObservedDeviceDetail" -> result.success(
+                        observedDeviceDetail())
+                    "getMediaCounts" -> result.success(mediaCounts())
+                    // Stage 31-P3 phase A quick/one-shot actions
+                    // (QuickActions.kt; single channel kept).
+                    "torchSet" -> result.success(torchSet(
+                        context, call.argument<Boolean>("on")))
+                    "findMyPhoneRing" -> result.success(findMyPhoneRing(
+                        context, call.argument<Int>("seconds"),
+                        call.argument<Boolean>("allow_dnd_bypass")))
+                    "mediaKeyEvent" -> result.success(mediaKeyEvent(
+                        context, call.argument<String>("action")))
+                    "clipboardSet" -> result.success(clipboardSet(
+                        context, call.argument<String>("text")))
+                    "openUri" -> result.success(openUri(
+                        context, call.argument<String>("uri")))
+                    "powerSaverSet" -> result.success(powerSaverSet(
+                        context, call.argument<Boolean>("on")))
+                    "streamVolumeSet" -> result.success(streamVolumeSet(
+                        context, call.argument<Int>("pct")))
+                    "alarmSet" -> result.success(alarmSet(
+                        context, call.argument<Int>("hour"),
+                        call.argument<Int>("minute"),
+                        call.argument<String>("label"),
+                        call.argument<Boolean>("skip_ui")))
+                    "timerSet" -> result.success(timerSet(
+                        context, call.argument<Int>("minutes"),
+                        call.argument<String>("label"),
+                        call.argument<Boolean>("skip_ui")))
+                    // P5 feature-hunt ② (2026-10-22): DND state + toggle
+                    "dndGet" -> result.success(dndGet(context))
+                    "dndSet" -> result.success(dndSet(
+                        context, call.argument<Boolean>("enabled"),
+                        call.argument<Boolean>("skip_ui")))
+                    // Stage 31-P3 phase B (P3d): call with contact
+                    // resolution. Numbers arrive ONLY from the confirmed
+                    // Core resolution step; the bridge re-checks anyway.
+                    "contactsLookup" -> result.success(contactsLookup(
+                        context, call.argument<String>("name"),
+                        call.argument<Int>("limit")))
+                    "callDirect" -> result.success(callDirect(
+                        context, call.argument<String>("number")))
+                    "callScreenPoll" -> result.success(callScreenPoll(
+                        (call.argument<Int>("wait_ms")
+                            ?: 4000).toLong()))
+                    // Stage 31-P3 phase B (P3e): native carrier SMS —
+                    // the recipient arrives ONLY from the confirmed
+                    // resolution; the draft rides the approval inputs.
+                    "smsSend" -> result.success(smsSend(
+                        context, call.argument<String>("number"),
+                        call.argument<String>("text")))
+                    "requestSmsPermission" ->
+                        requestPermission(Manifest.permission.SEND_SMS,
+                            result)
+                    // Stage 31-P3 phase B (P3f): bounded OTP scan over
+                    // the FRESH notification ring. Per-use consent is
+                    // enforced by Core (HIGH risk approval parks every
+                    // run); the device side adds freshness + shape only.
+                    // Stage 31-P3 phase B (P3a): TARGETED media
+                    // session control — hint required, matches the one
+                    // session, honest multi/zero answers.
+                    // Stage 31-P3 phase B (P3a): the labeled self-test
+                    // session (start/release) filing the production
+                    // targeted-control path end-to-end.
+                    // Stage 31-P3 phase B (P3c): photo inventory —
+                    // counts only, never names or content, read-only.
+                    "photosInventory" -> result.success(
+                        photosInventory(context))
+                    "mediaSelftest" -> result.success(
+                        MediaSelftest.start(context))
+                    "mediaSelftestRelease" -> result.success(
+                        MediaSelftest.release())
+                    // Stage 31-P3 phase B (P3a): the media call runs
+                    // OFF the main thread — the session's own callback
+                    // (onPause etc.) shares the main looper, and an
+                    // awaited latch on main freezes the very delivery
+                    // it waits for (read live twice). The Result is
+                    // delivered back on the main thread (channel rule).
+                    "mediaSessionTargeted" -> {
+                        val hintArg = call.argument<String>("hint")
+                        val actArg = call.argument<String>("action")
+                        Thread {
+                            try {
+                                val out = mediaSessionTargeted(
+                                    context, hintArg, actArg)
+                                android.os.Handler(context.mainLooper)
+                                    .post { result.success(out) }
+                            } catch (e: Exception) {
+                                android.os.Handler(context.mainLooper)
+                                    .post { result.success(
+                                        mapOf("supported" to false,
+                                            "detail" to ("failed: "
+                                                + (e.message
+                                                    ?: e.toString())))) }
+                            }
+                        }.start()
+                    }
+                    "otpScan" -> result.success(
+                        ZaraNotifListener.otpScan(
+                            ((call.argument<Number>("max_age_ms")
+                                ?: 300000L).toLong()
+                                ).coerceIn(0L, 600000L),
+                            call.argument<String>("sender_hint")))
+                    "requestContactsPermission" ->
+                        requestPermission(Manifest.permission.READ_CONTACTS,
+                            result)
+                    "requestCallPermission" ->
+                        requestPermission(Manifest.permission.CALL_PHONE,
+                            result)
                     else -> result.notImplemented()
                 }
             }
@@ -293,6 +491,7 @@ class DeviceBridge(
     private fun a11yTap(
         pkg: String?,
         nodeId: Any?,
+        params: Map<String, Any?>?,
         result: MethodChannel.Result,
     ) {
         if (pkg.isNullOrEmpty() || pkg !in a11yTapTargets) {
@@ -300,30 +499,355 @@ class DeviceBridge(
                 "target not in lab allowlist (refused)", null)
             return
         }
-        val id = (nodeId as? Number)?.toInt()
-        if (id == null || id < 0) {
+        val id = (nodeId as? Number)?.toInt() ?: -1
+        val semTarget = params?.get("target")
+        // Contract v3: either a positional node id (>= 0) or a semantic
+        // target — never both, never neither.
+        if (semTarget != null && id >= 0) {
+            result.error("failed",
+                "give target or node_id, not both (refused)", null)
+            return
+        }
+        if (id < 0 && semTarget == null) {
             result.error("failed", "bad node_id (need snapshot node)", null)
             return
         }
+        // Contract v1 (docs/UI_SNAPSHOT_CONTRACT.md): snapshot-bound tap.
+        // Guards (allowlist, package, staleness, clickability) refuse
+        // with explicit error codes; a refusal is a channel ERROR,
+        // never a fake success.
+        val expectedPkg = (params?.get("expected_package") as? String)
+            ?: (params?.get("package") as? String)
+        val expectedSnap = params?.get("expected_snapshot_id") as? String?
+        val maxEl = (params?.get("max_elements") as? Number)?.toInt()
         try {
-            val applied = ZaraA11yService.tapNode(id)
-            if (applied == null) {
-                result.error("unavailable",
-                    "accessibility service unbound/disabled", null)
+            val m = ZaraA11yService.tapResult(id, expectedPkg, expectedSnap,
+                maxEl ?: ZaraA11yService.MAX_NODES, target = semTarget)
+            if (m["applied"] == true) {
+                result.success(m + mapOf(
+                    "supported" to true,
+                    "package" to ("${m["package"] ?: pkg}"),
+                    "stopped" to "n/a",
+                    "verify_state" to "clicked",
+                ))
                 return
             }
-            result.success(mapOf(
-                "supported" to true,
-                "package" to pkg,
-                "stopped" to "n/a",
-                "applied" to applied,
-                "verify_state" to if (applied) "clicked" else "not_applied",
-            ))
+            result.error(when (m["error"]) {
+                "STALE_SNAPSHOT" -> "stale"
+                "UNEXPECTED_PACKAGE" -> "mismatch"
+                "NO_WINDOW" -> "unavailable"
+                else -> "failed"
+            }, "${m["error"] ?: "tap failed"}: ${m["reason"] ?: ""}",
+                m)
         } catch (e: SecurityException) {
             result.error("denied",
                 "SecurityException from framework", null)
         } catch (e: Exception) {
             result.error("failed", (e.message ?: "tap failed"), null)
+        }
+    }
+
+    /**
+     * Contract-v2 text entry / scroll entries: same guard shape as
+     * [a11yTap] (allowlist, snapshot bindings, explicit error codes).
+     * Typed text is capped at 500 chars and NEVER echoed in errors.
+     */
+    private fun a11yGuardedAction(
+        pkg: String?,
+        nodeId: Any?,
+        params: Map<String, Any?>?,
+        result: MethodChannel.Result,
+        action: String,
+    ) {
+        if (pkg.isNullOrEmpty() || pkg !in a11yTapTargets) {
+            result.error("denied",
+                "target not in lab allowlist (refused)", null)
+            return
+        }
+        val id = (nodeId as? Number)?.toInt() ?: -1
+        val semTarget = params?.get("target")
+        // Contract v3: positional or semantic target, never both. Scroll
+        // stays positional (v2 scope).
+        if (semTarget != null && (id >= 0 || action != "set_text")) {
+            result.error("failed",
+                "give target or node_id, not both (refused)", null)
+            return
+        }
+        if (id < 0 && semTarget == null) {
+            result.error("failed", "bad node_id (need snapshot node)", null)
+            return
+        }
+        val expectedPkg = (params?.get("expected_package") as? String)
+            ?: (params?.get("package") as? String)
+        val expectedSnap = params?.get("expected_snapshot_id") as? String?
+        val maxEl = (params?.get("max_elements") as? Number)?.toInt()
+            ?: ZaraA11yService.MAX_NODES
+        try {
+            val m = when (action) {
+                "set_text" -> ZaraA11yService.editResult(id, expectedPkg,
+                    expectedSnap, maxEl,
+                    (params?.get("text") as? String)?.take(500),
+                    target = semTarget)
+                else -> ZaraA11yService.scrollResult(id, expectedPkg,
+                    expectedSnap, maxEl,
+                    (params?.get("direction") as? String)?.lowercase() !=
+                        "backward")
+            }
+            if (m["applied"] == true) {
+                val outMap = m + mapOf(
+                    "supported" to true,
+                    "package" to ("${m["package"] ?: pkg}"),
+                    "verify_state" to ("${m["verify_state"] ?: "applied"}"),
+                )
+                val uncertain = "${outMap["verify_state"]}"
+                    .startsWith("applied (content changed")
+                if (action == "set_text" && uncertain) {
+                    // Honest uncertain at the immediate compare. One grace
+                    // re-read (bounded, single attempt) resolves the a11y
+                    // propagation lag without blocking the platform thread
+                    // or changing any verify_state semantics. Never a fake
+                    // success: the re-read only flips to text_matched when
+                    // the fresh tree truly shows the requested text.
+                    val want = (params?.get("text") as? String)?.take(500)
+                        ?: ""
+                    val editIdx = (
+                        ((outMap["target_matched"]
+                            as? Map<*, *>)?.get("node_id")
+                            as? Number)?.toInt()
+                    ) ?: id
+                    android.os.Handler(
+                        android.os.Looper.getMainLooper()
+                    ).postDelayed({
+                        try {
+                            result.success(ZaraA11yService
+                                .revalidateEditResult(
+                                    editIdx, want, maxEl, outMap))
+                        } catch (e: Exception) {
+                            result.error("failed",
+                                (e.message ?: "re-read failed"), null)
+                        }
+                    }, ZaraA11yService.POST_EDIT_REREAD_GRACE_MS)
+                    return
+                }
+                result.success(outMap)
+                return
+            }
+            result.error(when (m["error"]) {
+                "STALE_SNAPSHOT" -> "stale"
+                "UNEXPECTED_PACKAGE" -> "mismatch"
+                "NO_WINDOW" -> "unavailable"
+                else -> "failed"
+            }, "${m["error"] ?: "$action failed"}: ${m["reason"] ?: ""}",
+                m)
+        } catch (e: SecurityException) {
+            result.error("denied",
+                "SecurityException from framework", null)
+        } catch (e: Exception) {
+            result.error("failed", (e.message ?: "$action failed"), null)
+        }
+    }
+
+    private fun a11ySetText(
+        pkg: String?,
+        nodeId: Any?,
+        text: String?,
+        params: Map<String, Any?>?,
+        result: MethodChannel.Result,
+    ) {
+        if (text.isNullOrEmpty() || text.length > 500) {
+            result.error("failed",
+                "bad text (need 1-500 chars, never logged)", null)
+            return
+        }
+        a11yGuardedAction(pkg, nodeId, params, result, "set_text")
+    }
+
+    private fun a11yScroll(
+        pkg: String?,
+        nodeId: Any?,
+        params: Map<String, Any?>?,
+        result: MethodChannel.Result,
+    ) {
+        a11yGuardedAction(pkg, nodeId, params, result, "scroll")
+    }
+
+    /**
+     * Contract-v3 read-only semantic element lookup (gui.find). Same
+     * allowlist discipline as the acting channels; the lookup NEVER acts,
+     * so a MATCH result reports element facts and nothing else. A
+     * not-found lookup is a channel ERROR carrying the evidence — a
+     * caller cannot mistake it for success.
+     */
+    private fun a11yFind(
+        pkg: String?,
+        params: Map<String, Any?>?,
+        result: MethodChannel.Result,
+    ) {
+        if (pkg.isNullOrEmpty() || pkg !in a11yTapTargets) {
+            result.error("denied",
+                "target not in lab allowlist (refused)", null)
+            return
+        }
+        val semTarget = params?.get("target")
+        if (semTarget == null) {
+            result.error("failed",
+                "missing target (selectors required)", null)
+            return
+        }
+        // find is read-only but screen-location-sensitive: the requested
+        // package must BE the foreground package (guard, no silent shim).
+        val expectedPkg = (params?.get("expected_package") as? String) ?: pkg
+        val maxEl = (params?.get("max_elements") as? Number)?.toInt()
+            ?: ZaraA11yService.MAX_NODES
+        try {
+            val m = ZaraA11yService.findResult(expectedPkg, maxEl, semTarget)
+            if (m["status"] == "MATCH") {
+                result.success(m)
+                return
+            }
+            result.error(when (m["error"]) {
+                "UNEXPECTED_PACKAGE" -> "mismatch"
+                "NO_WINDOW" -> "unavailable"
+                else -> "failed"
+            }, "${m["error"] ?: "find failed"}: ${m["reason"] ?: ""}", m)
+        } catch (e: SecurityException) {
+            result.error("denied",
+                "SecurityException from framework", null)
+        } catch (e: Exception) {
+            result.error("failed", (e.message ?: "find failed"), null)
+        }
+    }
+
+    /**
+     * Global navigation (back/home) with lab-allowlist + foreground-package
+     * guards. The service refuses UNEXPECTED_PACKAGE instead of navigating
+     * an unexpected app; a successful navigation returns the FRESH
+     * post-navigation snapshot id for the caller's next inspect.
+     */
+    private fun a11yNavigate(
+        direction: String?,
+        pkg: String?,
+        params: Map<String, Any?>?,
+        result: MethodChannel.Result,
+    ) {
+        if (pkg.isNullOrEmpty() || pkg !in a11yTapTargets) {
+            result.error("denied",
+                "target not in lab allowlist (refused)", null)
+            return
+        }
+        val dir = (direction ?: "").lowercase()
+        // Recents/global-search/multi-window are deliberately out of the
+        // contract: only back and home are supported navigation surfaces.
+        if (dir != "back" && dir != "home") {
+            result.error("denied", "direction must be back or home", null)
+            return
+        }
+        val expectedPkg = params?.get("expected_package") as? String
+        try {
+            val m = ZaraA11yService.navigateResult(dir, expectedPkg)
+            if (m["applied"] == true) {
+                result.success(m)
+                return
+            }
+            result.error(when (m["error"]) {
+                "UNEXPECTED_PACKAGE" -> "mismatch"
+                "NO_WINDOW" -> "unavailable"
+                else -> "failed"
+            }, "${m["error"] ?: "navigate failed"}: ${m["reason"] ?: ""}", m)
+        } catch (e: Exception) {
+            result.error("failed", (e.message ?: "navigate failed"), null)
+        }
+    }
+
+    /**
+     * Passive notification read. Read-only drain of the in-memory ring
+     * fed by ZaraNotifListener (no settings UI, no actions, no polling).
+     * Access is refused honestly until the user granted Notification
+     * listener access — the job result then states the missing grant,
+     * and the user's step to grant it is in Settings (special access).
+     */
+    private fun notifList(params: Map<String, Any?>?, result: MethodChannel.Result) {
+        try {
+            val listeners = android.provider.Settings.Secure.getString(
+                context.contentResolver,
+                "enabled_notification_listeners",
+            ) ?: ""
+            val granted = listeners.split(':').any {
+                it.startsWith(context.packageName) &&
+                    it.contains("ZaraNotifListener")
+            }
+            if (!granted) {
+                result.success(mapOf(
+                    "supported" to true,
+                    "granted" to false,
+                    "reason" to
+                        "notification listener access not granted "
+                        + "(grant in Settings > Special access > "
+                        + "Device & app notifications)",
+                    "items" to emptyList<Map<String, Any?>>(),
+                ))
+                return
+            }
+            val sinceMs = (params?.get("since_ms") as? Number)?.toLong() ?: 0L
+            val limit = (params?.get("limit") as? Number)?.toInt() ?: 20
+            val m = ZaraNotifListener.snapshotSince(sinceMs, limit)
+            result.success(mapOf(
+                "supported" to true,
+                "granted" to true,
+                "count" to (m["count"] ?: 0),
+                "truncated" to (m["truncated"] == true),
+                "items" to (m["items"] as? List<Map<String, Any?>>
+                    ?: emptyList())))
+        } catch (e: Exception) {
+            result.error("failed",
+                ((e.message ?: "notification read failed").take(200)), null)
+        }
+    }
+
+    /**
+     * Launchable-application discovery. Read-only metadata (package +
+     * user-visible label), capped and deterministic — NEVER an
+     * authorization: every subsequent action still passes the Core
+     * allowlist/policy path.
+     */
+    private fun appList(limit: Int?, result: MethodChannel.Result) {
+        val max = (limit ?: 100).coerceIn(1, 200)
+        try {
+            val pm = context.packageManager
+            val intent = Intent(Intent.ACTION_MAIN)
+                .addCategory(Intent.CATEGORY_LAUNCHER)
+            val acts = pm.queryIntentActivities(intent, 0)
+            val rows = LinkedHashMap<String, String>()
+            // `truncated` means "honestly cut by the cap" — duplicate
+            // launcher activities for one package never count as
+            // truncation.
+            var capped = false
+            for (info in acts) {
+                val pkg = info.activityInfo?.packageName ?: continue
+                if (rows.containsKey(pkg)) continue
+                if (rows.size >= max) {
+                    capped = true
+                    break
+                }
+                val label = try {
+                    (info.loadLabel(pm) ?: pkg).toString().take(80)
+                } catch (_: Exception) {
+                    pkg.take(80)
+                }
+                rows[pkg] = label
+            }
+            val apps = rows.entries.map {
+                mapOf("package" to it.key, "label" to it.value)
+            }
+            result.success(mapOf(
+                "supported" to true,
+                "requested_limit" to max,
+                "count" to apps.size,
+                "truncated" to capped,
+                "apps" to apps))
+        } catch (e: Exception) {
+            result.error("failed",
+                ((e.message ?: "app listing failed").take(200)), null)
         }
     }
 
@@ -972,8 +1496,43 @@ class DeviceBridge(
                 return
             }
             context.startActivity(intent)
-            result.success(mapOf("supported" to true, "package" to pkg,
-                "launched" to true))
+            // Universal-operator verification: does the target actually
+            // take foreground focus? Bounded sampling on a background
+            // thread (never blocks the platform thread); sample via the
+            // a11y foreground package — honest "focus_unconfirmed" when
+            // the provider cannot see (never invented focus evidence).
+            Thread {
+                var observed: String? = null
+                var attempts = 0
+                try {
+                    while (attempts < 3) {
+                        Thread.sleep(if (attempts == 0) 800 else 500)
+                        attempts++
+                        val now = ZaraA11yService.focusedPackageNow()
+                            ?: continue
+                        if (now == pkg) { observed = now; break }
+                        observed = now
+                    }
+                } catch (_: Exception) {
+                }
+                val verify = when {
+                    observed == pkg -> "focused_verified"
+                    observed != null ->
+                        "focus_unconfirmed (foreground did not match)"
+                    else ->
+                        "focus_unconfirmed (accessibility provider " +
+                            "unavailable)"
+                }
+                try {
+                    result.success(mapOf(
+                        "supported" to true, "package" to pkg,
+                        "launched" to true, "verify_state" to verify,
+                        "focus" to (observed == pkg),
+                        "verify" to "gui.screen.inspect"))
+                } catch (_: Exception) {
+                    // Channel already replied; drop silently.
+                }
+            }.start()
         } catch (e: Exception) {
             result.error("failed", (e.message ?: "open app failed"), null)
         }
@@ -1217,8 +1776,221 @@ class DeviceBridge(
         }
     }
 
-    private fun battery(): Map<String, Any?> {
+    // ---- Stage 20: observed-device discovery (detection ≠ trust) ----
+    // Read-only snapshots over SUPPORTED OS interfaces: StorageManager
+    // volumes (no permission), DisplayManager displays (no permission),
+    // UsbManager enumeration (listing only; access needs user grant).
+    // Never claims ownership, never auto-grants, never drives hardware.
+
+    private fun volumeStat(v: StorageVolume): Map<String, Any?> {
+        // getDirectory() is the public (deprecated) path accessor; the
+        // hidden VolumeInfo.file accessor used earlier is not in the
+        // public SDK.
+        val st = v.directory?.absolutePath
         return try {
+            if (st != null) {
+                val fs = StatFs(st)
+                mapOf(
+                    "total_bytes" to fs.totalBytes,
+                    "free_bytes" to fs.availableBytes,
+                    "used_bytes" to (fs.totalBytes - fs.availableBytes),
+                    "path" to st,
+                )
+            } else {
+                mapOf<String, Any?>("path" to null)
+            }
+        } catch (e: Exception) {
+            mapOf<String, Any?>("error" to (e.message ?: "stat failed"))
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    fun observedDevices(): Map<String, Any?> {
+        val rows = ArrayList<Map<String, Any?>>()
+        // storage volumes (StorageManager gets all mounted volumes)
+        try {
+            val sm =
+                context.getSystemService(StorageManager::class.java)
+            for (vi in sm.storageVolumes) {
+                // Public StorageVolume replaces the hidden VolumeInfo
+                // class. Skip the primary built-in volume the same way
+                // the old type==TYPE_PRIVATE/isPrimary check intended:
+                // internal primary storage is the device itself, not an
+                // observed external device.
+                if (vi.isPrimary && !vi.isRemovable) {
+                    continue
+                }
+                @Suppress("DEPRECATION")
+                val stable = (vi.uuid ?: "vol-${rows.size}")
+                rows.add(mapOf(
+                    "src" to "storage_volume",
+                    "id" to "storage-$stable",
+                    "label" to (vi.getDescription(context) ?: "Volume"),
+                    "mount_state" to (
+                        when (vi.state) {
+                            Environment.MEDIA_MOUNTED,
+                            Environment.MEDIA_MOUNTED_READ_ONLY -> "mounted"
+                            Environment.MEDIA_UNMOUNTED -> "unmounted"
+                            Environment.MEDIA_REMOVED -> "removed"
+                            else -> (vi.state ?: "unknown")
+                        }),
+                    "removable" to (vi.isRemovable),
+                    "read_only" to (
+                        vi.state == Environment.MEDIA_MOUNTED_READ_ONLY),
+                    "stat" to volumeStat(vi),
+                    // fstype is not exposed on the public StorageVolume;
+                    // honest unknown instead of the hidden fsType API.
+                    "fs" to "unknown",
+                ))
+            }
+        } catch (e: Exception) {
+            rows.add(mapOf("src" to "storage_volume",
+                "error" to (e.message ?: "storage discovery failed")))
+        }
+        // USB devices attached to the phone (listing only)
+        try {
+            val um = context.getSystemService(UsbManager::class.java)
+            for (dev in um.deviceList.values.toList()) {
+                val cls = when (dev.deviceClass) {
+                    UsbConstants.USB_CLASS_MASS_STORAGE -> "usb_storage"
+                    // USB_CLASS_CSC_DATA (0x0A) is a hidden constant in
+                    // UsbConstants; list the class code literally.
+                    0x0A -> "cdc_data"
+                    UsbConstants.USB_CLASS_HID -> "hid"
+                    else -> "otherusb"
+                }
+                rows.add(mapOf(
+                    "src" to "usb",
+                    "id" to "usb-${dev.vendorId}:${dev.productId}",
+                    "label" to (dev.deviceName ?: cls),
+                    "class_hint" to cls,
+                    "state" to "attached",
+                    "user_granted_access" to (
+                        um.hasPermission(dev)),
+                ))
+            }
+        } catch (e: Exception) {
+            rows.add(mapOf("src" to "usb",
+                "error" to (e.message ?: "usb listing failed")))
+        }
+        // displays incl. external (DisplayManager, no permission)
+        try {
+            val dm = context.getSystemService(
+                DisplayManager::class.java)
+            for (d in dm.displays.toList()) {
+                if (d.displayId == 0) {
+                    continue
+                }
+                rows.add(mapOf(
+                    "src" to "display",
+                    "id" to "display-${d.displayId}",
+                    "label" to (
+                        d.name ?: "Display ${d.displayId}"),
+                    "state" to if (d.isValid) "present" else "invalid",
+                    // getRealMetrics is gone from the public SDK; the
+                    // public Display.Mode carries the physical size.
+                    "width_px" to d.mode.physicalWidth,
+                    "height_px" to d.mode.physicalHeight,
+                    "presentation_capable" to true,
+                ))
+            }
+        } catch (e: Exception) {
+            rows.add(mapOf("src" to "display",
+                "error" to (e.message ?: "display listing failed")))
+        }
+        return mapOf(
+            "devices" to rows,
+            "trust_note" to "detection is not trust",
+        )
+    }
+
+    private fun observedDeviceDetail(): Map<String, Any?> =
+        observedDevices()
+
+    /** Media-category counts via MediaStore. Permission-gated honestly:
+     *  when READ_MEDIA_* is not granted the result says so instead of
+     *  guessing. No media content is read — only counts. */
+    private fun mediaCounts(): Map<String, Any?> {
+        // Media-category counts via MediaStore. Permission-gated
+        // honestly: when READ_MEDIA_* is not granted the result says
+        // so instead of guessing. No media content is read — only
+        // row counts.
+        val sdk33 = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+        val readImages = ContextCompat.checkSelfPermission(
+            context, Manifest.permission.READ_MEDIA_IMAGES)
+        val readVideos = ContextCompat.checkSelfPermission(
+            context, Manifest.permission.READ_MEDIA_VIDEO)
+        val readAudio = ContextCompat.checkSelfPermission(
+            context, Manifest.permission.READ_MEDIA_AUDIO)
+        val readLegacy = ContextCompat.checkSelfPermission(
+            context, Manifest.permission.READ_EXTERNAL_STORAGE)
+        val needs = ArrayList<String>()
+        val granted: Boolean = if (sdk33) {
+            if (readImages != PackageManager.PERMISSION_GRANTED ||
+                readVideos != PackageManager.PERMISSION_GRANTED ||
+                readAudio != PackageManager.PERMISSION_GRANTED) {
+                needs.addAll(listOf(
+                    Manifest.permission.READ_MEDIA_IMAGES,
+                    Manifest.permission.READ_MEDIA_VIDEO,
+                    Manifest.permission.READ_MEDIA_AUDIO))
+            }
+            readImages == PackageManager.PERMISSION_GRANTED
+        } else {
+            if (readLegacy != PackageManager.PERMISSION_GRANTED) {
+                needs.add(Manifest.permission.READ_EXTERNAL_STORAGE)
+            }
+            readLegacy == PackageManager.PERMISSION_GRANTED
+        }
+        val counts = linkedMapOf<String, Any?>()
+        counts["available"] = granted
+        if (granted) {
+            counts["images"] = mediaTableCount(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI)
+            counts["videos"] = mediaTableCount(
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
+            counts["audio"] = mediaTableCount(
+                MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
+        } else {
+            counts["note"] = "permission absent: counts withheld, not faked"
+        }
+        // Primary-storage usage from an app-visible path on the same
+        // volume (scoped-storage safe); any failure is reported, not
+        // hidden.
+        val storage = linkedMapOf<String, Any?>()
+        try {
+            val dir = context.getExternalFilesDir(null)?.absolutePath
+                ?: Environment.getExternalStorageDirectory().absolutePath
+            val fs = StatFs(dir)
+            storage["total_bytes"] = fs.totalBytes
+            storage["free_bytes"] = fs.availableBytes
+            storage["used_bytes"] = (fs.totalBytes - fs.availableBytes)
+        } catch (e: Exception) {
+            storage["error"] = (e.message ?: "storage stat failed")
+        }
+        return mapOf(
+            "supported" to true,
+            "counts" to counts,
+            "permissions_needed" to needs,
+            "storage" to storage,
+        )
+    }
+
+    /** Row count of a MediaStore table; count-only query (no media
+     *  content is ever read here). */
+    private fun mediaTableCount(uri: Uri): Long {
+        return try {
+            context.contentResolver.query(
+                uri, arrayOf(android.provider.BaseColumns._COUNT),
+                null, null, null)?.use { c ->
+                c.moveToFirst()
+                (c.getLong(0))
+            } ?: -1L
+        } catch (e: Exception) {
+            -1L
+        }
+    }
+
+    private fun battery(): Map<String, Any?> {        return try {
             // Sticky battery intent: honors emulator overrides and all devices.
             val filter = context.registerReceiver(
                 null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))

@@ -646,6 +646,17 @@ class FabricRegistry:
             pass
         return "pending"
 
+    def _tool_required_caps(self, capability: str) -> frozenset:
+        """P5 helper (2026-10-23): the advertised feature ids that make a
+        registry TOOL routable on a laptop-style descriptor (tool name →
+        required_capabilities). Registry-missing/unknown names degrade to
+        an empty set (pure name/id matching)."""
+        try:
+            d = self.engine.registry.get(capability)
+            return frozenset(d.required_capabilities or [])
+        except Exception:  # noqa: BLE001 — not a registry tool name
+            return frozenset()
+
     def trust_of(self, device_id: str) -> str:
         if device_id in self._tombstones:
             return TrustState.REVOKED
@@ -1117,9 +1128,17 @@ class FabricRegistry:
         safe risks may substitute on non-policy failures; riskier ones
         never substitute silently."""
         recs: list[CapabilityRecord] = []
+        # P5 fix (2026-10-23, live-discovered): laptop descriptors advertise
+        # FEATURE-level ids (e.g. calendar.write) while the chat path
+        # routes TOOL names (calendar.event.add). Translate via the
+        # registry's required_capabilities — otherwise every laptop tool
+        # is unreachable in chat ("no device advertises …") even though
+        # its agent advertises exactly the implementing feature.
+        req_caps = self._tool_required_caps(capability)
         for view in self.list_devices():
             for r in self.capabilities_for(view.device_id):
-                if r.name == capability or r.capability_id == capability:
+                if r.name == capability or r.capability_id == capability \
+                        or (req_caps and r.capability_id in req_caps):
                     recs.append(r)
         if not recs:
             return FabricRoute(None, "deny",
@@ -1295,11 +1314,20 @@ class FabricRegistry:
 
     def execute_on_device(self, tool: str, inputs: dict, device_id: str,
                           who: str = "user",
-                          mission_id: str = "") -> dict:
+                          mission_id: str = "",
+                          auth: Optional["PolicyDecision"] = None) -> dict:
         """Full deterministic pipeline: capability -> identity -> trust ->
         presence -> permission -> risk/policy -> governor -> execute ->
         verify -> audit. Returns stage + record summary, never fake success.
-        Approval-gated tools return the hold (no bypass possible here)."""
+        Approval-gated tools return the hold (no bypass possible here).
+
+        `auth` is only ever supplied by a validated mission-bound approval
+        workflow (see core/messaging.py) after the single approval was
+        granted; the approval mints it via policy.grant, and the workflow
+        has already re-checked deny-patterns. It never skips the pipeline
+        gates below: identity, trust, presence, capability authorization,
+        the governor, execution, and verification all still run, and the
+        engine's HIGH_RISK pre-dispatch re-validation still applies."""
         try:
             definition = self.registry.get(tool)
         except KeyError:
@@ -1339,7 +1367,8 @@ class FabricRegistry:
             return {"stage": "deferred", "reason": gate.reason}
         try:
             rec = self.engine.submit(tool, dict(inputs), device_id,
-                                     who=who, mission_id=mission_id or None)
+                                     who=who, mission_id=mission_id or None,
+                                     auth=auth)
         except Exception as e:  # noqa: BLE001 — engine raises PolicyDenied
             self._audit("execution_rejected", device_id,
                         f"{tool}: {type(e).__name__}")
@@ -1392,7 +1421,13 @@ class FabricRegistry:
                             f"{tool} missing={missing}")
                 return False, f"missing keys: {missing}"
             return True, "output schema satisfied"
-        return bool(rec.verified), "explicit verification flag"
+        if mode == "explicit":
+            out = rec.result if isinstance(rec.result, dict) else {}
+            if "verified" not in out:
+                self._audit("verification_failed", rec.device_id,
+                            f"{tool} missing=verified")
+                return False, "explicit verification flag absent in result"
+            return bool(out["verified"]), "explicit verification flag"
 
     # ----- natural-language query helpers (facts for the LLM to phrase) -----
 

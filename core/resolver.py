@@ -324,10 +324,16 @@ class CapabilityResolver:
             views = self.fabric.list_devices()
         except Exception:  # noqa: BLE001 — no devices readable
             return out
+        # P5 fix (2026-10-23, live-discovered): laptop descriptors
+        # advertise feature-level ids (calendar.write) while chat routes
+        # tool names (calendar.event.add) — translate via the registry's
+        # required_capabilities, exactly like fabric.route_capability.
+        req_caps = self.fabric._tool_required_caps(capability)
         for v in views:
             recs = [r for r in self.fabric.capabilities_for(v.device_id)
                     if not r.capability_id.startswith("legacy:") and
-                    (r.capability_id == capability or r.name == capability)]
+                    (r.capability_id == capability or r.name == capability
+                     or (req_caps and r.capability_id in req_caps))]
             if not recs:
                 continue
             rec = sorted(recs, key=lambda r: r.capability_id)[0]
@@ -606,9 +612,11 @@ class CapabilityResolver:
         candidate sweep finds nothing pinned-usable). Returns None when
         the device does not advertise the capability at all."""
         try:
+            req_caps = self.fabric._tool_required_caps(capability)
             recs = [r for r in self.fabric.capabilities_for(device_id)
                     if not r.capability_id.startswith("legacy:") and
-                    (r.capability_id == capability or r.name == capability)]
+                    (r.capability_id == capability or r.name == capability
+                     or (req_caps and r.capability_id in req_caps))]
             views = {v.device_id: v for v in self.fabric.list_devices()}
             v = views.get(device_id)
             if not recs or v is None:

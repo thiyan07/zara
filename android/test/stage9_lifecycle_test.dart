@@ -36,6 +36,21 @@ void main() {
     l.move(DeviceLifecycleState.pairing);
   });
 
+  test('repeated 403 while revoked is a no-op, never a throw '
+      '(live crash 2026-10-22: the StateError escaped _tick and the '
+      'poll loop died silently)', () {
+    final l = DeviceLifecycle();
+    l.restore('android-phone');
+    l.move(DeviceLifecycleState.online);
+    l.handleHttp(403, hasIdentity: true); // -> revoked
+    expect(l.handleHttp(403, hasIdentity: true),
+        equals(DeviceLifecycleState.revoked)); // idempotent, no throw
+    expect(l.state, equals(DeviceLifecycleState.revoked));
+    expect(l.lastError, equals('auth 403'));
+    // the loop survives: restore keeps working from revoked
+    l.move(DeviceLifecycleState.pairing);
+  });
+
   test('404 means reregister, 5xx means reconnecting', () {
     final l = DeviceLifecycle();
     l.restore('d');

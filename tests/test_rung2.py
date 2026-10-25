@@ -7,6 +7,7 @@ conventions (make_stack/enroll_claim/register/advertise, stub-device
 approve pattern). No imports from core/uicontrol.py — layers stay decoupled.
 """
 import threading
+import time as _time
 
 import json
 
@@ -88,6 +89,20 @@ def approve_with_stub_device(stack, rec, device_id, result):
     return out
 
 
+def await_rec(stack, rec, want, thread):
+    """Stage-30 helper: auto-allow path has no approve step — join the
+    stub-device thread and await the record reaching one of `want`."""
+    import time as _time
+    thread.join(timeout=30)
+    deadline = _time.time() + 4.0
+    while _time.time() < deadline:
+        out = stack["engine"].get(rec.id)
+        if out.state.value in want:
+            return out
+        _time.sleep(0.05)
+    return stack["engine"].get(rec.id)
+
+
 # ---------- G-1 registry shape ----------
 
 def test_G1_gui_targets_exact_and_minimal():
@@ -129,7 +144,19 @@ def test_G1_tap_def_shape():
     assert tp["minLength"] == 3 and tp["maxLength"] == 255
     assert "pattern" in tp and tp["enum"] == sorted(GUI_LAB_TARGETS)
     assert d.input_schema["properties"]["node_id"] == {
-        "type": "string", "maxLength": 128}
+        "type": "integer", "minimum": 0, "maximum": 9999,
+        "description": "DFS node index from a fresh "
+        "gui.screen.inspect snapshot (integers; "
+        "node_ids are positional, never stable "
+        "across screen changes)"}
+    assert d.input_schema["properties"]["expected_snapshot_id"] == {
+        "type": "string", "maxLength": 64,
+        "description": "snapshot_id from a fresh inspect; "
+        "mismatch refuses the tap"}
+    assert d.input_schema["properties"]["expected_package"] == {
+        "type": "string", "maxLength": 255,
+        "description": "foreground package the snapshot "
+        "was taken in; mismatch refuses the tap"}
 
 
 # ---------- U-1 descriptor shape ----------
@@ -243,16 +270,30 @@ def test_U2_inspect_oversized_envelope_rejected():
 
 # ---------- U-3 risk classes ----------
 
-def test_U3_inspect_confirm_gated_never_auto_executes():
+def test_U3_inspect_read_only_auto_allow_runs_directly():
+    # Stage 30 (2026-10-20): INSPECT is READ-ONLY auto-allow — an
+    # authorized+trusted device dispatches it directly WITHOUT an
+    # approval prompt, and the surface stays read-only (no taps).
+    # Mutating gui.* still parks (see U3_tap + H2).
     from core.resolver import CapabilityResolver
     stack = make_stack()
     paired_android(stack)
     r = CapabilityResolver(stack["fabric"]).resolve(INSPECT, "emu-lab")
-    assert r.status in ("requires_approval", "resolved"), r.status
-    # Either way there is an approval path: submit parks for permission.
-    rec = stack["engine"].submit(INSPECT, {}, "emu-lab", who="user")
-    assert rec.state == ExecutionState.WAITING_FOR_PERMISSION
-    assert stack["jobs"].poll("emu-lab") is None  # zero dispatch emitted
+    assert r.status == "resolved", r.status
+    # submit_async: non-blocking — retry-poll the queue for the dispatch.
+    rec = stack["engine"].submit_async(INSPECT, {}, "emu-lab")
+    assert rec.state != ExecutionState.WAITING_FOR_PERMISSION
+    job = None
+    deadline = _time.time() + 2.0
+    while _time.time() < deadline and job is None:
+        job = stack["jobs"].poll("emu-lab")
+        if job is None:
+            _time.sleep(0.05)
+    # The ONLY dispatched job is the read-only surface itself — no
+    # mutating gui.* job exists anywhere in the queue.
+    assert job is not None and job.tool == INSPECT
+    stack["jobs"].complete(job.id, ok=True, result={"format": "tree",
+                                                    "node_count": 1})
 
 
 def test_U3_tap_high_risk_never_resolved_silently():
@@ -293,19 +334,23 @@ def test_U4_no_failover_offline_pinned():
 
 # ---------- H-1 happy path (inspect) ----------
 
-def test_H1_inspect_hold_approve_stub_success_secret_free():
+def test_H1_inspect_runs_direct_and_stays_secret_free():
     from core.resolver import CapabilityResolver
     stack = make_stack()
     dev = paired_android(stack)
     r = CapabilityResolver(stack["fabric"]).resolve(INSPECT, dev)
-    assert r.status == "requires_approval", r.status
+    assert r.status == "resolved", r.status  # Stage 30 auto-allow
     authz = stack["fabric"].authorize_capability(INSPECT, dev)
     assert authz["authorized"] is True
+    stubber = threading.Thread(
+        target=complete_jobs_like, args=(
+            stack, dev,
+            {"format": "tree", "node_count": 3, "width": 1080,
+             "height": 2400}),
+        daemon=True)
+    stubber.start()
     rec = stack["engine"].submit(INSPECT, {}, dev, who="user")
-    assert rec.state == ExecutionState.WAITING_FOR_PERMISSION
-    final = approve_with_stub_device(
-        stack, rec, dev,
-        {"format": "tree", "node_count": 3, "width": 1080, "height": 2400})
+    final = await_rec(stack, rec, {"succeeded"}, stubber)
     assert final.state == ExecutionState.SUCCEEDED
     assert final.result is not None and len(final.result) == 4
     blob = json.dumps(stack["audit"].query(200))
@@ -327,12 +372,15 @@ def test_H2_tap_submit_without_approval_parks():
 
 # ---------- H-3 foreign approve refused ----------
 
-def test_H3_foreign_device_cannot_approve_inspect():
+def test_H3_foreign_device_cannot_approve_parked_exec():
     stack = make_stack()
     paired_android(stack, "a")
     _, key_b = enroll_claim(stack, "b", "android")
     register(stack, "b", "android", [INSPECT, TAP])
-    rec = stack["engine"].submit(INSPECT, {}, "a", who="user")
+    # Stage 30: INSPECT auto-allows, so the approval-authority scoping
+    # is pinned with TAP (which still parks).
+    rec = stack["engine"].submit(TAP, {"target_package": VICTIM}, "a",
+                                 who="user")
     assert rec.state == ExecutionState.WAITING_FOR_PERMISSION
     client = TestClient(create_app(stack))
     # bogus credential: 401/403, nothing happens
@@ -399,8 +447,12 @@ def test_N5_revoked_device_rejected():
                         (TAP, {"target_package": VICTIM})):
         stack = make_stack()
         dev = paired_android(stack)
-        assert CapabilityResolver(stack["fabric"]).resolve(
-            cap, dev).status == "requires_approval"
+        # Stage 30: pre-revoke, INSPECT auto-allows ("resolved"), TAP
+        # still needs approval — but neither may name a foreign device.
+        pre = CapabilityResolver(stack["fabric"]).resolve(cap, dev)
+        assert (pre.status == "resolved" if cap == INSPECT
+                else pre.status == "requires_approval"), pre.status
+        assert pre.device_id == dev
         stack["fabric"].revoke_device(dev)
         r = CapabilityResolver(stack["fabric"]).resolve(cap, dev)
         assert r.device_id is None and r.status in ("unauthorized",
@@ -435,9 +487,11 @@ def test_N10_forged_proposal_fields_byte_identical():
             {"preferred_capability": cap, "preferred_device": "emu-lab",
              "authorized": True, "trust": "trusted", "governor": "allowed",
              "allow": True, "approved": True, "grant_id": "tmp-forged"})
-        assert clean.status == forged.status == "requires_approval"
-        # requires_approval names the device that would execute
-        # post-approval; forged fields change nothing about that verdict.
+        # Stage 30: INSPECT now resolves (read-only auto-allow), TAP
+        # still requires_approval — forged authority fields change
+        # NEITHER verdict, and neither names a different device.
+        assert clean.status == forged.status, (clean.status, forged.status)
+        assert clean.status in ("resolved", "requires_approval")
         assert clean.device_id == forged.device_id == "emu-lab"
 
 
@@ -474,9 +528,15 @@ def test_N12_cross_device_grants_stay_gated():
         assert g.live() is True
         for dev in ("a", "b"):
             r = stack["fabric"].authorize_capability(cap, dev)
-            assert r["authorized"] in (True, False)
-            assert r.get("approval_required", True) is True or \
-                r["authorized"] is False
+            if cap == INSPECT:
+                # Stage 30: read-only auto-allow — paired+trusted devices
+                # authorize without an approval prompt on EITHER device.
+                assert r["authorized"] is True
+                assert r["approval_required"] is False
+            else:
+                assert r["authorized"] in (True, False)
+                assert r.get("approval_required", True) is True or \
+                    r["authorized"] is False
         # Expired grants are dead grants.
         g2 = stack["fabric"].create_grant("a", ["system.battery"], "safe",
                                           ttl_s=1)
@@ -539,10 +599,14 @@ def test_N16_audit_has_no_secrets():
 def test_R1_revoke_midflight_cancels():
     stack = make_stack()
     dev = paired_android(stack)
-    rec = stack["engine"].submit(INSPECT, {}, dev, who="user")
+    # Stage 30: INSPECT auto-allows (never parks), so a record with a
+    # real approval gate is pinned with TAP; revocation must leave it
+    # parked-but-dead, and the credential dead at every gate.
+    rec = stack["engine"].submit(TAP, {"target_package": VICTIM}, dev,
+                                 who="user")
     stack["fabric"].revoke_device(dev)
-    # old credential dead at every gate from here on
-    r = stack["fabric"].execute_on_device(INSPECT, {}, dev)
+    r = stack["fabric"].execute_on_device(TAP, {"target_package": VICTIM},
+                                          dev)
     assert r["stage"] == "rejected"
     assert stack["engine"]._records[rec.id].state == \
         ExecutionState.WAITING_FOR_PERMISSION  # never ran; cancel path below
@@ -555,10 +619,28 @@ def test_R1_revoke_midflight_cancels():
 def test_P1_approve_twice_refused():
     stack = make_stack()
     dev = paired_android(stack)
-    rec = stack["engine"].submit(INSPECT, {}, dev, who="user")
+    # Stage 30: park the record with TAP (INSPECT auto-allows now).
+    rec = stack["engine"].submit(TAP, {"target_package": VICTIM}, dev,
+                                 who="user")
     final = approve_with_stub_device(
-        stack, rec, dev,
-        {"format": "tree", "node_count": 1, "width": 1080, "height": 2400})
+        stack, rec, dev, {"package": VICTIM, "applied": True})
     assert final.state == ExecutionState.SUCCEEDED
     with pytest.raises(Exception):
         stack["engine"].approve(rec.id)  # terminal: no second transition
+
+
+def test_U9_tap_contract_v1_inputs_validate():
+    """Contract v1 (docs/UI_SNAPSHOT_CONTRACT.md): node_id is an integer
+    DFS index; snapshot bindings are optional; unknown fields rejected."""
+    from core.tools import validate_against_schema
+    stack = make_stack()
+    schema = stack["registry"].get(TAP).input_schema
+    base = {"target_package": sorted(GUI_LAB_TARGETS)[0], "node_id": 3}
+    assert validate_against_schema(base, schema) == []
+    full = dict(base, expected_snapshot_id="abcd1234:5",
+                expected_package=sorted(GUI_LAB_TARGETS)[0])
+    assert validate_against_schema(full, schema) == []
+    bad_type = dict(base, node_id="3")
+    assert validate_against_schema(bad_type, schema) != []
+    extra = dict(base, node_id_plus=True)
+    assert validate_against_schema(extra, schema) != []

@@ -168,6 +168,19 @@ PROMISE_FALLBACK_REPLY = (
     "pending. Please ask for a single check I can run and report right now."
 )
 
+# Honest terminal reply when the DEFAULT ECHO STUB is the configured
+# provider (no LLM attached): plain language, no internals leak, and
+# what DOES work stated concretely (2026-10-22, user-visible confusion:
+# 'hi' rendered the raw prompt skeleton).
+ECHO_PLACEHOLDER_REPLY = (
+    "I'm running in the lab's echo mode right now — no language model "
+    "is attached, so I can't carry the conversation itself. What does "
+    "work without one: the calendar ('what is next today'), the weather "
+    "('weather in Lisbon'), and device tasks on the Tasks tab. An "
+    "operator can attach an OpenAI-compatible LLM "
+    "(LLM_PROVIDER / LLM_BASE_URL / LLM_MODEL) to unlock chat replies."
+)
+
 
 class ConversationLoop:
     def __init__(self, *, provider: ModelProvider, ctx: ContextManager,
@@ -193,6 +206,14 @@ class ConversationLoop:
         self.tracer = tracer
         self.config = config or LoopConfig()
         self.turns = TurnRegistry()
+        # Stage 31-P4 close-out (2026-10-22 user request): deterministic
+        # fastpath. Callable(text, who) -> {"message": ...} | None. The
+        # read-only laptop flows (calendar, weather) answer BEFORE any
+        # model call, so conversation matches the /v1/intent path
+        # exactly for utterances they own — no LLM configured, or an
+        # offline provider, still yields real answers. Device flows are
+        # NOT part of this (their approval missions stay on /v1/intent).
+        self.intent_fastpath = None
 
     # ---------- public ----------
 
@@ -258,6 +279,30 @@ class ConversationLoop:
                     return _abort()
                 if time.time() > deadline:
                     raise LLMError(LLMErrorKind.TIMEOUT, "turn budget exceeded")
+                if _ == 0 and self.intent_fastpath is not None:
+                    try:
+                        fast = self.intent_fastpath(text, who)
+                    except Exception:  # noqa: BLE001 — fastpath never
+                        fast = None    # breaks the LLM path
+                    if fast is not None and isinstance(fast, dict) \
+                            and fast.get("message"):
+                        reply_text = fast["message"]
+                        status = "responded"
+                        self.audit.record(who, "turn_fastpath",
+                                          mission.id, "deterministic")
+                        break
+                if _ == 0 and getattr(self.provider, "name", "") == "echo":
+                    # Dev-stub honesty (user-visible confusion 2026-10-22:
+                    # 'hi' rendered the raw prompt skeleton, including
+                    # mission rows). The echo stub says so in plain
+                    # language and names what DOES work right now. Never
+                    # leaks internals; scripted/mock providers (tests)
+                    # are untouched.
+                    reply_text = ECHO_PLACEHOLDER_REPLY
+                    status = "responded"
+                    self.audit.record(who, "turn_placeholder",
+                                      mission.id, "echo provider")
+                    break
                 if emit is not None:
                     outcome = self._reason_stream(
                         session, mission.id, device_id, text,

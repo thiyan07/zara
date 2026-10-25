@@ -23,6 +23,7 @@ from core.models import DeviceKind, DeviceState, ExecutionState
 OP = {"Authorization": "Bearer dev-token"}
 ECHO = "util.echo"
 INSPECT = "gui.screen.inspect"
+TAP = "gui.tap"
 
 
 def make_stack(small_cap=5):
@@ -39,7 +40,7 @@ def paired_android(stack, dev="emu-lab"):
     stack["device_auth"].claim(code)
     stack["devices"].register(DeviceState(
         device_id=dev, kind=DeviceKind("android"),
-        capabilities=[INSPECT], online=True, status="online"))
+        capabilities=[INSPECT, TAP], online=True, status="online"))
     stack["fabric"].advertise([
         {"id": INSPECT, "name": INSPECT, "descriptor_version": "1",
          "version": "1.0.0", "risk": "confirm", "availability": "available"},
@@ -52,8 +53,12 @@ def test_H01_http_burst_evicts_oldest_terminal_keeps_parked():
     client = TestClient(create_app(stack))
     dev = paired_android(stack)
     # Parked approval = active work that retention must never reap.
+    # Stage 30: INSPECT auto-allows now; retention must never reap an
+    # ACTIVE approval — pin that with a still-parking tool (TAP).
     r = client.post("/v1/executions",
-                    json={"tool": INSPECT, "inputs": {}, "device_id": dev},
+                    json={"tool": TAP,
+                          "inputs": {"target_package": "dev.zara.lab.privtest"},
+                          "device_id": dev},
                     headers=OP)
     assert r.status_code == 202, r.text
     parked_id = r.json()["id"]

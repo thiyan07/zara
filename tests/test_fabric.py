@@ -17,7 +17,7 @@ from core.fabric import (CapabilityRecord, FabricDeviceType, FabricRegistry,
                          FabricStore, Presence, TempGrant, TrustState,
                          TrustViolation, check_trust_transition,
                          derive_presence)
-from core.models import DeviceKind, DeviceState
+from core.models import DeviceKind, DeviceState, ToolDefinition
 
 OP = {"Authorization": "Bearer dev-token"}
 
@@ -416,6 +416,49 @@ def test_verify_modes():
         "util.echo", Rec("failed", {}))
     assert ok is False
     ok, _ = fabric.verify_device_result("nope", Rec("succeeded", {}))
+    assert ok is False
+
+
+def test_explicit_verification_requires_flag_in_result():
+    """verification='explicit' must mean the handler SAYS it verified in
+    its result ('verified': bool). A non-empty payload is not proof —
+    the engine must not silently latch verified=True for it, and the
+    fabric verifier must report the absent flag honestly."""
+    fabric, stack = make_fabric()
+
+    def blind(inputs, ctx=None):  # non-empty result, no claim
+        return {"did": "stuff"}
+
+    def honest_true(inputs, ctx=None):
+        return {"verified": True, "did": "stuff"}
+
+    def honest_false(inputs, ctx=None):
+        return {"verified": False, "did": "stuff"}
+
+    for name, h in (("test.explicit_blind", blind),
+                    ("test.explicit_ok", honest_true),
+                    ("test.explicit_no", honest_false)):
+        stack["registry"].register(
+            ToolDefinition(name=name, description="explicit mode",
+                           input_schema={"type": "object",
+                                         "properties": {}},
+                           output_schema={"type": "object"},
+                           verification="explicit"), h)
+
+    rec = stack["engine"].submit("test.explicit_blind", {}, "d1")
+    assert rec.state.value == "succeeded"
+    assert rec.verified is False
+    ok, why = fabric.verify_device_result("test.explicit_blind", rec)
+    assert ok is False and "absent" in why
+
+    rec2 = stack["engine"].submit("test.explicit_ok", {}, "d1")
+    assert rec2.verified is True
+    ok, why = fabric.verify_device_result("test.explicit_ok", rec2)
+    assert ok is True and "explicit" in why
+
+    rec3 = stack["engine"].submit("test.explicit_no", {}, "d1")
+    assert rec3.verified is False
+    ok, _ = fabric.verify_device_result("test.explicit_no", rec3)
     assert ok is False
 
 

@@ -33,6 +33,14 @@ class DeviceManager:
             was_online = d.online
             d.online = online
             d.last_seen = utcnow()
+            if online and d.status == "offline":
+                # A graceful disconnect from a dying agent can land after
+                # the successor's register (both run during an agent
+                # restart) — heartbeats must then restore the presence
+                # status or every approval re-check fails closed forever.
+                # Observed live 2026-10-25: online=True, status=offline.
+                d.status = "online"
+                self._emit("device_online", device_id, {"status": "online"})
             if battery_pct is not None and battery_pct != d.battery_pct:
                 d.battery_pct = battery_pct
                 self._emit("battery_changed", device_id, {"battery_pct": battery_pct})

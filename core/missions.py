@@ -97,6 +97,41 @@ class MissionEngine:
             return self.transition(mission_id, MissionState.EXECUTING)
         return self.get(mission_id)
 
+    # Continuable-plan bookkeeping (Stage 24g). The plan envelope is a
+    # pure record: it stores WHAT a parked plan would do next so the
+    # continuation can re-enter the SAME per-step pipeline. It grants
+    # nothing by itself and bypasses no gate — each continued step is
+    # still resolved, authorized, approved, and verified individually.
+    _PLAN_MAX_BYTES = 16384          # bounded envelope; plan payloads
+    # (steps, parameters, fetch bindings) are small by construction.
+
+    def set_plan(self, mission_id: str, plan: dict) -> bool:
+        """Store/refresh the resumable plan envelope. Returns False
+        honestly (never raises, never truncates into fake data) when
+        the payload is missing or oversized."""
+        try:
+            if not isinstance(plan, dict) or not plan:
+                return False
+            import json as _json
+            if len(_json.dumps(plan, default=str)) > self._PLAN_MAX_BYTES:
+                return False
+            with self._lock:
+                m = self._missions[mission_id]
+                if m.state in TERMINAL_MISSIONS:
+                    return False
+                m.plan = dict(plan)
+                m.updated_at = utcnow()
+            self._emit(self.get(mission_id), "plan stored")
+        except Exception:  # noqa: BLE001 — bookkeeping never decides
+            return False
+        return True
+
+    def plan_of(self, mission_id: str) -> Optional[dict]:
+        try:
+            return self.get(mission_id).plan
+        except Exception:  # noqa: BLE001
+            return None
+
     def cancel(self, mission_id: str) -> Mission:
         m = self.get(mission_id)
         if m.state in TERMINAL_MISSIONS:
@@ -113,6 +148,15 @@ class MissionEngine:
 class PersistentMissionEngine(MissionEngine):
     """SQLite-backed missions: checkpoints and lifecycle survive restarts."""
 
+    def set_plan(self, mission_id: str, plan: dict) -> bool:
+        ok = super().set_plan(mission_id, plan)
+        if ok:
+            try:
+                self._save(self.get(mission_id))
+            except Exception:  # noqa: BLE001 — never block the caller
+                return False
+        return ok
+
     def __init__(self, path: str, on_event=None) -> None:
         super().__init__(on_event=on_event)
         import json as _json
@@ -126,6 +170,13 @@ class PersistentMissionEngine(MissionEngine):
                 "goal TEXT NOT NULL, state TEXT NOT NULL, device_id TEXT, "
                 "steps TEXT, checkpoints TEXT, approvals TEXT, retries INT, "
                 "max_retries INT, error TEXT, created_at TEXT, updated_at TEXT)")
+        # Additive migration for pre-existing databases: the resumable
+        # plan column joins the schema in place, keeping every row.
+        with self._lock, self._db:
+            cols = [r[1] for r in
+                    self._db.execute("PRAGMA table_info(missions)").fetchall()]
+            if "plan" not in cols:
+                self._db.execute("ALTER TABLE missions ADD COLUMN plan TEXT")
         for row in self._db.execute("SELECT * FROM missions").fetchall():
             try:
                 m = Mission(id=row[0], goal=row[1], state=row[2],
@@ -135,7 +186,8 @@ class PersistentMissionEngine(MissionEngine):
                             approvals=_json.loads(row[6] or "[]"),
                             retries=row[7] or 0, max_retries=row[8] or 3,
                             error=row[9] or "", created_at=row[10],
-                            updated_at=row[11])
+                            updated_at=row[11],
+                            plan=_json.loads(row[12]) if row[12] else None)
                 self._missions[m.id] = m
             except Exception:  # noqa: BLE001 — skip corrupt rows, stay up
                 continue
@@ -143,14 +195,16 @@ class PersistentMissionEngine(MissionEngine):
     def _save(self, m: Mission) -> None:
         with self._lock, self._db:
             self._db.execute(
-                "INSERT OR REPLACE INTO missions VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO missions VALUES "
+                "(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (m.id, m.goal, m.state.value, m.device_id,
                  self._json.dumps([s.model_dump(mode="json") for s in m.steps]),
                  self._json.dumps(m.checkpoints),
                  self._json.dumps(m.approvals), m.retries, m.max_retries,
                  m.error or "",
                  m.created_at.isoformat() if hasattr(m.created_at, "isoformat") else m.created_at,
-                 m.updated_at.isoformat() if hasattr(m.updated_at, "isoformat") else m.updated_at))
+                 m.updated_at.isoformat() if hasattr(m.updated_at, "isoformat") else m.updated_at,
+                 self._json.dumps(m.plan, default=str) if m.plan else None))
 
     def create(self, goal: str, steps=None, device_id=None) -> Mission:
         m = super().create(goal, steps, device_id)

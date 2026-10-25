@@ -1,16 +1,16 @@
 {
   "model": "hey_zara.onnx",
   "model_bytes": 205430,
-  "n_pos": 1000,
+  "n_pos": 1009,
   "n_neg": 1000,
   "neg_hours": 0.304,
-  "recall_at_0.5": 0.948,
-  "fp_at_0.5": 162,
-  "fp_per_hour_at_0.5": 533.1797424610194,
+  "recall_at_0.5": 0.9544103072348861,
+  "fp_at_0.5": 165,
+  "fp_per_hour_at_0.5": 543.0534413954828,
   "threshold": 0.5,
-  "recall": 0.948,
-  "fp": 162,
-  "fp_per_hour": 533.1797424610194,
+  "recall": 0.9544103072348861,
+  "fp": 165,
+  "fp_per_hour": 543.0534413954828,
   "note": "no threshold met FP<=0.5/hr",
-  "limitation": "synthetic-only clips; NOT real-world accuracy"
+  "limitation": "positives: 1000 synthetic + 9 real user takes (recorded by the user; the 9 real takes all fire >=0.99); negatives are synthetic-only clips; NOT real-world streaming accuracy (no live-room validation yet)"
 }

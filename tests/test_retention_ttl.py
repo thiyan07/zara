@@ -28,6 +28,7 @@ BAT = "system.battery"
 ECHO = "util.echo"
 INSPECT = "gui.screen.inspect"
 TAP = "gui.tap"
+VICTIM = "dev.zara.lab.privtest"
 
 
 def utcnow():
@@ -230,7 +231,7 @@ def test_R06_prune_racing_complete_and_cancel():
 def test_R07_grant_with_corrupt_park_time_reparks_never_approves():
     stack = make_stack()
     dev = paired_android(stack)
-    rec = stack["engine"].submit_async(INSPECT, {}, dev)
+    rec = stack["engine"].submit_async(TAP, {"target_package": VICTIM}, dev)
     assert rec.state == ExecutionState.WAITING_FOR_PERMISSION
     rec.parked_at = "not-a-time"  # type: ignore[assignment]
     with pytest.raises(ValueError, match="unverifiable"):
@@ -350,11 +351,13 @@ def test_R17_approval_ttl_edges():
     dev_ok = paired_android(stack, "emu-ok")
     dev_old = paired_android(stack, "emu-old")
     now = utcnow()
-    r_ok = stack["engine"].submit_async(INSPECT, {}, dev_ok)
+    r_ok = stack["engine"].submit_async(
+        TAP, {"target_package": VICTIM}, dev_ok)
     assert r_ok.state == ExecutionState.WAITING_FOR_PERMISSION
     r_ok.parked_at = now - timedelta(seconds=299)
     assert stack["engine"]._grant(r_ok.id).state == ExecutionState.RUNNING
-    r_old = stack["engine"].submit_async(INSPECT, {}, dev_old)
+    r_old = stack["engine"].submit_async(
+        TAP, {"target_package": VICTIM}, dev_old)
     assert r_old.state == ExecutionState.WAITING_FOR_PERMISSION
     r_old.parked_at = now - timedelta(seconds=301)
     with pytest.raises(ValueError, match="re-parked"):

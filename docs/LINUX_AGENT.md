@@ -35,5 +35,12 @@ layers: shell allowlist → core policy (deny-patterns + risk) → approval gate
 
 ## Limitations
 
-Single-agent process, REST poll transport, no sandboxing beyond scoping
-(containers/seccomp later), probes best-effort (never crash the loop).
+## Limitations
+
+Single-agent process, REST poll transport (job claims use Core's bounded
+server-side long poll, `wait_secs` up to `POLL_WAIT_S` = 25 s by default:
+one held request per window replaces the former 5 s poll tick, so idle
+request rate drops while claim latency becomes sub-second; old cores
+without the parameter degrade to the previous instant-empty cadence),
+no sandboxing beyond scoping (containers/seccomp later), probes
+best-effort (never crash the loop).

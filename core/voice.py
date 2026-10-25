@@ -960,7 +960,406 @@ class OnnxWakeSpotter:
                         "model files present; detection still unvalidated "
                         "on hardware"}
 
+@dataclass
+class OpenWakeWordConfig:
+    """openWakeWord custom-model runtime config. Env overrides:
+    WAKE_OWW_MODEL (keyword model path), WAKE_OWW_FRONTENDS (dir holding
+    melspectrogram.onnx + embedding_model.onnx), WAKE_OWW_THRESHOLD,
+    WAKE_OWW_CONS_FRAMES, WAKE_OWW_COOLDOWN_S, WAKE_OWW_MAX_SNIPPET_S.
 
+    Defaults select the USER-TRAINED "hey zara" model and the openWakeWord
+    release frontends under ~/.cache/zara-wake/. Nothing is downloaded
+    automatically; with the files absent the spotter fails closed with an
+    actionable error (see docs/WAKE_ONNX_SETUP.md and
+    training/hey_zara_metrics.json for measured behaviour)."""
+
+    model: str = "~/.cache/zara-wake/hey_zara.onnx"
+    frontend_dir: str = "~/.cache/zara-wake/oww"
+    threshold: float = 0.5
+    cons_frames: int = 2
+    cooldown_s: float = 1.5
+    max_snippet_s: float = 5.0
+    phrase: str = "Hey Zara"
+    sample_rate: int = 16000
+
+    @staticmethod
+    def from_env() -> "OpenWakeWordConfig":
+        import os as _os
+
+        def _s(key: str, default: str) -> str:
+            return _os.path.expanduser(_os.environ.get(key, "") or default)
+
+        def _f(key: str, default: float) -> float:
+            try:
+                return float(_os.environ.get(key, "") or default)
+            except ValueError:
+                return default
+
+        return OpenWakeWordConfig(
+            model=_s("WAKE_OWW_MODEL", OpenWakeWordConfig.model),
+            frontend_dir=_s("WAKE_OWW_FRONTENDS",
+                            OpenWakeWordConfig.frontend_dir),
+            threshold=_f("WAKE_OWW_THRESHOLD",
+                         OpenWakeWordConfig.threshold),
+            cons_frames=max(1, int(_f("WAKE_OWW_CONS_FRAMES",
+                                      OpenWakeWordConfig.cons_frames))),
+            cooldown_s=_f("WAKE_OWW_COOLDOWN_S",
+                          OpenWakeWordConfig.cooldown_s),
+            max_snippet_s=_f("WAKE_OWW_MAX_SNIPPET_S",
+                             OpenWakeWordConfig.max_snippet_s))
+
+
+class OpenWakeWordSpotter:
+    """openWakeWord (Apache-2.0 project) custom-model binding over
+    onnxruntime — the SAME spotter contract as ``OnnxWakeSpotter``
+    (``_load`` / ``spot`` / ``close`` / ``availability``), so
+    ``WakeListenSession`` and ``wake_listen_once`` accept either engine.
+
+    The streaming feature pipeline re-implements the upstream
+    openWakeWord semantics exactly (80 ms scoring chunks; melspectrogram
+    ONNX -> speech-embedding ONNX (76-frame mel windows, step 8) ->
+    16-embedding-frame classifier window) using numpy and onnxruntime
+    only — no openwakeword/torch/tensorflow runtime dependency, no
+    vendored code. Streaming state persists across ``spot()`` calls and
+    is causal: a chunk score never uses future audio. Per call the
+    binding mirrors the reference ``predict()``: the newest full chunks
+    are scored and the max is returned; sub-chunk audio repeats the
+    previous score; the first five scored calls return 0.0
+    (reference warm-up). Detection policy layered above the raw score is
+    Zara's: threshold gate -> ``cons_frames`` consecutive confirmed
+    chunks -> cooldown suppression. Missing or corrupt model files raise
+    a descriptive error — never silent non-detection.
+    """
+
+    CHUNK = 1280            # samples per scored frame (80 ms @16 kHz)
+    MEL_WINDOW = 76         # mel frames per embedding window
+    MEL_STEP = 8            # mel frames appended per chunk
+    N_MELS = 32
+    KW_WINDOW = 16          # embedding frames per classifier window
+    WARMUP_CALLS = 5        # reference: first five predictions -> 0.0
+    RAW_BUF_MAX = 160000    # rolling raw-sample buffer (10 s)
+    MELS_BUF_MAX = 10 * 97
+    FEATURES_BUF_MAX = 120
+
+    def __init__(self, config: OpenWakeWordConfig | None = None,
+                 _sessions: Optional[dict] = None) -> None:
+        self.config = config or OpenWakeWordConfig.from_env()
+        self._sessions = _sessions  # injected only by tests
+        self._lock = threading.Lock()
+        from collections import deque
+        self._raw: deque = deque(maxlen=self.RAW_BUF_MAX)
+        self._remainder: Optional["object"] = None  # np int16 tail
+        self._mels: Optional["object"] = None       # (frames, 32) float
+        self._features: Optional["object"] = None   # (frames, 96) float
+        self._accum = 0
+        self._calls = 0
+        self._last_score = 0.0
+        self._cons = 0
+        self._last_fire = 0.0
+
+    # -- model loading --
+
+    def _read_model(self, ort, path: str, opts, label: str):
+        import os as _os
+        if not _os.path.isfile(path):
+            raise RuntimeError(
+                f"wake model file missing: {label} not found at {path} "
+                "(place the trained 'Hey Zara' openWakeWord models there; "
+                "nothing is downloaded automatically; see "
+                "docs/WAKE_ONNX_SETUP.md)")
+        try:
+            return ort.InferenceSession(path, opts,
+                                        providers=["CPUExecutionProvider"])
+        except Exception as e:  # noqa: BLE001 — corrupt model must not
+            raise RuntimeError(               # masquerade as silence
+                f"wake {label} failed to load from {path}: {e}")
+
+    def _load(self):
+        with self._lock:
+            if self._sessions is not None:
+                return self._sessions
+            try:
+                import onnxruntime as _ort
+            except ImportError:
+                raise RuntimeError(
+                    "onnxruntime not installed: pip install onnxruntime "
+                    "(openWakeWord wake detection unavailable)")
+            import os as _os
+            import numpy as _np
+            opts = _ort.SessionOptions()
+            opts.intra_op_num_threads = 1  # low-power: no thread pool
+            opts.log_severity_level = 3    # errors only
+            front = _os.path.expanduser(self.config.frontend_dir)
+            sessions = {
+                "mel": self._read_model(
+                    _ort, _os.path.join(front, "melspectrogram.onnx"),
+                    opts, "mel frontend"),
+                "emb": self._read_model(
+                    _ort, _os.path.join(front, "embedding_model.onnx"),
+                    opts, "embedding model"),
+                "kw": self._read_model(
+                    _ort, _os.path.expanduser(self.config.model),
+                    opts, "keyword model"),
+            }
+            shape = sessions["kw"].get_inputs()[0].shape
+            if len(shape) != 3 or shape[1] != self.KW_WINDOW:
+                raise RuntimeError(
+                    f"wake keyword model needs a {self.KW_WINDOW}-frame "
+                    f"input, got shape {shape!r}")
+            self._sessions = sessions
+            self._reset_streams(_np)
+            return self._sessions
+
+    def _reset_streams(self, np) -> None:
+        """Fresh streaming state. The feature buffer is primed with the
+        embeddings of 4 s of random audio — identical consumption to the
+        reference ``AudioFeatures`` init, so the classifier never sees an
+        empty history."""
+        self._raw.clear()
+        self._remainder = np.empty(0, dtype=np.int16)
+        self._mels = np.ones((self.MEL_WINDOW, self.N_MELS),
+                             dtype=np.float32)
+        prime = np.random.randint(-1000, 1000,
+                                  self.config.sample_rate * 4).astype(
+                                      np.int16)
+        self._features = self._embed_from_audio(prime)
+        self._accum = 0
+        self._calls = 0
+        self._last_score = 0.0
+        self._cons = 0
+        self._last_fire = 0.0
+
+    # -- feature pipeline (reference streaming semantics) --
+
+    def _mel_frames(self, pcm: "np.ndarray") -> "np.ndarray":
+        """Melspectrogram frames (frames, 32) for int16 audio, with the
+        reference /10+2 transform."""
+        import numpy as _np
+        sess = self._sessions["mel"]
+        x = pcm.astype(_np.float32).reshape(1, -1)
+        out = sess.run(None, {sess.get_inputs()[0].name: x})[0]
+        frames = out.reshape(out.shape[0], -1, self.N_MELS)[0]
+        return frames / 10.0 + 2.0
+
+    def _embed_windows(self, windows: "np.ndarray") -> "np.ndarray":
+        """Speech embeddings (n, 96) for a stack of (76, 32) mel windows.
+        Batched calls produce the same per-window outputs as the
+        reference's per-window invocations."""
+        import numpy as _np
+        sess = self._sessions["emb"]
+        x = windows.astype(_np.float32)[:, :, :, None]
+        out = sess.run(None, {sess.get_inputs()[0].name: x})[0]
+        return out.reshape(out.shape[0], -1).astype(_np.float32)
+
+    def _embed_from_audio(self, pcm: "np.ndarray") -> "np.ndarray":
+        """Full-clip embeddings (reference batch path): mel frames then
+        76-frame windows stepped by 8."""
+        import numpy as _np
+        mels = self._mel_frames(pcm)
+        starts = range(0, max(mels.shape[0] - self.MEL_WINDOW, 0),
+                       self.MEL_STEP)
+        wins = [mels[i:i + self.MEL_WINDOW] for i in starts]
+        if not wins:
+            return _np.zeros((0, 96), dtype=_np.float32)
+        return self._embed_windows(_np.stack(wins))
+
+    def _raw_tail(self, n: int) -> list:
+        import itertools as _it
+        size = len(self._raw)
+        if size <= n:
+            return list(self._raw)
+        return list(_it.islice(self._raw, size - n, size))
+
+    def _stream(self, x: "np.ndarray") -> int:
+        """Reference ``_streaming_features``: buffer raw audio, carry
+        sub-chunk tails, and on full-chunk boundaries refresh the mel
+        buffer and append one embedding frame per new chunk. Returns the
+        number of samples processed as full chunks (0 accumulator count
+        otherwise)."""
+        import numpy as _np
+        if self._remainder is not None and self._remainder.size:
+            x = _np.concatenate((self._remainder, x.astype(_np.int16)))
+            self._remainder = _np.empty(0, dtype=_np.int16)
+        if self._accum + x.size >= self.CHUNK:
+            rem = (self._accum + x.size) % self.CHUNK
+            if rem:
+                even = x[:x.size - rem]
+                self._raw.extend(even.tolist())
+                self._accum += even.size
+                self._remainder = x[x.size - rem:].astype(_np.int16)
+            else:
+                self._raw.extend(x.tolist())
+                self._accum += x.size
+        else:
+            self._accum += x.size
+            self._raw.extend(x.tolist())
+        processed = 0
+        if self._accum >= self.CHUNK and self._accum % self.CHUNK == 0:
+            n = self._accum
+            take = _np.asarray(self._raw_tail(n + 480), dtype=_np.int16)
+            self._mels = _np.vstack((self._mels, self._mel_frames(take)))
+            if self._mels.shape[0] > self.MELS_BUF_MAX:
+                self._mels = self._mels[-self.MELS_BUF_MAX:, :]
+            for i in range(n // self.CHUNK - 1, -1, -1):
+                ndx = -self.MEL_STEP * i
+                if ndx == 0:
+                    ndx = self._mels.shape[0]
+                win = self._mels[-self.MEL_WINDOW + ndx:ndx]
+                if win.shape[0] == self.MEL_WINDOW:
+                    emb = self._embed_windows(win[None, :, :])
+                    self._features = _np.vstack((self._features, emb))
+            if self._features.shape[0] > self.FEATURES_BUF_MAX:
+                self._features = self._features[-self.FEATURES_BUF_MAX:, :]
+            processed = n
+            self._accum = 0
+        return processed if processed else self._accum
+
+    def _score_call(self, processed: int) -> float:
+        """Reference ``predict()`` semantics: max classifier score over
+        every new full chunk of this call; sub-chunk calls repeat the
+        previous (post-policy) score; the first five scored calls are
+        forced to 0.0 by ``spot`` (reference warm-up), and repeats carry
+        the forced value exactly like the reference prediction buffer."""
+        import numpy as _np
+        sess = self._sessions["kw"]
+        if processed < self.CHUNK:
+            return self._last_score
+        feats = self._features
+        best = 0.0
+        for i in range(processed // self.CHUNK):
+            window = feats[-self.KW_WINDOW - i:len(feats) - i, :]
+            if window.shape[0] != self.KW_WINDOW:
+                continue
+            out = sess.run(None, {
+                sess.get_inputs()[0].name:
+                    window.astype(_np.float32)[None, :, :]})
+            best = max(best, float(_np.asarray(out).ravel()[0]))
+        return best
+
+    # -- spotter contract --
+
+    def spot(self, pcm16k: bytes) -> dict:
+        """Score one bounded snippet. Returns {detected, word,
+        confidence, cons_frames, cooldown}. Raises when unavailable;
+        cooldown suppresses repeats (detected False + cooldown True)."""
+        import time as _t
+        cap = int(self.config.sample_rate * 2 *
+                  self.config.max_snippet_s) * 2  # bytes: 2 bytes/sample
+        if len(pcm16k) > cap:
+            raise ValueError(
+                f"snippet exceeds {self.config.max_snippet_s}s")
+        if len(pcm16k) == 0:
+            raise ValueError("empty snippet")
+        self._load()
+        import numpy as _np
+        with self._lock:
+            pcm = _np.frombuffer(pcm16k, dtype=_np.int16)
+            processed = self._stream(pcm)
+            raw = self._score_call(processed)
+            self._calls += 1
+            conf = 0.0 if self._calls <= self.WARMUP_CALLS else raw
+            self._last_score = conf   # repeats carry the forced value
+            hit = conf >= self.config.threshold
+            self._cons = self._cons + 1 if hit else 0
+            confirmed = hit and self._cons >= self.config.cons_frames
+            now = _t.monotonic()
+            if confirmed and (now - self._last_fire) < self.config.cooldown_s:
+                return {"detected": False, "word": self.config.phrase,
+                        "confidence": conf,
+                        "cons_frames": self.config.cons_frames,
+                        "cooldown": True}
+            if confirmed:
+                self._last_fire = now
+                self._cons = 0
+        return {"detected": bool(confirmed), "word": self.config.phrase,
+                "confidence": float(conf),
+                "cons_frames": self.config.cons_frames, "cooldown": False}
+
+    def close(self) -> None:
+        """Release sessions idempotently; late callbacks after close must
+        not revive anything (sessions are dropped, not re-created)."""
+        with self._lock:
+            self._sessions = None
+            self._features = None
+            self._mels = None
+            self._remainder = None
+            self._raw.clear()
+            self._cons = 0
+            self._calls = 0
+
+    def availability(self) -> dict:
+        import os as _os
+        try:
+            import onnxruntime  # noqa: F401
+            runtime = True
+        except ImportError:
+            runtime = False
+        front = _os.path.expanduser(self.config.frontend_dir)
+        files = {
+            "keyword_model": _os.path.isfile(
+                _os.path.expanduser(self.config.model)),
+            "melspectrogram": _os.path.isfile(
+                _os.path.join(front, "melspectrogram.onnx")),
+            "embedding_model": _os.path.isfile(
+                _os.path.join(front, "embedding_model.onnx")),
+        }
+        ready = runtime and all(files.values())
+        return {"engine": "openwakeword-onnx",
+                "phrase": self.config.phrase,
+                "runtime": runtime,
+                "files": files,
+                "ready": ready,
+                "always_on_dsp": False,
+                "physically_validated": False,
+                "validated_on_recorded_user_speech": ready,
+                "note": (
+                    "trained 'Hey Zara' model + openWakeWord frontends "
+                    "present; acoustically validated on the user's own "
+                    "recorded takes (training/hey_zara_metrics.json); "
+                    "live-room listening is the remaining user-gated "
+                    "validation" if ready else
+                    "place the trained 'Hey Zara' openWakeWord models "
+                    "(see docs/WAKE_ONNX_SETUP.md); nothing is "
+                    "downloaded automatically")}
+
+
+def _spotter_from_env():
+    """Wake engine selection helper. ``ZARA_WAKE_ENGINE`` env:
+    unset/'auto' -> the openWakeWord binding when all three of its model
+    files are present, else the onnx-wakeword-contract spotter;
+    'oww' -> openWakeWord binding; 'onnx' -> onnx-wakeword contract;
+    anything else -> ValueError (unknown engines must not silently
+    fall back). Explicit spotter arguments always win."""
+    import os as _os
+    which = _os.environ.get("ZARA_WAKE_ENGINE", "").strip().lower()
+    if which == "oww":
+        return OpenWakeWordSpotter()
+    if which == "onnx":
+        return OnnxWakeSpotter(OnnxWakeConfig.from_env())
+    if which in ("", "auto"):
+        if OpenWakeWordSpotter(OpenWakeWordConfig.from_env()) \
+                .availability()["ready"]:
+            return OpenWakeWordSpotter()
+        return OnnxWakeSpotter(OnnxWakeConfig.from_env())
+    raise ValueError(f"unknown ZARA_WAKE_ENGINE {which!r}: expected "
+                     f"auto|oww|onnx")
+
+
+_default_spotter_obj = None
+_default_spotter_lock = threading.Lock()
+
+
+def _default_spotter():
+    """Shared default wake spotter (one persistent engine per process).
+    The reference warm-up suppresses the first five scored calls, so a
+    fresh engine per call could never fire; wake listening is inherently
+    a continuous stream and the shared instance matches that (state
+    persists for the process, exactly like a running session)."""
+    global _default_spotter_obj
+    with _default_spotter_lock:
+        if _default_spotter_obj is None:
+            _default_spotter_obj = _spotter_from_env()
+        return _default_spotter_obj
 def capture_snippet_alsa(seconds: float = 1.0, rate: int = 16000,
                          device: str | None = None,
                          timeout_s: float = 15.0) -> bytes:
@@ -998,7 +1397,7 @@ def capture_snippet_alsa(seconds: float = 1.0, rate: int = 16000,
     return r.stdout
 
 
-def wake_listen_once(spotter: OnnxWakeSpotter | None = None,
+def wake_listen_once(spotter: "OnnxWakeSpotter | OpenWakeWordSpotter | None" = None,
                      seconds: float = 1.0,
                      device: str | None = None,
                      pcm: bytes | None = None) -> dict:
@@ -1006,8 +1405,10 @@ def wake_listen_once(spotter: OnnxWakeSpotter | None = None,
     the spotter. No loop, no background work, no persistence. The model
     is validated BEFORE touching the microphone, so a missing model
     never costs a room recording. Returns the spot() dict; raises
-    honestly on capture or inference failure."""
-    sp = spotter if spotter is not None else OnnxWakeSpotter()
+    honestly on capture or inference failure. Default engine: see
+    ``_spotter_from_env`` (auto-selects the trained openWakeWord model
+    when its files are present, ZARA_WAKE_ENGINE overrides)."""
+    sp = spotter if spotter is not None else _default_spotter()
     sp._load()  # fail fast on model problems — same module, intentional
     raw = pcm if pcm is not None else capture_snippet_alsa(
         seconds=seconds, device=device)
@@ -1031,13 +1432,14 @@ class WakeListenSession:
     waits only). States: off | starting | listening | error.
     """
 
-    def __init__(self, spotter: OnnxWakeSpotter | None = None,
+    def __init__(self,
+                 spotter: "OnnxWakeSpotter | OpenWakeWordSpotter | None" = None,
                  on_event=None, window_s: float = 1.0,
                  device: str | None = None,
                  max_retries: int = 3, retry_backoff_s: float = 1.0,
                  spawn=None) -> None:
         self.spotter = spotter if spotter is not None \
-            else OnnxWakeSpotter()
+            else _spotter_from_env()
         self.on_event = on_event
         self.window_s = window_s
         self.device = device

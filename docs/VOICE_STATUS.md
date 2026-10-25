@@ -6,8 +6,9 @@
 |---|---|---|
 | STT | faster-whisper `tiny.en` (int8 CPU) | REAL LINUX AUDIO TESTED |
 | TTS | Piper `en_US-lessac-medium` (onnx CPU) | REAL LINUX AUDIO TESTED |
-| Wake | VAD-gated single-shot keyword spotter | INTEGRATION TESTED (synth audio) |
-| Mic capture | arecord/ALSA (`core/audio.py`) + `probe_capabilities()` | VERIFIED opens, BLOCKED signal (see below) |
+| Wake | trained "Hey Zara" openWakeWord model (`OpenWakeWordSpotter`, onnxruntime) | LIVE on laptop — binding validated vs upstream reference (331 calls, 0 mismatch); real-speech recall measured; soundalike FAR disclosed (see WAKE_ONNX_SETUP.md) |
+| Wake fallback | VAD-gated single-shot keyword spotter (`OnnxWakeSpotter` contract available via `ZARA_WAKE_ENGINE=onnx`) | INTEGRATION TESTED (synth audio) |
+| Mic capture | arecord/ALSA (`core/audio.py`) + `probe_capabilities()` | VERIFIED opens; laptop signal UNBLOCKED 2026-10-19 (loopback + wake 0.9955, `scripts/voice_mic_probe.py`) |
 | Speaker | aplay/ALSA | PLAYBACK_PATH_VERIFIED, AUDIBILITY_MANUAL |
 | Conversation | `VoiceConversation` bounded sessions (`core/voice.py`) | INTEGRATION TESTED |
 | Barge-in monitor | `monitor_barge_in` VAD polling (`core/voice.py`) | INTEGRATION TESTED |
@@ -46,11 +47,24 @@
 
 ## Blocked / honest limits
 
-- REAL MICROPHONE SPEECH = BLOCKED. The ALC256 capture device records
-  successfully but yields digital silence (muted/unconnected input).
-  STT itself is validated on synthesized speech, which exercises the
-  identical code path.
-- REAL WAKE DETECTION = BLOCKED (no mic signal + no DSP). The spotter is
+- REAL MICROPHONE SPEECH (LAPTOP): **was blocked, now UNBLOCKED with dated
+  evidence — 2026-10-19**. The earlier finding ("ALC256 records but yields
+  digital silence", 2026-10-03) no longer holds on the current route:
+  `arecord -D default` (system pipewire-routed default; `record_backend()`
+  reports the backend Zara will use) now delivers REAL signal and the full
+  acoustic loopback works: piper TTS -> speakers -> REAL laptop mic ->
+  faster-whisper tiny.en int8 -> transcript "check the battery" (wake
+  phrase heard "Hey Sarah"/"He's out" — the known Zara confusable), and the
+  REAL OWW "hey zara" spotter scored the same capture at **0.9955 with
+  exactly 1 confirmed detection** (cooldown). Repeatable via
+  `scripts/voice_mic_probe.py --wake` (JSON, honest labels). Raw `hw:X,Y`
+  ALSA devices still record nothing (0 bytes) — the working route is the
+  system default; Zara's default backend matches it.
+  STILL NOT CLAIMED: human speech handling, live-room behavior, false-
+  acceptance rates on a real room — speech source in the probe is
+  synthetic TTS over speakers; wake FAR/SAR evidence remains
+  training/hey_zara_metrics.json (never lowered by this probe).
+- WAKE always-on loop: not built by design. The spotter is
   a VAD-gated single-shot keyword matcher, never an always-on loop, and
   wake events only move voice state — they execute nothing.
 - Speaker audibility cannot be verified from here (no ears); playback

@@ -42,11 +42,36 @@ class DeviceJob(BaseModel):
     created_at: str = ""
     claimed_at: Optional[str] = None
     finished_at: Optional[str] = None
+    # Zombie-claim repair (see JobQueue.CLAIM_ACK_TIMEOUT_S): deliveries
+    # counts claims handed out (any claim path); claim_ack flips True on
+    # the owner's first state read of the claimed job. Re-parking clears
+    # claimed_at and claim_ack but never deliveries.
+    deliveries: int = 0
+    claim_ack: bool = False
 
 
 class JobQueue:
     CLAIM_TIMEOUT_S = 300.0
     MAX_PENDING_PER_DEVICE = 100
+    # P5 ⑯ (2026-10-23): long-poll-park wakeup granularity. The parked
+    # waiter must wake on enqueue/cancel notify_all (immediate serve) and
+    # otherwise at most this often to re-check its own deadline — a slice,
+    # not a busy poll (each wake re-checks state under the lock).
+    JOB_POLL_SLICE_S = 2.0
+    # P5 ⑯ zombie-claim repair (live-caught 2026-10-23): a claim handed
+    # to a long-poll whose client has vanished is invisible to the
+    # queue (the in-memory claim already happened; the response goes to
+    # a dead socket). The claimant's immediate owner-scoped state probe
+    # (agent is_job_cancelled → /v1/agent/jobs/{id}/state) doubles as
+    # the DELIVERY RECEIPT ("claim_ack"): a claim never acked in this
+    # window is presumed delivered to a dead connection and re-parked
+    # for redelivery; after this many deliveries without a receipt the
+    # job terminates expired (never resurrected — Task 8 invariant).
+    # Bounded at-least-once: a device may run a re-delivered tool
+    # twice; device tools stay honest under re-run (a calendar move's
+    # second run refuses at selection: the old start is gone).
+    CLAIM_ACK_TIMEOUT_S = 8.0
+    MAX_JOB_DELIVERIES = 3
 
     def __init__(self, max_pending_per_device: int = 100,
                  max_terminal_records: int = TERMINAL_RETENTION_MAX,
@@ -83,14 +108,52 @@ class JobQueue:
             return job
 
     def poll(self, device_id: str) -> Optional[DeviceJob]:
-        """Agent poll: oldest pending job for this device (or None)."""
+        """Agent poll: oldest pending job for this device (or None).
+        The handout is recorded as a delivery (zombie-claim repair)."""
         with self._cond:
             for job in self._jobs.values():
                 if job.device_id == device_id and job.state == "pending":
                     job.state = "claimed"
+                    job.deliveries += 1
                     job.claimed_at = utcnow().isoformat()
                     return job
         return None
+
+    def wait_for_job(self, device_id: str, timeout: float) -> Optional[DeviceJob]:
+        """Server-side long poll: claim the oldest pending job for this
+        device, or block (Condition wait — no busy poll) until one arrives
+        or the bounded timeout expires. Claim semantics are identical to
+        poll() and equally atomic (same lock, same first-match loop), so
+        two concurrent long polls can never both claim the same job.
+        Wakes on enqueue AND on any cancel/complete/prune notification:
+        a pending job of this device being cancelled just re-checks and
+        keeps waiting until its own deadline — a cancelled job is never
+        handed out. Monotonic deadline like wait_for_result (Task 9):
+        wall-clock jumps neither strand a waiter nor oversleep.
+        Caller (HTTP handler) still re-validates revocation/cancellation
+        AFTER the claim, exactly as with poll()."""
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while True:
+                for job in self._jobs.values():
+                    if job.device_id == device_id and job.state == "pending":
+                        job.state = "claimed"
+                        job.deliveries += 1
+                        job.claimed_at = utcnow().isoformat()
+                        return job
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                # Park-wait slice: enqueue/cancel notify_all wakes this
+                # immediately; only the deadline re-check needs the slice.
+                # P5 ⑯ live-caught (2026-10-23): this line referenced a
+                # bare JOB_POLL_SLICE_S (class attr is invisible to the
+                # bare name) — every parked long poll died on NameError
+                # → HTTP 500 → the agent's poll_job swallowed it and
+                # re-polled at full speed (196k rounds/80 s, a 429
+                # storm). self.<class const> it is.
+                self._cond.wait(timeout=min(remaining,
+                                            self.JOB_POLL_SLICE_S))
 
     def complete_once(self, job_id: str, ok: bool,
                       result: Optional[dict] = None,
@@ -192,7 +255,18 @@ class JobQueue:
         return n
 
     def wait_for_result(self, job_id: str, timeout: float) -> DeviceJob:
-        """Core-side blocking wait on Condition — no busy polling."""
+        """Core-side blocking wait on Condition — no busy polling.
+
+        P5 ⑯ zombie-claim redelivery: the proxy waiter also sweeps its
+        own job. A claim older than CLAIM_ACK_TIMEOUT_S with no owner
+        receipt (claim_ack) was delivered to a vanished long-poll client
+        — re-park it to pending (redelivery, wake any live parked poll)
+        unless the delivery cap is exhausted, in which case the job
+        terminates expired exactly like the pre-repair contract (Task 8:
+        expired stays terminal, never resurrected). Acked claims and
+        pending jobs are left alone; the waiter's own deadline expiry
+        expires the job unchanged, so all short-timeout pins still hold
+        (their timeouts are far below the ack window)."""
         # Monotonic deadline (Task 9): wall-clock jumps must neither strand
         # a waiter nor expire a claim early. Record stamps stay wall-clock.
         deadline = time.monotonic() + timeout
@@ -207,7 +281,34 @@ class JobQueue:
                     job.finished_at = utcnow().isoformat()
                     self._cond.notify_all()
                     return job
+                if (job.state == "claimed" and not job.claim_ack):
+                    age = self._claim_age_s(job)
+                    if age > self.CLAIM_ACK_TIMEOUT_S:
+                        if job.deliveries >= self.MAX_JOB_DELIVERIES:
+                            job.state = "expired"
+                            job.finished_at = utcnow().isoformat()
+                            self._cond.notify_all()
+                            return job
+                        job.state = "pending"
+                        job.claimed_at = None
+                        job.claim_ack = False
+                        self._cond.notify_all()
                 self._cond.wait(timeout=min(remaining, 1.0))
+
+    def _claim_age_s(self, job: DeviceJob) -> float:
+        """Seconds since the current claim (claimed_at, wall-clock).
+        Unparseable/missing stamps count as maximally stale — a receipt
+        that cannot be aged cannot be trusted to arrive."""
+        if not job.claimed_at:
+            return self.CLAIM_ACK_TIMEOUT_S + 1.0
+        try:
+            claimed = datetime.fromisoformat(job.claimed_at)
+        except (ValueError, TypeError):
+            return self.CLAIM_ACK_TIMEOUT_S + 1.0
+        try:
+            return (utcnow() - claimed).total_seconds()
+        except TypeError:  # naive vs aware stamp mix: cannot trust it
+            return self.CLAIM_ACK_TIMEOUT_S + 1.0
 
     def get_by_execution(self, execution_id: str) -> Optional[DeviceJob]:
         """Read-time execution→job join for status views (O(n), fine for
@@ -227,16 +328,25 @@ class JobQueue:
 
         Returns job.state iff job.device_id == device_id, else None
         (wrong owner, unknown id, or pruned id all read back as None so
-        callers cannot probe other devices' jobs). Pure read under the
-        queue lock: no state change, no notify, no prune. Does NOT alter
-        claim/complete/cancel/prune semantics.
-        """
+        callers cannot probe other devices' jobs). P5 ⑯: the owner's
+        read of a CLAIMED job is also its delivery receipt (claim_ack —
+        the one liveness signal a live claimant emits within seconds of
+        claiming); nothing else mutates here, and no notify fires (the
+        receipt never unblocks a waiter on its own)."""
         with self._cond:
             job = self._jobs.get(job_id)
             if job is None:
                 return None
             if job.device_id != device_id:
                 return None
+            # P5 ⑯ zombie-claim repair: the owner reading its OWN claimed
+            # job's state is the delivery receipt — the live agent's
+            # run_one_job probes this endpoint immediately after
+            # claiming, so an unacked claim is a claim nobody holds.
+            # Other owners' reads stay non-mutating (wrong device_id
+            # returned None above without touching state).
+            if job.state == "claimed":
+                job.claim_ack = True
             return job.state
 
     def prune(self, now: Optional[datetime] = None,

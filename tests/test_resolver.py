@@ -527,3 +527,51 @@ def test_api_ladder_shape():
     assert lad["levels"]["NATIVE"] == ["system.battery"]
     assert "GUI" in lad["levels"] and "HUMAN" in lad["levels"]
     assert "executable" in lad["note"]
+
+
+# ---------- P5 2026-10-23: TOOL-NAME routing over FEATURE-LEVEL
+# descriptor ids. Laptop descriptors advertise feature ids
+# (calendar.write); the chat path routes TOOL names (calendar.event.add).
+# Live-discovered regression: "no eligible device" for every laptop tool
+# despite a healthy advertising agent. The resolver (and
+# fabric.route_capability) translate tool name -> required_capabilities
+# and match the advertised feature id. This test pins BOTH directions:
+# routing works, and a tool whose feature is NOT advertised stays
+# unreachable. ----------
+
+def _cal_tool(required, **kw):
+    from core.models import PermissionLevel, RiskLevel
+    return ToolDefinition(
+        name="calendar.event.add",
+        description="write test tool", input_schema={"type": "object"},
+        required_capabilities=required,
+        permission=PermissionLevel.CONFIRM, risk=RiskLevel.CONFIRM,
+        **kw)
+
+
+def test_resolver_routes_tool_name_through_advertised_feature_id():
+    r, stack = resolver()
+    enroll_claim(stack, "d1")
+    register(stack, "d1")
+    stack["fabric"].advertise([doc("calendar.write")], "d1")
+    out = r.resolve("calendar.event.add")
+    assert out.status != "no_device", out
+    assert out.device_id == "d1", out
+
+
+def test_resolver_stays_unrouted_without_advertised_feature():
+    r, stack = resolver()
+    enroll_claim(stack, "d1")
+    register(stack, "d1")
+    stack["fabric"].advertise([doc("some.other.feature")], "d1")
+    out = r.resolve("calendar.event.add")
+    assert out.status == "no_device", out
+
+
+def test_fabric_route_capability_translates_tool_name():
+    stack = make_stack()
+    enroll_claim(stack, "d1")
+    register(stack, "d1")
+    stack["fabric"].advertise([doc("calendar.write")], "d1")
+    route = stack["fabric"].route_capability("calendar.event.add")
+    assert route.action == "route" and route.device_id == "d1", route

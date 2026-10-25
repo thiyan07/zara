@@ -64,6 +64,13 @@ class ExecutionEngine:
         self._records: dict[str, ExecutionRecord] = {}
         self._idem: dict[str, str] = {}
         self._idem_lock = threading.Lock()
+        # Stage 24h: mission-adoption hook (set after construction).
+        # A mission-bound record reaching SUCCEEDED hands its outcome
+        # to the owning mission immediately, so checkpointed plan state
+        # stays truthful across restarts / record pruning. Bookkeeping
+        # only — the hook can never allow anything (decisions were
+        # already made by the normal gates).
+        self._mission_adopt: Optional[Callable] = None
         # Grants in progress: concurrent approve calls for the same
         # execution must not both pass the WAITING check (double grant =
         # double dispatch). Entries live only for the grant duration.
@@ -92,6 +99,19 @@ class ExecutionEngine:
         """Attach the fabric revalidation hook after construction
         (fabric is built after the engine in build_stack)."""
         self._revalidate = fn
+
+    def set_mission_adopt(self, fn) -> None:
+        """Attach the mission-adoption hook after construction
+        (the intent service owns the held-<->step binding)."""
+        self._mission_adopt = fn
+
+    def _adopt_mission_record(self, rec) -> None:
+        if not rec.mission_id or self._mission_adopt is None:
+            return
+        try:
+            self._mission_adopt(rec)
+        except Exception:  # noqa: BLE001 — adoption never decides
+            pass
 
     def _emit(self, type: str, **payload) -> None:
         if self._on_event:
@@ -293,7 +313,8 @@ class ExecutionEngine:
         definition = self.registry.get(tool)
         decision = auth or self.policy.decide(
             who, capability=f"tool:{tool}", device_id=device_id,
-            resource=tool, risk=definition.risk, context={"command": str(inputs)})
+            resource=tool, risk=definition.risk, context={"command": str(inputs)},
+            mission_id=mission_id)
         # Task 9 (T2): enforce the tool's own input envelope BEFORE the
         # record exists. validate_against_schema re-checks at dispatch, but
         # a rejected submit must not retain a full inputs copy (up to the
@@ -462,19 +483,49 @@ class ExecutionEngine:
                 self._emit("approval_invalidated", execution_id=rec.id,
                            tool=rec.tool, reason=rec.error)
                 raise ValueError(rec.error)
+        # P5 feature-hunt (2026-10-22, live-discovered): CONFIRM-class
+        # quick actions (android.timer.set, android.alarm.set, torch,
+        # …) declare a `confirm` input that direct-tool callers set
+        # explicitly. The chat path parks the hold WITHOUT it on
+        # purpose: the user's APPROVAL action here IS that
+        # confirmation. Drift and revalidate checks have already
+        # bounded the parked operation (and stay pre-approval — the
+        # fingerprint never sees the injection, so nothing drifts);
+        # satisfying the tool's confirm slot at grant time keeps the
+        # recorded receipt in the audited inputs instead of asking the
+        # user to utter a second "confirm" slot value. Failure to look
+        # up the schema never blocks a grant: no confirm property means
+        # the tool wants nothing.
+        try:
+            schema = self.registry.get(rec.tool).input_schema or {}
+            props = schema.get("properties") \
+                if isinstance(schema, dict) else None
+            if isinstance(props, dict) and "confirm" in props and \
+                    rec.inputs.get("confirm") is not True:
+                rec.inputs = dict(rec.inputs)
+                rec.inputs["confirm"] = True
+                self._emit("approval_confirm_injected",
+                           execution_id=rec.id, tool=rec.tool)
+        except Exception:  # noqa: BLE001 — absence of schema != blocker
+            pass
         # Final compare-and-set, grant mint included: a cancel that landed
         # anywhere above wins and the grant is refused instead of
         # resurrecting CANCELLED to RUNNING. policy.grant is a fast local
         # mint (no engine callbacks), so holding _lock across it cannot
-        # deadlock; minting inside the lock also means a refused attempt
-        # never leaves a live unused grant that a later decide() could
-        # consume as approval.
+        # deadlock. Stage 26: the minted grant can never authorize an
+        # unrelated later request — mission-bound records mint a
+        # mission-scoped grant (consumable only inside THAT mission's
+        # continuation, the Stage 24g semantics), non-mission records
+        # mint used-at-mint so no decide() ever harvests a leftover.
         with self._lock:
             if rec.state != ExecutionState.WAITING_FOR_PERMISSION:
                 raise ValueError(
                     f"execution {rec.id} no longer awaiting approval")
             gid = self.policy.grant(approver, f"tool:{rec.tool}",
-                                    rec.device_id, rec.tool)
+                                    rec.device_id, rec.tool,
+                                    mission_id=rec.mission_id or "",
+                                    used_now=not rec.mission_id,
+                                    source="approval")
             rec.auth = PolicyDecision(allow=True, grant_id=gid,
                                       scope=f"tool:{rec.tool}@{rec.device_id}",
                                       reason=f"approved by {approver}")
@@ -528,9 +579,19 @@ class ExecutionEngine:
                                           "cancel_requested":
                                               lambda: rec.cancel_requested})
                 rec.result = out
-                rec.verified = True if tool.verification == "none" else bool(out)
+                # Explicit mode: a non-empty payload is NOT proof — the
+                # handler must state verification in its result
+                # ("verified": true/false). Anything else stays honestly
+                # unverified instead of silently latching true.
+                if tool.verification == "explicit":
+                    rec.verified = bool(
+                        isinstance(out, dict) and out.get("verified"))
+                else:
+                    rec.verified = (True if tool.verification == "none"
+                                    else bool(out))
                 rec.state = ExecutionState.SUCCEEDED
                 rec.ended_at = utcnow()
+                self._adopt_mission_record(rec)
                 self._emit("execution_finished", execution_id=rec.id,
                            tool=rec.tool, ok=True)
                 break
